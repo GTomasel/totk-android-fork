@@ -4,7 +4,8 @@
     python3 games/totk/android/build_release.py --ndk <android-ndk> --turnip <driver.so> --key <release.pem>
                                                 [--key-pass-env VAR] [--work DIR] [-o totk-native.apk]
                                                 [--translator <android-arm64 totk_xlate>] [--android-sdk SDK]
-                                                [--version-code N] [--version-name X]   (default 1.0.0 / 10000)
+                                                [--version-code N] [--version-name X]
+                                                [--package ID] [--label NAME] [--target-sdk N]
     python3 games/totk/android/build_release.py --audit <apk>        (only the content audit)
 
 What goes in (all built here, or fetched at pinned sources, except the two prebuilt inputs named below):
@@ -67,6 +68,9 @@ def parse_args(argv):
     ap.add_argument('--android-sdk', type=Path, help='Android SDK (default ANDROID_HOME, ANDROID_SDK_ROOT, ~/Android/Sdk)')
     ap.add_argument('--version-code', type=int, help='default: from the version name, MAJOR*10000 + MINOR*100 + PATCH')
     ap.add_argument('--version-name', help=f'default: {APP_VERSION}')
+    ap.add_argument('--package', help='APK application ID (default: com.aure.totk)')
+    ap.add_argument('--label', help='APK launcher label (default: TotK Native)')
+    ap.add_argument('--target-sdk', type=int, default=API, help=f'APK target API (default: {API})')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     args = ap.parse_args(argv)
     if not args.audit:
@@ -233,6 +237,7 @@ def licence_texts(work, ndk, *, setup=True):
         'dotnet.txt': [LICENSES / 'dotnet.txt'],
         'Ryujinx.txt': [REPO / 'vendor/ryujinx/LICENSE.txt', REPO / 'vendor/ryujinx/src/Spv.Generator/LICENSE'],
         'totk_xlate.txt': [t / 'tools/totk_xlate/LICENSE'],
+        'totk-pc-recomp.txt': [t / 'third_party/licenses/totk-pc-recomp.txt'],
         'd2r-mobile.txt': [t / 'third_party/d2r/LICENSE', t / 'third_party/d2r_gfx/LICENSE'],
         'deko3d.txt': [t / 'third_party/d2r_gfx/LICENSE.deko3d'],
         'bcdec.txt': [t / 'third_party/d2r_gfx/third_party/bcdec/LICENSE'],
@@ -321,7 +326,7 @@ def verify_signatures(apk, logs, sdk=None):
 
 
 def package(*, out, dex, libs, translator, turnip, assets, key, key_pass_env=None, make_key=False, release, version_code,
-            version_name, timestamp=None, logs, android_sdk=None):
+            version_name, timestamp=None, logs, android_sdk=None, application_id=None, label=None, target_sdk=API):
     """Sign the APK with build_apk.py, verify each signature scheme and audit it; a failure removes the APK."""
     libs = list(libs) + ([turnip] if turnip else [])
     if turnip:   # packed under the name the runtime looks for beside libtotk.so
@@ -338,7 +343,11 @@ def package(*, out, dex, libs, translator, turnip, assets, key, key_pass_env=Non
         raise BuildError(f'{icons} is missing or older than {art}: rerun python3 games/totk/android/apk/render_launcher.py (needs Pillow)')
     cmd = [sys.executable, HERE / 'apk/build_apk.py', '--dex', dex, *sum((['--lib', str(p)] for p in libs), []),
            '--ondevice-xlate', translator, '--assets', assets, '--launcher-mipmaps', icons, '--out', out, '--key', key,
-           '--version-code', str(version_code), '--version-name', version_name, '--min-sdk', str(API), '--target-sdk', str(API)]
+           '--version-code', str(version_code), '--version-name', version_name, '--min-sdk', str(API), '--target-sdk', str(target_sdk)]
+    if application_id is not None:
+        cmd += ['--package', application_id]
+    if label is not None:
+        cmd += ['--label', label]
     cmd += (['--key-pass-env', key_pass_env] if key_pass_env else []) + (['--make-key'] if make_key else [])
     cmd += (['--release'] if release else []) + (['--timestamp', str(timestamp)] if timestamp is not None else [])
     run(cmd, logs / 'build_apk.log')
@@ -363,7 +372,8 @@ def audit_entries(apk):
 
 
 def app(*, work, ndk, logs, out, key, key_pass_env=None, make_key=False, release=True, turnip=None, translator=None,
-        android_sdk=None, version_code=None, version_name=None, jobs=os.cpu_count() or 4):
+        android_sdk=None, version_code=None, version_name=None, jobs=os.cpu_count() or 4,
+        application_id=None, label=None, target_sdk=API):
     """The whole app from the repository: native libraries, translator, dex, assets, signed and audited APK. Shared by the
     public release (release=True, the caller's key and the pinned Turnip) and build_android.py --apk (a debuggable build
     signed with the work folder's developer key)."""
@@ -380,7 +390,8 @@ def app(*, work, ndk, logs, out, key, key_pass_env=None, make_key=False, release
     return package(out=out, dex=dex, libs=libs, translator=xlate, turnip=check_turnip(turnip) if turnip else None, assets=assets,
                    key=key, key_pass_env=key_pass_env, make_key=make_key, release=release,
                    version_code=version_code or (int(time.time()) // 60 if make_key else semver_code(name)),
-                   version_name=name, timestamp=stamp, logs=logs, android_sdk=android_sdk)
+                   version_name=name, timestamp=stamp, logs=logs, android_sdk=android_sdk,
+                   application_id=application_id, label=label, target_sdk=target_sdk)
 
 
 def source_commit():
@@ -416,7 +427,7 @@ def main(argv):
     t0 = time.time()
     app(work=work, ndk=ndk, logs=logs, out=out, key=key, key_pass_env=args.key_pass_env, release=True, turnip=turnip,
         translator=args.translator, android_sdk=args.android_sdk, version_code=args.version_code, version_name=args.version_name,
-        jobs=args.jobs)
+        jobs=args.jobs, application_id=args.package, label=args.label, target_sdk=args.target_sdk)
     say(f'done in {(time.time() - t0) / 60:.0f} min: {out} (sha256 {sha256(out)})')
 
 
