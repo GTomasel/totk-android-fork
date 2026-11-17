@@ -85,13 +85,26 @@ static void wb_diag_sweep(uint64_t start, uint64_t bytes, uint64_t chunks, int y
     pthread_mutex_unlock(&g_wb_diag_mu);
 }
 
-/* ---------- device memory: 64 MiB blocks per memory type, first-fit free lists; big images get their own ---------- */
-#define BLOCK_SIZE (64ull << 20)
+/* ---------- device memory: first-fit blocks per memory type; big images get their own ---------- */
+#define IMAGE_DEDICATED_THRESHOLD (16ull << 20)
 typedef struct { VkDeviceSize off, size; } span_t;
 typedef struct { VkDeviceMemory mem; uint32_t type; span_t *free; int nfree, capfree; VkDeviceSize used; } block_t;
 static block_t *g_blocks; static int g_nblocks;
 static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes;
+static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes, g_mem_block_allocs, g_mem_block_releases;
+static pthread_once_t g_mem_policy_once = PTHREAD_ONCE_INIT;
+static int g_mem_free_empty, g_mem_pack;
+static VkDeviceSize g_mem_block_size;
+static void image_memory_policy(void) {
+    const char *value = getenv("TOTK_VK_IMAGE_FREE_EMPTY");
+    g_mem_free_empty = value && !strcmp(value, "1");
+    value = getenv("TOTK_VK_IMAGE_PACK");
+    g_mem_pack = value && !strcmp(value, "1");
+    value = getenv("TOTK_VK_IMAGE_BLOCK_MB");
+    g_mem_block_size = 64ull << 20;
+    if (value && !strcmp(value, "32")) g_mem_block_size = 32ull << 20;
+    else if (value && !strcmp(value, "16")) g_mem_block_size = 16ull << 20;
+}
 
 static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
     int i = 0; while (i < b->nfree && b->free[i].off < off) i++;
@@ -101,13 +114,14 @@ static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
     if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == b->free[i].off) { b->free[i - 1].size += b->free[i].size; memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--; }
 }
 int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out) {
+    pthread_once(&g_mem_policy_once, image_memory_policy);
     int type = vk_pick_type(req->memoryTypeBits, want);
     if (type < 0) type = vk_pick_type(req->memoryTypeBits, 0);
     if (type < 0) return 0;
     memset(out, 0, sizeof *out);
     VkDeviceSize align = req->alignment ? req->alignment : 1;
     if (align < V.props.limits.bufferImageGranularity) align = V.props.limits.bufferImageGranularity;
-    if (req->size > BLOCK_SIZE / 4) {
+    if (req->size > IMAGE_DEDICATED_THRESHOLD) {
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req->size, .memoryTypeIndex = (uint32_t)type};
         if (vk_memory_allocate(&mai, &out->mem, VK_MEMORY_IMAGE_DEDICATED)) return 0;
         out->size = req->size; out->block = -1;
@@ -116,31 +130,49 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
     }
     pthread_mutex_lock(&g_mem_mu);
     for (int pass = 0; pass < 2; pass++) {
-        for (int bi = 0; bi < g_nblocks; bi++) {
+        int block = -1, span = -1;
+        VkDeviceSize offset = 0;
+        for (int bi = 0; bi < g_nblocks && (g_mem_pack || block < 0); bi++) {
             block_t *b = &g_blocks[bi];
-            if (b->type != (uint32_t)type) continue;
+            if (!b->mem || b->type != (uint32_t)type) continue;
+            /* Fill denser compatible blocks first so sparse ones can drain as their images retire.
+             * No live image moves. Equal occupancy retains allocation order. */
+            if (block >= 0 && b->used <= g_blocks[block].used) continue;
             for (int i = 0; i < b->nfree; i++) {
-                VkDeviceSize at = (b->free[i].off + align - 1) / align * align, end = b->free[i].off + b->free[i].size;
-                if (at + req->size > end) continue;
                 span_t f = b->free[i];
-                memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--;
-                if (at > f.off) block_free_insert(b, f.off, at - f.off);
-                if (at + req->size < end) block_free_insert(b, at + req->size, end - at - req->size);
-                b->used += req->size;
-                out->mem = b->mem; out->off = at; out->size = req->size; out->block = bi;
-                pthread_mutex_unlock(&g_mem_mu);
-                return 1;
+                VkDeviceSize at = (f.off + align - 1) / align * align, end = f.off + f.size;
+                if (at > end || req->size > end - at) continue;
+                block = bi; span = i; offset = at;
+                break;
             }
         }
+        if (block >= 0) {
+            block_t *b = &g_blocks[block];
+            span_t f = b->free[span];
+            VkDeviceSize end = f.off + f.size, after = offset + req->size;
+            memmove(b->free + span, b->free + span + 1, (size_t)(b->nfree - span - 1) * sizeof *b->free);
+            b->nfree--;
+            if (offset > f.off) block_free_insert(b, f.off, offset - f.off);
+            if (after < end) block_free_insert(b, after, end - after);
+            b->used += req->size;
+            out->mem = b->mem; out->off = offset; out->size = req->size; out->block = block;
+            pthread_mutex_unlock(&g_mem_mu);
+            return 1;
+        }
         if (pass) break;
-        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = BLOCK_SIZE, .memoryTypeIndex = (uint32_t)type};
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = g_mem_block_size, .memoryTypeIndex = (uint32_t)type};
         VkDeviceMemory m;
         if (vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK)) break;
-        int bi = g_nblocks++;
-        g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
+        int bi = 0;
+        while (bi < g_nblocks && g_blocks[bi].mem) bi++;
+        if (bi == g_nblocks) {
+            g_nblocks++;
+            g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
+        }
         block_t *b = &g_blocks[bi]; memset(b, 0, sizeof *b); b->mem = m; b->type = (uint32_t)type;
-        block_free_insert(b, 0, BLOCK_SIZE);
-        g_mem_block_bytes += BLOCK_SIZE;
+        block_free_insert(b, 0, g_mem_block_size);
+        g_mem_block_bytes += g_mem_block_size;
+        g_mem_block_allocs++;
     }
     pthread_mutex_unlock(&g_mem_mu);
     return 0;
@@ -151,6 +183,15 @@ void vk_mem_free(vk_alloc *a) {
     else {
         pthread_mutex_lock(&g_mem_mu);
         block_t *b = &g_blocks[a->block]; block_free_insert(b, a->off, a->size); b->used -= a->size;
+        if (!b->used && g_mem_free_empty) {
+            /* Callers already retired the image's GPU fence. A partially used block is never reclaimed.
+             * Leave a reusable hole so every other live vk_alloc keeps its stable block index. */
+            vk_memory_release(b->mem, VK_MEMORY_IMAGE_BLOCK);
+            g_mem_block_bytes -= g_mem_block_size;
+            g_mem_block_releases++;
+            free(b->free);
+            memset(b, 0, sizeof *b);
+        }
         pthread_mutex_unlock(&g_mem_mu);
     }
     memset(a, 0, sizeof *a);
@@ -242,6 +283,15 @@ static uint64_t g_native_frame = 1;
    this lock; arena compaction re-enters only to invalidate its cached views. */
 static pthread_mutex_t g_tex_mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static uint64_t g_stat_uploads, g_stat_reuploads, g_stat_upload_bytes, g_stat_images, g_stat_shared_hits, g_stat_swept, g_stat_published, g_stat_switched;
+/* g_tex_mu: a lower bound on the next possible expiry. A texture becoming live again can leave a
+ * stale early deadline; the scan recomputes it from the image's current use and writeback state. */
+enum { SHARED_IMAGE_IDLE_SUBMISSIONS = 600 };
+static uint64_t g_shared_sweep_at = UINT64_MAX, g_shared_scans, g_shared_skips;
+static void shared_image_idle(vk_img *im) {
+    im->idle_sub = vk_submit_serial();
+    uint64_t expiry = im->idle_sub + SHARED_IMAGE_IDLE_SUBMISSIONS;
+    if (!im->wbrefs && expiry < g_shared_sweep_at) g_shared_sweep_at = expiry;
+}
 /* GPU-written CPU-pool textures shared by storage (TOTK_VK_OFF=mirshare: off). A texture in a CPU-visible pool mirrors the
    pool's bytes into its own image (one per serial). When the GPU renders into one, the pool bytes are stale; another
    serial at the same storage with the same layout (the game re-initialises render-target objects at the storage that
@@ -318,14 +368,25 @@ void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
     }
     wb_sweep_locked();
     wb_age_locked();
+    vk_rec_service_check();
     /* shared images nobody holds for a while (the game re-creates per-frame textures at the same storage) */
     uint64_t sub = vk_submit_serial();
-    for (uint32_t i = 0; i < g_by_storage.cap; i++) {
-        vk_rec_service_check();
-        vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
-        if (!im || im->refs || im->wbrefs || sub - im->idle_sub < 600) continue;
-        texcopy_retire(im, "sweep");
-        stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--; g_stat_swept++;   /* deletion shifts entries back */
+    if (sub < g_shared_sweep_at) g_shared_skips++;
+    else {
+        g_shared_sweep_at = UINT64_MAX;
+        g_shared_scans++;
+        for (uint32_t i = 0; i < g_by_storage.cap; i++) {
+            vk_rec_service_check();
+            vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
+            if (!im || im->refs || im->wbrefs) continue;
+            uint64_t expiry = im->idle_sub + SHARED_IMAGE_IDLE_SUBMISSIONS;
+            if (sub < expiry) {
+                if (expiry < g_shared_sweep_at) g_shared_sweep_at = expiry;
+                continue;
+            }
+            texcopy_retire(im, "sweep");
+            stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--; g_stat_swept++;   /* deletion shifts entries back */
+        }
     }
     pthread_mutex_unlock(&g_tex_mu);
     wb_diag_end(WB_D_SWEEP, start);
@@ -678,7 +739,7 @@ static void tex_drop_locked(vk_tex *x) {
     texcopy_resource("drop", x);
     if (x->tbv) retire_bview(x->tbv, x->tb_buffer);
     if (x->im) {
-        if (x->im->shared) { if (--x->im->refs == 0) x->im->idle_sub = vk_submit_serial(); }
+        if (x->im->shared) { if (--x->im->refs == 0) shared_image_idle(x->im); }
         else if (x->im->wbrefs) x->im->orphan = 1;   /* a rendering waiting for write-back keeps it */
         else retire_img(x->im);
     }
@@ -1044,7 +1105,7 @@ static void wb_detail(const wb_ent *e, const wb_history *h, enum wb_land_mode mo
 static void wb_ref(vk_img *im) { im->wbrefs++; }
 static void wb_unref(vk_img *im) {
     im->wbrefs--;
-    if (im->shared) { if (!im->refs) im->idle_sub = vk_submit_serial(); }
+    if (im->shared) { if (!im->refs) shared_image_idle(im); }
     else if (!im->wbrefs && im->orphan) retire_img(im);
 }
 static void wb_staging_free(wb_ent *e) {
@@ -2652,11 +2713,55 @@ static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const 
     texel_flush(s);
 }
 void vk_res_counters(uint64_t v[7]) { v[0] = g_stat_images; v[1] = g_stat_shared_hits; v[2] = g_stat_uploads; v[3] = g_stat_reuploads; v[4] = g_stat_swept; v[5] = g_stat_published; v[6] = g_stat_switched; }
+#ifdef TOTK_VK_TESTS
+void vk_res_test_shared_sweep(uint64_t stats[2]) {
+    pthread_mutex_lock(&g_tex_mu);
+    stats[0] = g_shared_scans;
+    stats[1] = g_shared_skips;
+    pthread_mutex_unlock(&g_tex_mu);
+}
+#endif
 void vk_res_mem(uint64_t v[8]) {
+    pthread_once(&g_mem_policy_once, image_memory_policy);
+    int detail = g_mem_pack || g_mem_free_empty;
+    uint64_t largest = 0, allocs, releases;
+    unsigned sparse = 0, empty = 0;
     pthread_mutex_lock(&g_mem_mu); v[0] = g_mem_block_bytes; v[1] = g_mem_dedicated_bytes; v[7] = 0;
-    for (int i = 0; i < g_nblocks; i++) v[7] += g_blocks[i].used;
+    for (int i = 0; i < g_nblocks; i++) {
+        const block_t *b = &g_blocks[i];
+        v[7] += b->used;
+        if (!detail || !b->mem) continue;
+        empty += !b->used;
+        sparse += b->used > 0 && b->used <= g_mem_block_size / 4;
+        for (int s = 0; s < b->nfree; s++) if (b->free[s].size > largest) largest = b->free[s].size;
+    }
+    allocs = g_mem_block_allocs; releases = g_mem_block_releases;
     pthread_mutex_unlock(&g_mem_mu);
-    pthread_mutex_lock(&g_tex_mu); v[2] = (uint64_t)g_nretired; v[3] = g_by_serial.n; v[4] = g_by_storage.n; v[5] = (uint64_t)g_nwb; v[6] = (uint64_t)g_capretired; pthread_mutex_unlock(&g_tex_mu);
+    uint64_t retired = 0, pinned = 0, active = 0, idle[3] = {0}, gpu_written = 0, scans, skips;
+    pthread_mutex_lock(&g_tex_mu);
+    scans = g_shared_scans; skips = g_shared_skips;
+    v[2] = (uint64_t)g_nretired; v[3] = g_by_serial.n; v[4] = g_by_storage.n; v[5] = (uint64_t)g_nwb; v[6] = (uint64_t)g_capretired;
+    if (detail) {
+        uint64_t sub = vk_submit_serial();
+        for (int i = 0; i < g_nretired; i++) retired += g_retired[i].mem.size;
+        for (uint32_t i = 0; i < g_by_storage.cap; i++) {
+            const vk_img *im = g_by_storage.vals[i];
+            if (!im) continue;
+            if (im->refs) active += im->mem.size;
+            else if (im->wbrefs) pinned += im->mem.size;
+            else {
+                uint64_t age = sub - im->idle_sub;
+                idle[(age >= 60) + (age >= 240)] += im->mem.size;
+                if (im->gpu_written) gpu_written += im->mem.size;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_tex_mu);
+    if (detail) LOGV("[image-memory] pack=%d allocs=%llu releases=%llu empty=%u sparse=%u largest_free_mib=%.3f retired_mib=%.3f "
+        "shared_active_mib=%.3f wb_only_mib=%.3f idle_under60_mib=%.3f idle_60_239_mib=%.3f idle_240_plus_mib=%.3f idle_gpu_written_mib=%.3f sweeps=%llu skipped_sweeps=%llu",
+        g_mem_pack, (unsigned long long)allocs, (unsigned long long)releases, empty, sparse, largest / 1048576.0,
+        retired / 1048576.0, active / 1048576.0, pinned / 1048576.0, idle[0] / 1048576.0, idle[1] / 1048576.0,
+        idle[2] / 1048576.0, gpu_written / 1048576.0, (unsigned long long)scans, (unsigned long long)skips);
 }
 void vk_res_stats(void) {
     pthread_mutex_lock(&g_tex_mu);

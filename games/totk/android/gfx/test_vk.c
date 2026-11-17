@@ -1718,7 +1718,48 @@ static int texel_regions(void) {
     return !!fails;
 }
 
+static void shared_test_advance(uint64_t until) {
+    for (unsigned i = 0; i < 601 && vk_submit_serial() < until; i++) {
+        mtl_sub_begin(); (void)vk_cb(); (void)mtl_sub_commit();
+    }
+    CHECK(vk_submit_serial() == until, "shared image fixture reached the intended submission");
+}
+static int shared_idle_checks(void) {
+    extern void vk_res_test_shared_sweep(uint64_t stats[2]);
+    uint8_t backing[4096];
+    tex_t first = {.d = {.target = 1, .format = 0x25, .width = 4, .height = 4, .depth = 1, .levels = 1},
+                   .mem = backing, .serial = 1};
+    nvn_tex_layout(&first.d, &first.L);
+    tex_t alias = first; alias.serial++;
+    mtl_sub_begin(); vk_tex *original = vk_tex_get(&first);
+    CHECK(original != NULL, "GPU-only texture realized");
+    VkImage prior = original ? vk_tex_image(original) : VK_NULL_HANDLE;
+    mtl_sub_commit();
+    uint64_t before[7], after[7], counts[2];
+    vk_res_counters(before);
+    uint64_t old_deadline = vk_submit_serial() + 600;
+    mtl_tex_release(&first);
+    shared_test_advance(old_deadline - 1);
+    vk_res_test_shared_sweep(counts);
+    CHECK(counts[0] == 0 && counts[1] >= 600, "quiet submissions skip the shared-image scan");
+    mtl_sub_begin(); vk_tex *reused = vk_tex_get(&alias);
+    CHECK(reused && vk_tex_image(reused) == prior, "reuse just before expiry keeps the original Vulkan image");
+    uint64_t new_deadline = vk_submit_serial() + 600;
+    mtl_tex_release(&alias);
+    mtl_sub_commit();
+    shared_test_advance(new_deadline - 1);
+    vk_res_counters(after);
+    CHECK(after[4] == before[4], "the earlier deadline cannot expire the reused image");
+    shared_test_advance(new_deadline);
+    vk_res_counters(after); vk_res_test_shared_sweep(counts);
+    CHECK(after[4] == before[4] + 1 && counts[0] == 2, "the replacement deadline expires the image exactly once");
+    mtl_finish();
+    printf("%s: shared image idle deadline %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--shared-idle")) return shared_idle_checks();
     if (argc == 2 && !strcmp(argv[1], "--texel-regions")) return texel_regions();
     if (argc == 2 && !strcmp(argv[1], "--mprotect-bench")) return mprotect_bench();
     if (argc == 2 && !strcmp(argv[1], "--registry-kind-bench")) return registry_kind_bench();

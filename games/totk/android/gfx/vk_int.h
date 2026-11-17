@@ -138,7 +138,7 @@ uint64_t vk_game_submit_serial(void);    /* walking thread only; GPU chunks do n
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) \
     X(vkCmdPushConstants) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
-    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDispatch) \
+    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) \
@@ -156,6 +156,7 @@ typedef struct {
     int has_pipeline_statistics;   /* pipelineStatisticsQuery, already enabled with supported core features */
     int has_host_query_reset;   /* hostQueryReset, for fence-owned profiling pools shared by pre/main buffers */
     int has_custom_border, has_null_descriptor, has_index_u8, has_depth_clip_control, has_eds3, has_divisor, has_bc;
+    int has_indirect_first_instance;
     int has_geometry, has_layer_output, has_logic_op, has_dual_src;
     int has_image_read_without_format, has_image_write_without_format;
     int has_cache_control;   /* pipelineCreationCacheControl: a pipeline can be asked of the pipeline cache alone (vk_draw.c pipe_get) */
@@ -593,6 +594,11 @@ typedef struct vk_shader {
     uint8_t framegen_plane; /* audited VS view-position or FS plane-depth convention, not unconditional admission */
     uint8_t framegen_uncertified_plane; /* exact experimental VS candidate; no authority unless opt-in and runtime checks */
     uint64_t xlate_miss_ns; /* recorder clears after its first emitted draw/dispatch; not a GPU-completion timestamp */
+    /* user varyings (vk_varyings.h): a vertex shader's Output Locations, a fragment shader's Input Locations and their
+       numeric kinds; io_known when the module could be read. vfix: vertex modules with the varyings a fragment shader
+       reads that this vertex shader does not write added as (0, 0, 0, 1) (vk_vs_module_for). */
+    uint32_t vout_mask, fin_mask; uint8_t fin_kind[32]; uint8_t io_known;
+    struct vk_vfix *vfix;
 } vk_shader;
 
 /* ---------- opt-in per-slot GPU pass profiler (vk_gpuprof.c) ---------- */
@@ -649,6 +655,7 @@ typedef struct vk_prog vk_prog;
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]);
 void vk_stage_sig_invalidate(unsigned stages);   /* recording-thread state writes: one bit per NVN stage */
 void vk_prog_prepare(const prog_t *p); /* bind-time compute compilation, no variant selection or graphics seed IO */
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs);   /* vs->mod, or one with fs's missing varyings added */
 VkPipelineLayout vk_layout_of(vk_shader *vs, vk_shader *fs);
 VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout);
 void vk_compute_start(void);

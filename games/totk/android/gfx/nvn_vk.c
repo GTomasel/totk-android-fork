@@ -779,6 +779,7 @@ static void vk_init_once(void) {
     V.has_custom_border = has_ext("VK_EXT_custom_border_color") && f_cbc.customBorderColors && f_cbc.customBorderColorWithoutFormat;
     V.has_null_descriptor = has_ext("VK_EXT_robustness2") && f_rob2.nullDescriptor;
     V.has_index_u8 = has_ext("VK_EXT_index_type_uint8") && f_u8.indexTypeUint8;
+    V.has_indirect_first_instance = f2.features.drawIndirectFirstInstance;
     V.has_depth_clip_control = has_ext("VK_EXT_depth_clip_control") && f_dcc.depthClipControl;
     V.has_divisor = has_ext("VK_EXT_vertex_attribute_divisor") && f_div.vertexAttributeInstanceRateDivisor;
     V.has_bc = f2.features.textureCompressionBC; V.has_geometry = f2.features.geometryShader;
@@ -2573,10 +2574,16 @@ static uint32_t slot_alloc_sets(void *owner, VkDescriptorSetLayout layout, uint3
             if (count > 1) { count /= 2; continue; }   /* large layouts may fit fewer than a whole batch */
             if (s->curdpool + 1 < s->ndpool) { s->curdpool++; s->curdsets = 0; continue; }
         }
-        VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = DPOOL_SETS, .poolSizeCount = VK_DESC_POOL_TYPES, .pPoolSizes = vk_desc_pool_sizes};
         if (s->ndpool == s->capdpool) { s->capdpool = s->capdpool ? 2 * s->capdpool : 4; s->dpools = VK_REALLOC(s->dpools, (size_t)s->capdpool * sizeof *s->dpools); }
-        if (fresh) break;   /* a set that does not fit an empty pool */
-        VKCHECK(vkCreateDescriptorPool(V.dev, &pci, NULL, &s->dpools[s->ndpool++]));
+        if (fresh) {
+            if (fresh == 1 && vk_desc_compact_pools()) {
+                vkDestroyDescriptorPool(V.dev, s->dpools[s->curdpool], NULL);
+                VKCHECK(vk_desc_pool_create(DPOOL_SETS, 1, &s->dpools[s->curdpool]));
+                fresh = 2; continue;
+            }
+            break;
+        }
+        VKCHECK(vk_desc_pool_create(DPOOL_SETS, 0, &s->dpools[s->ndpool++]));
         HK_ADD(dpools, 1); vk_record_primary_pools(1);
         s->curdpool = s->ndpool - 1; s->curdsets = 0; fresh = 1;
     }
@@ -6004,7 +6011,7 @@ void vk_mem_report(void) {
         (unsigned long long)primary[0], (unsigned long long)primary[1]);
     uint64_t pn, pb; gpu_pool_totals(&pn, &pb);
     uint64_t r[8]; vk_res_mem(r);
-    LOGV("memory image blocks: used/free %.3f/%.3f MiB (empty blocks retained for reuse)",
+    LOGV("memory image blocks: used/free %.3f/%.3f MiB in currently allocated blocks",
         r[7] / 1048576.0, (r[0] - r[7]) / 1048576.0);
 #ifdef __GLIBC__
     struct mallinfo2 mi = mallinfo2();

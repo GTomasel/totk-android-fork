@@ -54,6 +54,7 @@ typedef struct {
     const vk_record_spans *spans;
     uint32_t vertex_mask;
     VkBuffer index; VkDeviceSize index_offset; VkIndexType index_type;
+    VkBuffer indirect; VkDeviceSize indirect_offset; /* GPU-generated quad count; zero for ordinary draws */
     uint64_t index_address; /* optional unresolved index range; walk-selected handles need no worker lookup */
     uint64_t lag_ticket, index_bytes; uint32_t index_lag_reason;
     uint32_t count, instances, first, base_instance; int32_t vertex_offset;
@@ -136,6 +137,8 @@ void vk_record_primary_pools(int64_t delta); /* primary slots' retained descript
    vk_desc_layout_fits refuses such a layout where it is created instead, naming the type. */
 enum { VK_DESC_POOL_TYPES = 8 };
 extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
+int vk_desc_compact_pools(void);
+VkResult vk_desc_pool_create(uint32_t max_sets, int full_size, VkDescriptorPool *out);
 int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 /* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
    used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the

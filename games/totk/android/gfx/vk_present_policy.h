@@ -79,9 +79,11 @@ static inline uint32_t vk_present_shown_width(uint32_t w, uint32_t h, float aspe
     return shown >= 1 && shown < 65536 ? (uint32_t)shown : w;
 }
 /* The centred destination of a w x h source shown at aspect (above) in an ow x oh output, as large as fits. */
-static inline vk_present_rect vk_present_fit_shown(uint32_t w, uint32_t h, float aspect, uint32_t ow, uint32_t oh) {
+static inline vk_present_rect vk_present_fit_shown(uint32_t w, uint32_t h, float aspect, uint32_t ow, uint32_t oh,
+        int stretch) {
     uint32_t sw = vk_present_shown_width(w, h, aspect);
     if (!sw || !h || !ow || !oh) return (vk_present_rect){0};
+    if (stretch) return (vk_present_rect){0, 0, ow, oh};
     double sc = (double)ow / sw < (double)oh / h ? (double)ow / sw : (double)oh / h;
     int32_t dw = (int32_t)(sw * sc + 0.5), dh = (int32_t)(h * sc + 0.5);
     return (vk_present_rect){((int32_t)ow - dw) / 2, ((int32_t)oh - dh) / 2, (uint32_t)dw, (uint32_t)dh};
@@ -100,6 +102,17 @@ static inline vk_present_rect vk_present_guest_fit(uint32_t guest_w, uint32_t gu
     }
     if (!w || !h) return (vk_present_rect){0};
     return (vk_present_rect){(int32_t)((window_w-w)/2),(int32_t)((window_h-h)/2),w,h};
+}
+/* Where a fitted guest picture (vk_present_guest_fit) is shown in the window: the largest centered rect with its
+ * aspect. The front buffer keeps the fitted size (no extra GPU upsampling for AHB, whose compositor destination is
+ * this rect); only the window-sized copy fallback blits into it. A panel larger than the canvas (e.g. a 2400x1504
+ * tablet docked at 1920x1080) is therefore filled instead of showing the canvas 1:1 inside black bars. A fit that
+ * already touches a window edge (any panel no larger than the canvas) is returned unchanged. */
+static inline vk_present_rect vk_present_guest_display(vk_present_rect fit, uint32_t window_w, uint32_t window_h,
+        int stretch) {
+    if (!fit.w || !fit.h || !window_w || !window_h) return fit;
+    if (!stretch && (fit.w >= window_w || fit.h >= window_h)) return fit;
+    return vk_present_fit_shown(fit.w, fit.h, 0, window_w, window_h, stretch);
 }
 /* Nonzero guest basis and host extent; map endpoints identically for real and
    generated native UI output, including nonzero crops and rounded edges. */

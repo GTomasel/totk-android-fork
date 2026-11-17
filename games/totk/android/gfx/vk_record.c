@@ -547,6 +547,26 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
+static pthread_once_t desc_memory_once = PTHREAD_ONCE_INIT;
+static int desc_compact;
+static void desc_memory_policy(void) {
+    const char *e = getenv("TOTK_VK_DESC_COMPACT");
+    desc_compact = e && !strcmp(e, "1");
+    LOGV("descriptor compact pools: %d; quarter descriptor capacity, original maxSets; wide layouts fall back to full-size pools. Retained MiB estimates use base capacities and exclude any wide-layout fallback surplus", desc_compact);
+}
+int vk_desc_compact_pools(void) {
+    pthread_once(&desc_memory_once, desc_memory_policy);
+    return desc_compact;
+}
+VkResult vk_desc_pool_create(uint32_t max_sets, int full_size, VkDescriptorPool *out) {
+    VkDescriptorPoolSize sizes[VK_DESC_POOL_TYPES];
+    memcpy(sizes, vk_desc_pool_sizes, sizeof sizes);
+    if (!full_size && vk_desc_compact_pools())
+        for (unsigned i = 0; i < VK_DESC_POOL_TYPES; i++) sizes[i].descriptorCount /= 4;
+    VkDescriptorPoolCreateInfo info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = max_sets, .poolSizeCount = VK_DESC_POOL_TYPES, .pPoolSizes = sizes};
+    return vkCreateDescriptorPool(V.dev, &info, NULL, out);
+}
 int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size) {
     uint64_t need[VK_DESC_POOL_TYPES] = {0};
     for (uint32_t i = 0; i < count; i++) {
@@ -575,7 +595,7 @@ static uint64_t desc_pool_bytes(void) {
         bytes += (uint64_t)vk_desc_pool_sizes[t].descriptorCount *
             (vk_desc_pool_sizes[t].type == VK_DESCRIPTOR_TYPE_SAMPLER ? 16 :
              vk_desc_pool_sizes[t].type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 128 : 64);
-    return bytes;
+    return vk_desc_compact_pools() ? bytes / 4 : bytes;
 }
 #ifdef TOTK_VK_TESTS
 void vk_record_test_descriptor_retained(uint64_t out[4]) {
@@ -603,11 +623,18 @@ static uint32_t alloc_sets(void *owner, VkDescriptorSetLayout layout, uint32_t c
             if (count > 1) { count /= 2; continue; }
         }
         if (c->curdp + 1 < c->ndp) { c->curdp++; c->sets = 0; continue; }
-        if (fresh) DIE("recorder descriptor set exceeds a fresh pool");
-        VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = REC_POOL_SETS,
-            .poolSizeCount = VK_DESC_POOL_TYPES, .pPoolSizes = vk_desc_pool_sizes};
+        if (fresh) {
+            if (fresh == 1 && vk_desc_compact_pools()) {
+                /* No set was allocated from this new pool. A wide layout may
+                 * need the original capacity; replace only this unused pool. */
+                vkDestroyDescriptorPool(V.dev, c->dp[c->curdp], NULL);
+                VKCHECK(vk_desc_pool_create(REC_POOL_SETS, 1, &c->dp[c->curdp]));
+                fresh = 2; continue;
+            }
+            DIE("recorder descriptor set exceeds a fresh pool");
+        }
         if (c->ndp == c->capdp) { c->capdp = c->capdp ? c->capdp * 2 : 4; c->dp = VK_REALLOC(c->dp, c->capdp * sizeof *c->dp); }
-        VKCHECK(vkCreateDescriptorPool(V.dev, &pi, NULL, &c->dp[c->ndp++]));
+        VKCHECK(vk_desc_pool_create(REC_POOL_SETS, 0, &c->dp[c->ndp++]));
         atomic_fetch_add_explicit(&memory_dpools, 1, memory_order_relaxed);
         c->curdp = c->ndp - 1; c->sets = 0; fresh = 1;
     }
@@ -1139,7 +1166,8 @@ static void record_job(rec_job *j, unsigned worker) {
             if (index_buffer != buffer || index_offset != offset || index_type != d->index_type) {
                 (vkCmdBindIndexBuffer)(j->cb, buffer, offset, d->index_type); index_buffer = buffer; index_offset = offset; index_type = d->index_type;
             }
-            (vkCmdDrawIndexed)(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
+            if (d->indirect) (vkCmdDrawIndexedIndirect)(j->cb, d->indirect, d->indirect_offset, 1, sizeof(VkDrawIndexedIndirectCommand));
+            else (vkCmdDrawIndexed)(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
             draws++;
         } else if (d->count) { (vkCmdDraw)(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
     }
@@ -1375,6 +1403,7 @@ vk_record_draw *vk_record_draw_begin(VkPipeline pipeline, VkPipelineLayout layou
     vk_record_draw *d = &building->draw[building->count];
     d->pipeline = pipeline; d->layout = layout; memset(d->sets, 0, sizeof d->sets);
     d->vertex_mask = 0; d->index = VK_NULL_HANDLE; d->index_address = d->index_offset = 0;
+    d->indirect = VK_NULL_HANDLE; d->indirect_offset = 0;
     d->index_type = VK_INDEX_TYPE_UINT32; d->first = 0; d->vertex_offset = 0;
     d->index_lag_reason = 0; d->index_bytes = 0;
     d->lag_ticket = vk_record_lag_enabled() ? vk_record_lag_ticket() : 0;

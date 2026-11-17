@@ -85,6 +85,12 @@ static void pso_collect_success(pipe_ent *e) {
 }
 static void pso_demand(pipe_ent *e, int capture) {
     if (!atomic_load_explicit(&g_pso_ready, memory_order_relaxed)) return;
+    if (e->list_index && !e->prewarm_demand_seen) {
+        e->prewarm_demand_seen = 1; /* recording owner, never mutated by a compile worker */
+        int state = atomic_load_explicit(&e->state, memory_order_acquire);
+        static const char *const reason[] = {"prewarm-queued", "prewarm-building", "prewarm-ready", "prewarm-failed"};
+        pso_trace_log(&e->k, "first-demand", reason[state], totk_ft_work_frame(), VK_SUCCESS, 0, 0, -1);
+    }
     if ((!capture || e->capture) && (!e->list_index || atomic_load_explicit(&e->state, memory_order_acquire) != PE_QUEUED)) return;
     pthread_mutex_lock(&g_pq_mu);
     e->capture |= capture;

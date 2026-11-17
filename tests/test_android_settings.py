@@ -18,9 +18,9 @@ ALLOWED = {'TOTK_FPS60', 'TOTK_GPU_TIME', 'TOTK_FRAMEGEN', 'TOTK_REALTIME', 'TOT
            'DM_PRESENT_INTERVAL', 'TOTK_PRESENT_SLOTS', 'TOTK_VK_PRESENT', 'TOTK_ACQUIRE_SLACK', 'TOTK_ACQUIRE_CLOCK',
            'TOTK_PACE', 'TOTK_ASYNC_REPLAY', 'TOTK_RENDER_RES', 'TOTK_POST_SCALE', 'TOTK_POST_SHARPNESS',
            'TOTK_POST_SGSR_SHARPNESS', 'TOTK_FXAA', 'TOTK_POST_AA', 'TOTK_SHADOW_RES', 'TOTK_OPERATION_MODE',
-           'TOTK_NATIVE_UI', 'TOTK_OVERLAY', 'TOTK_OVERLAY_POS', 'TOTK_COMPANION', 'TOTK_FACE_BUTTONS',
+           'TOTK_NATIVE_UI', 'TOTK_ASPECT', 'TOTK_PRESENT_STRETCH', 'TOTK_OVERLAY', 'TOTK_OVERLAY_POS', 'TOTK_COMPANION', 'TOTK_FACE_BUTTONS',
            'TOTK_AUDIO_PREFILL_MS', 'TOTK_LOCALE', 'TOTK_LANG', 'TOTK_DATA_DIR', 'TOTK_RUMBLE', 'TOTK_RUMBLE_GAIN', 'TOTK_GYRO',
-           'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS',
+           'TOTK_AUTOLOAD', 'TOTK_VK_SPLIT_PASS_DRAWS', 'TOTK_ADPF_GPU', 'TOTK_FPS60_HYSTERESIS', 'TOTK_LOW_MEMORY',
            'TOTK_UNCAPPED', 'TOTK_UNCAPPED_HZ', 'TOTK_UNCAPPED_INTERVAL', 'TOTK_FRAME_RATE_HINT', 'TOTK_FRAME_RATE_HINT_HZ'}
 FRONTEND = TOTK / 'runtime/frontend_android.c'
 FRAMEGEN = ['TOTK_FPS60=0', 'TOTK_FRAMEGEN=locked', 'TOTK_REALTIME=1', 'TOTK_FRAME_LAG=0', 'TOTK_FPS_AUTO=0', 'DM_PRESENT_HZ=60',
@@ -216,6 +216,16 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(self.env(frame_gen='on', gpu_feed='on'), self.env(frame_gen='on', gpu_feed='off'))
         self.assertEqual(self.env(gpu_feed='invalid'), self.env(gpu_feed='off'))
 
+    def test_low_memory_is_independent_of_graphics_preset(self):
+        off = self.env(render_res='960x540')
+        on = self.env(render_res='960x540', low_memory='on')
+        self.assertIn('TOTK_LOW_MEMORY=1', on)
+        self.assertEqual([line for line in on if line != 'TOTK_LOW_MEMORY=1'], off)
+        self.assertEqual(self.env(render_res='960x540', low_memory='invalid'), off)
+        values = self.values(self.run_probe('apply balanced low_memory=on')[0])
+        self.assertEqual(values['low_memory'], 'on')
+        self.assertEqual(self.run_probe('preset ' + ' '.join(f'{k}={v}' for k, v in values.items())), ['balanced'])
+
     def test_preset_env_bytes(self):
         for preset, before in LEGACY_PRESET_ENV.items():
             with self.subTest(preset=preset):
@@ -356,8 +366,24 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(any(l.startswith('TOTK_RUMBLE_GAIN') for l in off))   # no vibration devices for the game at all
         self.assertIn('TOTK_RUMBLE_GAIN=0.25', self.env(rumble='25'))
         self.assertIn('TOTK_RUMBLE_GAIN=0.75', self.env(rumble='75'))
+        for value, gain in (('150', '1.5'), ('200', '2.0'), ('300', '3.0'), ('400', '4.0')):
+            with self.subTest(strength=value):
+                self.assertIn('TOTK_RUMBLE_GAIN=' + gain, self.env(rumble=value))
         self.assertIn('TOTK_GYRO=0', self.env(motion='off'))
         self.assertIn('TOTK_RUMBLE_GAIN=1.0', self.env(rumble='33'))   # not a menu value: the default
+
+    def test_explicit_1080p_and_camera_aspect_choices(self):
+        self.assertIn('TOTK_RENDER_RES=1920x1080', self.env(render_res='1920x1080'))
+        self.assertFalse(any(line.startswith('TOTK_ASPECT=') for line in self.env()))
+        for ratio in ('4:3', '21:9', '32:9'):
+            with self.subTest(ratio=ratio):
+                self.assertIn('TOTK_ASPECT=' + ratio, self.env(aspect_ratio=ratio))
+                self.assertEqual(self.values(self.run_probe('stored aspect_ratio=' + ratio)[0])['aspect_ratio'], ratio)
+        self.assertFalse(any(line.startswith('TOTK_ASPECT=') for line in self.env(aspect_ratio='bogus')))
+        stretched = self.env(aspect_ratio='stretch')
+        self.assertIn('TOTK_PRESENT_STRETCH=1', stretched)
+        self.assertFalse(any(line.startswith('TOTK_ASPECT=') for line in stretched))
+        self.assertNotIn('TOTK_PRESENT_STRETCH=1', self.env(aspect_ratio='21:9'))
 
     def test_sharpness_follows_the_selected_upscaler_only(self):
         fsr = self.env(upscaler='fsr')

@@ -2293,8 +2293,11 @@ static int settled_budget(void) {
     }
     vk_wb_stats(); nvn_dirty_remove_range(memory); mtl_pool_del(memory); settled_idle(2);
     uint64_t ownership[5], resources[8]; vk_wb_test_memory(ownership); vk_res_mem(resources);
-    CHECK(!ownership[0] && !ownership[1] && !ownership[2] && !ownership[3] && resources[0] && !resources[7],
-        "finalization releases records/history/pins/images while empty blocks remain reusable");
+    const char *trim = getenv("TOTK_VK_IMAGE_FREE_EMPTY");
+    int free_empty = trim && !strcmp(trim, "1");
+    CHECK(!ownership[0] && !ownership[1] && !ownership[2] && !ownership[3] && !resources[7],
+        "finalization releases records/history/pins and occupied image bytes");
+    CHECK((resources[0] == 0) == free_empty, "empty blocks follow the selected retention policy");
     free(expected); free(snapshot); munmap(memory, POOL_BYTES);
     printf("%s: settled budget %d checks, %d failed; 1-MiB/2-ms cooperative sweeps, partial CPU/GPU/pool cancellation, complete invalidate\n",
         fails ? "FAILED" : "ok", checks, fails);
@@ -2926,6 +2929,101 @@ int main(int argc, char **argv) {
     p_viewports vp; memset(&vp, 0, sizeof vp); vp.n = 1; vp.v[0][2] = 64; vp.v[0][3] = 64; vp.v[0][5] = 1; op(OP_VIEWPORTS, &vp, sizeof vp);
     p_draw dw = {4, 0, 3, 0, 0}; op(OP_DRAW, &dw, sizeof dw);
     p_copy_b2t cp; memset(&cp, 0, sizeof cp); cp.src = (uint64_t)(uintptr_t)readback; cp.tex = &rt; cp.r = (NVNcopyRegion){0, 0, 0, 64, 64, 1}; op(OP_COPY_T2B, &cp, sizeof cp);
+    if (argc == 2 && !strcmp(argv[1], "--quad-strip")) {
+        CHECK(mtl_wait(run(), 5000000000ull), "quad strip fixture warms real shaders");
+        const float strip[] = {-1,-1, -1,1, 0,-1, 0,1, 1,-1, 1,1, -1,1};
+        uint8_t expected[64 * 64 * 4];
+        const unsigned counts[] = {3, 4, 6, 7};
+        for (unsigned c = 0; c < 4; c++) for (unsigned first = 0; first <= 2; first += 2)
+            for (unsigned instances = 1; instances <= 2; instances++) {
+                unsigned count = counts[c], quads = count < 4 ? 0 : count / 2 - 1;
+                float *reference = (float *)(cpu_pool + 0x203000);
+                for (unsigned q = 0; q < quads; q++) {
+                    unsigned a = q * 2, ix[] = {a, a+1, a+3, a, a+3, a+2};
+                    for (unsigned i = 0; i < 6; i++) memcpy(reference + 2 * (q * 6 + i), strip + 2 * ix[i], 8);
+                }
+                memset(vtx, 0, 128); memcpy(vtx + 2 * first, strip, sizeof strip);
+                for (int indexed = -1; indexed < 3; indexed++) for (int arm = 0; arm < 2; arm++) {
+                    p_bind_vbuf input = vb;
+                    input.r[0].address = (uint64_t)(uintptr_t)(arm ? vtx : reference); input.r[0].size = 128;
+                    p_draw draw = {.prim = arm ? 8 : 4, .first = arm ? (int)first : 0,
+                        .count = arm ? (int)count : (int)(quads * 6), .instances = (int)instances, .base_instance = 3};
+                    op(OP_SET_RT, &srt, sizeof srt); op(OP_CLEAR_COLOR, &cc, sizeof cc);
+                    op(OP_BIND_VBUF, &input, sizeof input);
+                    if (arm && indexed >= 0) {
+                        uint8_t *indices = cpu_pool + 0x202000;
+                        for (unsigned i = 0; i < count; i++) { uint32_t value = i; memcpy(indices + (i << indexed), &value, 1u << indexed); }
+                        p_draw_idx index = {.prim = 8, .itype = indexed, .count = (int)count, .base_vertex = (int)first,
+                            .instances = (int)instances, .base_instance = 3, .ibuf = (uint64_t)(uintptr_t)indices};
+                        op(OP_DRAW_IDX, &index, sizeof index);
+                    } else op(OP_DRAW, &draw, sizeof draw);
+                    op(OP_COPY_T2B, &cp, sizeof cp);
+                    CHECK(mtl_wait(run(), 5000000000ull), "quad strip count%u first%u instances%u arm%d completes", count, first, instances, arm);
+                    if (!arm) memcpy(expected, readback, sizeof expected);
+                    else CHECK(!memcmp(expected, readback, sizeof expected),
+                        "quad strip count%u first%u instances%u matches every reference triangle pixel", count, first, instances);
+                }
+            }
+        /* Both quad topologies: restart markers at every index width, trailing incomplete
+           groups, nonzero base vertex and inline updates. */
+        const float separate[] = {-1,-1,-1,1,0,-1,0,1, 0,-1,0,1,1,-1,1,1};
+        float *reference = (float *)(cpu_pool + 0x203000);
+        for (unsigned q = 0; q < 2; q++) {
+            unsigned a = 4*q, ix[] = {a,a+1,a+3,a,a+3,a+2};
+            for (unsigned i = 0; i < 6; i++) memcpy(reference + 2*(q*6+i), separate + 2*ix[i], 8);
+        }
+        p_bind_vbuf input = vb; input.r[0].size = 128;
+        input.r[0].address = (uint64_t)(uintptr_t)reference;
+        p_draw reference_draw = {.prim=4,.count=12,.instances=2,.base_instance=3};
+        op(OP_SET_RT,&srt,sizeof srt); op(OP_CLEAR_COLOR,&cc,sizeof cc);
+        op(OP_BIND_VBUF,&input,sizeof input); op(OP_DRAW,&reference_draw,sizeof reference_draw);
+        op(OP_COPY_T2B,&cp,sizeof cp); CHECK(mtl_wait(run(),5000000000ull),"separated quad reference completes");
+        memcpy(expected,readback,sizeof expected);
+        for (int prim=7;prim<=8;prim++) for (int type=0;type<3;type++)
+            for (int restart=0;restart<2;restart++) for (int logged=0;logged<2;logged++) {
+                memset(vtx,0,128); memcpy(vtx+4,separate,sizeof separate);
+                uint8_t *indices=cpu_pool+0x202000;
+                struct { uint64_t dst,n; uint8_t data[64]; } update={.dst=(uint64_t)(uintptr_t)indices};
+                unsigned count=0, stride=1u<<type;
+                for (unsigned q=0;q<2;q++) {
+                    unsigned order[]={4*q,4*q+1,4*q+(prim==7?3:2),4*q+(prim==7?2:3)};
+                    for (unsigned i=0;i<4;i++) { memcpy(update.data+count*stride,&order[i],stride); count++; }
+                    if (!q && restart) { memset(update.data+count*stride,0xff,stride); count++; }
+                }
+                uint32_t dangling=0; memcpy(update.data+count*stride,&dangling,stride); count++;
+                update.n=count*stride;
+                if (logged) memset(indices,0,(size_t)update.n); else memcpy(indices,update.data,(size_t)update.n);
+                p_draw_idx index={.prim=prim,.itype=type,.count=(int)count,.base_vertex=2,.base_instance=3,.instances=2,.ibuf=update.dst};
+                input.r[0].address=(uint64_t)(uintptr_t)vtx;
+                op(OP_SET_RT,&srt,sizeof srt); op(OP_CLEAR_COLOR,&cc,sizeof cc); op(OP_BIND_VBUF,&input,sizeof input);
+                if (logged) op(OP_UPDATE_UB,&update,(uint32_t)(16+update.n));
+                op(OP_DRAW_IDX,&index,sizeof index); op(OP_COPY_T2B,&cp,sizeof cp);
+                uint64_t ticket=run();
+                CHECK(mtl_wait(ticket,5000000000ull),"indexed topology%d width%u restart%d logged%d completes",prim,stride,restart,logged);
+                CHECK(!memcmp(expected,readback,sizeof expected),"indexed topology%d width%u restart%d logged%d preserves all pixels",prim,stride,restart,logged);
+            }
+        for (unsigned type=0;type<3;type++) {
+            unsigned stride=1u<<type, bytes=8*stride;
+            uint8_t *indices=cpu_pool+0x202000; memset(indices,0,bytes);
+            memset(vtx,0,128); memcpy(vtx+4,separate,sizeof separate);
+            mtl_sub_begin();
+            VkBuffer destination,source; uint64_t destination_offset; VkDeviceSize source_offset;
+            CHECK(vk_resolve((uint64_t)(uintptr_t)indices,bytes,&destination,&destination_offset),"GPU index producer resolves its target");
+            uint8_t *staging=vk_transient(bytes,16,&source,&source_offset);
+            for (unsigned i=0;i<8;i++) memcpy(staging+i*stride,&i,stride);
+            VkBufferCopy copy={source_offset,destination_offset,bytes};
+            vkCmdCopyBuffer(vk_cb(),source,destination,1,&copy);
+            vk_gpu_write((uint64_t)(uintptr_t)indices,bytes);
+            p_draw_idx index={.prim=8,.itype=(int)type,.count=8,.base_vertex=2,.base_instance=3,.instances=2,.ibuf=(uint64_t)(uintptr_t)indices};
+            op(OP_SET_RT,&srt,sizeof srt); op(OP_CLEAR_COLOR,&cc,sizeof cc); op(OP_BIND_VBUF,&input,sizeof input);
+            op(OP_DRAW_IDX,&index,sizeof index); op(OP_COPY_T2B,&cp,sizeof cp); op(OP_END,NULL,0);
+            mtl_exec(rec); rn=0;
+            CHECK(mtl_wait(mtl_sub_commit(),5000000000ull),"GPU-produced width%u indices finish on queue",stride);
+            CHECK(!memcmp(expected,readback,sizeof expected),"GPU-produced width%u indices use newer GPU bytes, not stale CPU mapping",stride);
+        }
+        printf("%s: quad strip %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
     if (argc >= 2 && !strcmp(argv[1],"--alpha-test")) {
         CHECK(mtl_wait(run(),5000000000ull),"alpha fixture initial draw completes");
         const float full[]={-1,-1,3,-1,-1,3}; memcpy(vtx,full,sizeof full);

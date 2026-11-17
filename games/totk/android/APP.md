@@ -138,6 +138,31 @@ ones (`assets/expected-v1.4.3.json`). Vulkan driver: `<game>/driver.so` (copied 
 driver. A `shaders/v143/seed.vkpack` selects the indexed seed IO (`TOTK_VK_SEED_IO=1`). Developer builds fill the same
 folder over USB with `install_app.sh data` (install.json goes last). The rest of this file is the development history.
 
+Local independently signed API36 test builds and data-preserving ADB updates are documented in
+[`docs/android-test-builds.md`](../../../docs/android-test-builds.md). Keep the developer signing state outside build caches.
+
+**Graphics → Performance → Low memory mode** reduces how much rendering data stays in memory. Close and reopen
+the game to apply it. It is off by default and independent of graphics presets. Developers can set
+`TOTK_LOW_MEMORY=1` in `<game>/totk.env`. An explicit value in that file overrides the menu. The staging retention
+target is 8 MiB per retired slot, and recorder packet/descriptor slabs use the existing 32 MiB retention budget.
+Image suballocation uses 32 MiB blocks and releases blocks that become empty after fence retirement. Use
+`TOTK_VK_IMAGE_BLOCK_MB=16` to try smaller blocks or `64` for the standard block size.
+Images above 16 MiB continue to use dedicated allocations. `TOTK_VK_IMAGE_PACK=1` selects the experimental
+densest-block placement. It is off by default after a worse transition on the S23+ accounted for in the
+[device report](../../../docs/s23-device-validation.md#optimization-trials-after-the-source-comparison).
+Descriptor pools use quarter capacities
+(`TOTK_VK_DESC_COMPACT=1`), falling back
+to full-size pools for layouts that need them. Pipeline prewarming is disabled (`TOTK_PSO_PREWARM=0`) and shader
+warm payloads are bounded to16MiB (`TOTK_SEED_WARM_MB=16`); shaders still load on demand, with possible first-use
+stutter. Explicit values for the underlying variables take precedence. Active allocations can exceed retention targets.
+This profile does not shrink the guest heap or lower image quality and is not a guarantee against Android low-memory termination.
+Use `tools/android_memory_capture.py` to retain package exit reasons and separate system/app counters; overlapping
+RSS/PSS/GPU/shared-memory values must not be added as if they were disjoint.
+
+**Graphics → Screen → Aspect ratio** separates camera ratios (4:3, 16:9, 21:9, and 32:9) from **Stretch to fill**.
+Stretch scales the final picture to the window, including the HUD, while using the standard camera. It applies on
+the next launch. The developer equivalent is `TOTK_PRESENT_STRETCH=1`.
+
 *Game data → Graphics driver* accepts a bare ELF64 AArch64 `.so` or an AdrenoTools Turnip `.zip`, detected by content.
 `DriverImport.java` stages a bounded archive privately, reads `meta.json` (up to 64 KiB) and selects its exact
 `libraryName` entry (including nested paths); without metadata exactly one `.so` is required. Other entries are
@@ -1269,7 +1294,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_FRAMEGEN=locked`, `TOTK_FRAMEGEN_LEAD_REFRESHES=1` / `2`, `TOTK_FRAME_LAG=0` / `1` | Locked camera device-qualified on Thor/Odin; Thor's qualified profile lag0, Odin measured lag1. Lead and optional FSR phase bounds compose as above; no Duo qualification. |
 | `TOTK_PRESENT_TIMELINE`, `TOTK_PRESENT_FLOOR_NS`, `TOTK_PRESENT_DEDUPE`, `TOTK_PRESENT_GUARD_NS` | Independently default-off locked-AHB qualification controls; exact behavior and limits are documented in [Experimental API timeline and timestamp corrections](#experimental-api-timeline-and-timestamp-corrections-default-off). |
 | `TOTK_DRS_FRAMEGEN=1` | Experimental, default off; applies only to locked real30 frame generation with explicit `TOTK_FPS60=0`. See [Native DRS headroom for locked frame generation](#native-drs-headroom-for-locked-frame-generation-experimental-default-off). |
-| `TOTK_ADPF=full`, `TOTK_FRAME_RATE_HINT=1` | Opt-in full ADPF and display content-rate hint; the existing render-only ADPF session remains default. See [Android performance hints](#android-performance-hints-experimental-full-mode). |
+| `TOTK_ADPF=full`, `TOTK_FRAME_RATE_HINT` | Full ADPF is opt-in; display refresh requests are enabled by default (`0` disables them). The existing render-only ADPF session remains default. See [Android performance hints](#android-performance-hints-experimental-full-mode). |
 | Aligned scene-size classifier | Always on for colour-target pipeline keys; no setting. See [Shader compiles and the pipeline cache](#shader-compiles-and-the-pipeline-cache). |
 | Packaged PSO keylist / prewarm | APK binary is generated from `games/totk/assets/pso_keys.tsv`; startup prewarm is on when packaged keys exist. `TOTK_PSO_PREWARM=0` opts out. See [Shader compiles and the pipeline cache](#shader-compiles-and-the-pipeline-cache). |
 | `TOTK_FRAMEGEN=hybrid` | Existing opt-in Odin policy. `TOTK_HYBRID_DROP_FPS`, `TOTK_HYBRID_DROP_SECONDS`, `TOTK_HYBRID_RECOVER_SECONDS`, `TOTK_HYBRID_RECOVER_SCORE`, `TOTK_HYBRID_DWELL_SECONDS` are host-tested policy tuners, not individually device-qualified values. |
@@ -4017,8 +4042,8 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_REC_ASYNC_SUBMIT` | On when recorder workers are enabled | Explicit `0` keeps walking-thread assembly/submit. Existing diagnostic and software-protection exclusions are unchanged. |
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
-| `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
-| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate; needs `TOTK_FRAME_RATE_HINT=1`. Invalid/unavailable rates retain the existing policy. See below. |
+| `TOTK_FRAME_RATE_HINT` | `1` | Persistent refresh request through the activity window, native window and zero-copy SurfaceControl; explicit `0` disables it. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_FRAME_RATE_HINT_HZ` | `max` | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate. Explicit empty/`0` restores content-rate hints. Invalid/unavailable rates fall back to content-rate hints. See below. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
@@ -4117,7 +4142,16 @@ time minus the existing acquire pacing duration; GPU/dependency waits are retain
 Zero/invalid work and >=250ms discontinuities are not reported. Stable frames allocate
 nothing in our hint code; session creation happens only at configuration changes.
 
-`TOTK_FRAME_RATE_HINT=1` requests 60fps for locked/native60. Plain30 requests 30fps only
+By default, gameplay requests the highest advertised refresh rate of its current window display through both
+native hint targets and `WindowManager.LayoutParams.preferredRefreshRate`. This keeps a persistent app-side
+vote after a vendor's touch boost expires, including controller-only gameplay. It requests 120 Hz on a display
+advertising 120 Hz and 60 Hz on a 60-Hz display; Android still decides the actual rate under the user's display
+settings, power saving and thermal constraints. No global settings, display-mode IDs or synthetic input are used.
+The activity-window preference is cleared on pause and restored on resume. The validated rate remains independent
+of measured idle refresh and guest FPS, and repeated lifecycle revalidation avoids redundant window updates.
+See [Samsung refresh investigation](../../../docs/samsung-refresh-rate.md) for qualification limits.
+
+Explicit `TOTK_FRAME_RATE_HINT_HZ=0` (or empty) restores the content policy: locked/native60 requests 60fps. Plain30 requests 30fps only
 without a physical-clock lattice; fixed present slots, display pacing or acquire clocks
 retain a 60fps request so a 30Hz panel mode cannot turn two physical slots into 15fps.
 The SurfaceControl request is also applied to the actual zero-copy child, not only its
@@ -4134,9 +4168,10 @@ rate of the last `<ms>`: up at once, down only after the lower rate held that lo
 which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
 change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
 
-`TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
-request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
-policy. Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+`TOTK_FRAME_RATE_HINT_HZ=120` explicitly selects a 120 Hz app-side FIXED_SOURCE
+request on both the native window and actual AHB child, with a matching activity-window preference.
+Unset selects `max`; empty/`0` keeps content-rate hints without an activity-window preference.
+Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
 `decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
 rounding such as 120.00001 but not substituting a distinct fractional mode. `max` instead selects the highest finite
 positive rate advertised by that same display, retaining its fractional Hz through both native hint targets.
@@ -4149,8 +4184,8 @@ This is not a preferred-mode/system-setting write and cannot override an OS/user
 Treat an accepted hint only as a request; measure game intervals, framework fences and real physical
 panel cadence separately before claiming even 40 fps at 120 Hz.
 
-Device comparison arms are unchanged default / `TOTK_ADPF=0` /
-`TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same
+For a refresh-policy comparison, use default / `TOTK_FRAME_RATE_HINT=0` /
+`TOTK_FRAME_RATE_HINT_HZ=0` / `TOTK_FRAME_RATE_HINT_HZ=60`, interleaved on the same
 profile, save, shader seed and cache state. Do not flip the full-mode default without
 per-layer SurfaceFlinger cadence plus performance, power and temperature evidence.
 
@@ -5589,6 +5624,15 @@ the shutdown test covers that process-exit model, not Java lifecycle/device
 integration. This change establishes no measured on-device FPS improvement.
 
 ## Shader compiles and the pipeline cache
+
+For an opt-in selective warm-up trial, collect a route with `TOTK_PSO_COLLECT=1` and `TOTK_PSO_TRACE=1`.
+Use `scripts/select_hot_pso_keys.py` from the TotK directory with the resulting `.pso-keys` and `totk.log`.
+It ranks exact capture keys by measured successful synchronous build time, verifies they match the shader
+manifest and emits a small binary key list. Test it with `TOTK_PSO_PREWARM=1` and `TOTK_PSO_KEYS` pointed
+at that list, keeping the same initial driver cache and save for the comparison. The default is eight keys.
+The worker's `first-demand` trace records whether a selected key was ready, queued, building or failed
+when encountered. On Vulkan 1.3, `pso-feedback` rows also report valid driver duration and app-cache-hit
+feedback for graphics pipelines. Compare measured first usage and gameplay latency before sharing a list.
 
 Turnip needs 70–150 ms to compile each pipeline with a shader it hasn't seen, which used to freeze the game for up to
 3 s on the first visit to an area. Pipelines the driver has to compile are now built on two worker threads

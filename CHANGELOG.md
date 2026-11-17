@@ -5,7 +5,38 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
 
 ## Unreleased
 
+### Issue-audit candidates
+- Add **Low memory mode** to Graphics → Performance, with fenced reclamation of
+  empty Vulkan image blocks, compact descriptor pools with a wide-layout fallback,
+  bounded shader warming and demand pipeline preparation. Guest resources and image quality
+  are preserved. The initial compact profile survived 10 minutes of sky gameplay and a 12-minute surface session
+  on an 8 GB S23+, then hit a foreground low-memory exit on a longer Akkala run. The revised profile uses 32 MiB
+  image blocks and an 8 MiB staging retention target per slot. It still hit foreground LMKD during a Depths
+  warp after sustained gameplay. A fresh process completed that warp and returned to the surface.
+- Accept up to4096 save files, retaining byte/path/archive limits, so complete compendium
+  photographs can be imported and exported without deleting pictures.
+- Integrate upstream PR43 wind shader compatibility, PR44 black-wheel capture guards,
+  PR45 mod/IPS import, and PR21 docked presentation scaling. Real scene acceptance remains
+  separate from host tests and successful compilation.
+- Expose 1080p rendering, 4:3/21:9/32:9 camera aspect, an option to stretch the picture to fill the display,
+  and rumble gains up to 400% in the menu.
+- Open the existing menu with Android Back, including Android16 predictive-back dispatch.
+  Bind the visible menu to the paused game process so it retains foreground-related importance;
+  unbind when the menu leaves. This does not exempt it from actual system memory exhaustion.
+- Convert guest60Hz present intervals to physical display slots so high-refresh panels
+  retain the selected30/60fps policy;40/unlimited/interpolation retain their own clocks.
+- Add quad-strip rendering and GPU conversion for indexed quads/strips. The converter handles8/16/32-bit
+  indices, restart markers, incomplete groups and instance/base offsets in queue order, including GPU-produced
+  input. Generated counts drive indirect draws in both direct and recorder paths. A real Hero's Path scene
+  discarded primitive8 before this change;253 live Vulkan checks pass after a red regression.
+  The recorded trail is now visible at both inspected map zoom levels on the S23+.
+  Indexed-quad UI replay remains disabled in generated frames.
+- Add a separately signed API36 development APK builder with persistent signing identity,
+  monotonic build numbers, content/signature audit and optional data-preserving ADB update.
+
 ### Developer tools
+- Select a bounded warm-up list from measured slow synchronous capture pipelines. Trace graphics pipeline
+  creation feedback and the readiness of each prewarmed key at first use.
 - Add launch-only, default-off `TOTK_BENCH_TIME=HH:MM` for restored-save benchmark arms.
   It pins the native effective clock, overriding timeline/sleep/day progression; weather and randomness remain uncontrolled.
   Host guards and ARM64 state fixtures do not establish device HUD/sky or unchanged-save behavior.
@@ -24,12 +55,23 @@ the game version it runs is shown separately. versionCode = major × 10000 + min
   Per-thread period-weighted self/inclusive reports separate walker, recorder, submit and game CPU.
 - Give newly linked `libtotk.so` a SHA-1 GNU build ID retained in the packaged library,
   so native profiles can identify matching unstripped symbols without relying on source revision alone.
-- Add experimental `TOTK_FRAME_RATE_HINT_HZ` (default off, needs `TOTK_FRAME_RATE_HINT=1`): request integer
+- Add `TOTK_FRAME_RATE_HINT_HZ` (default `max`, hints enabled unless explicitly disabled): request integer
   rates advertised by the current game-window display, or `max` for its highest rate (including fractional Hz),
   through the existing FIXED_SOURCE window/AHB-child hints. Invalid or unavailable rates retain the old hint
   policy; game pacing and Android settings remain unchanged.
 
 ### Runtime
+- Skip shared-image reclamation scans until
+  the next possible expiry while preserving the 600-submission reuse window and fence retirement.
+- Keep a persistent gameplay refresh request on the activity window and native window/AHB child by default,
+  addressing Samsung controller-only play dropping to a low idle refresh after the touch boost expires.
+  Request the current display's highest advertised rate (including fractional Hz), subject to Android's user,
+  battery and thermal limits. Clear the activity-window preference on pause and restore it on resume.
+  `TOTK_FRAME_RATE_HINT_HZ=60` selects an explicit 60 Hz request; `0` restores content-rate hints and
+  `TOTK_FRAME_RATE_HINT=0` disables requests. Game FPS and timing are unchanged.
+  Native/JVM policy/lifecycle fixtures pass. On S23+, a601s island trial retained120Hz in all120 framework
+  samples without touch boost; Samsung Standard limited it to60Hz and Adaptive restored120Hz.
+  The S23+ also retained 120 Hz in all 144 samples during a 12-minute surface session.
 - Fix shader translation for compute texture gathers with runtime offsets.
   The translator now lowers those offsets before emitting SPIR-V instead of putting runtime values in constants.
   Existing generated shader seeds need replacement to receive the corrected modules.

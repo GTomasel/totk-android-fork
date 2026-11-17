@@ -95,7 +95,7 @@ class SetupActivity extends Activity {
     boolean moveSettingsToMain(Intent intent){return false;}
     boolean returnToRunningGame(Intent intent){return false;}
     void showUi(){ui=true; screen=Screen.HOME;}
-    void render(){} void startUi(){}
+    void render(){} void startUi(){} void bindVisibleGame(){}
 '''
 AUTH_TEST = r'''
     static void require(boolean condition,String why){if(!condition)throw new AssertionError(why);}

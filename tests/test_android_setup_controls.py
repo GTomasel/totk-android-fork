@@ -367,13 +367,14 @@ class SetupControlTests(unittest.TestCase):
         methods = section(source, '    private void gameControl(', '    private void gameBanner(')
         close = section(source, '    private void closeGame()', '    // ---------- lifecycle')
         start = section(source, '    @Override protected void onStart()', '    @Override protected void onResume()')
-        stop = section(source, '    @Override protected void onStop()', '    /** A card mounted,')
+        # Visible-game service binding has its own production-method fixture in test_android_game_menu.py.
+        stop = section(source, '    @Override protected void onStop()', '    /** The visible menu still depends')
         refresh = section(source, '    private final Runnable refresh', '    @Override protected void onDestroy()')
         show = section(source, '    private void showUi()', '    /** A move killed')
         show_tail = show.rsplit('        render();', 1)[1]
         logger = section(state, '    static void logGameDecision(', '    /** Only an acquired game lock')
         probe = cls.work / 'SetupActivity.java'
-        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + methods + close + start + stop + refresh
+        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + 'void bindVisibleGame() {} void unbindVisibleGame() {}\n' + methods + close + start + stop + refresh
                          + '    private void showUi() { ui = true; render();' + show_tail + JAVA_TESTS)
         log = cls.work / 'android/util/Log.java'; log.parent.mkdir(parents=True); log.write_text(LOG)
         process = cls.work / 'android/os/Process.java'; process.parent.mkdir(parents=True)

@@ -49,6 +49,7 @@ class AndroidDriverStartup(unittest.TestCase):
 #define __ANDROID__ 1
 #define TOTK_ANDROID_APP 1
 #define TOTK_BUILD_KIND "host-order"
+#include "android_memory.h"
 #include <assert.h>
 #include <dirent.h>
 #include <dlfcn.h>

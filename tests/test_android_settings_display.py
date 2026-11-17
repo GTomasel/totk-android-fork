@@ -190,7 +190,8 @@ class SettingsDisplayTests(unittest.TestCase):
 class SetupActivity extends Activity {
     static final String EXTRA_SETTINGS="settings",EXTRA_GAME_ERROR="error",EXTRA_UPDATE="update";
     enum Screen {HOME,WELCOME,DATA,INSTALL,ERROR,INTERRUPTED}
-    boolean ui,closingGame; Runnable blockedAction; Screen screen,recovery=Screen.HOME;
+    boolean ui,closingGame,started; Runnable blockedAction; Screen screen,recovery=Screen.HOME;
+    void bindVisibleGame(){} // Separately exercised by test_android_game_menu.py.
     String gameError; int shown,replacements;
     boolean pendingAsked;
     void requestedUpdate() {}
