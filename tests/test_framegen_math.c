@@ -48,8 +48,9 @@ static void focal_interpolation(void) {
         const double y=0.5-world_y*focal/4;
         const double expected_u=0.5+world_x*(FG_TEST_H/(double)FG_TEST_W*pm)/4;
         const double expected_v=0.5-world_y*pm/4;
-        CHECK(fg_math_project(transform[side],(float)x,(float)y,fg_test_depth(2),uv),
-              "FOV source point projects into midpoint");
+        int projected=fg_math_project(transform[side],(float)x,(float)y,fg_test_depth(2),uv);
+        CHECK(projected,"FOV source point projects into midpoint");
+        if (!projected) continue;
         close_to(uv[0],expected_u,2e-6,"FOV midpoint horizontal projection is analytic");
         close_to(uv[1],expected_v,2e-6,"FOV midpoint vertical projection is analytic");
     }

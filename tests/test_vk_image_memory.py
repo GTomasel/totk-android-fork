@@ -72,6 +72,7 @@ int main(int argc, char **argv) {
         assert(allocated == 16 * MiB + req.size);
         vk_mem_free(&whole); vk_mem_free(&large);
         assert(!allocated && !g_mem_block_bytes && !g_mem_dedicated_bytes);
+        assert(g_mem_block_allocs == 2 && g_mem_block_releases == 2);
         return 0;
     }
     if (!strcmp(argv[1], "packed")) {
@@ -93,6 +94,7 @@ int main(int argc, char **argv) {
         assert(allocated == 32 * MiB && releases == 1 && sizes[a[5].mem]);
         for (int i = 3; i < 6; i++) vk_mem_free(&a[i]);
         assert(!allocated && releases == 2);
+        assert(g_mem_block_allocs == 2 && g_mem_block_releases == 2);
         puts("packing preserved an emptyable block without changing any live handle");
         return 0;
     }

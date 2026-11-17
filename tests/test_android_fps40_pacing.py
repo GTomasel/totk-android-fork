@@ -160,6 +160,10 @@ int main(int argc, char **argv) {
     assert(resumed.interval == 3 && resumed.desired_ns >= stale.desired_ns + 3 * hz120);
     assert(!memcmp(&queued, &saved, sizeof saved));
     assert(invalidations == 3);
+    (void)display_callback_observation;
+    (void)display_fence_observation;
+    (void)display_callback_measured_ns;
+    (void)display_callback_calibrated;
     return 0;
 }
 '''
