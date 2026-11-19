@@ -68,3 +68,7 @@ python3 games/totk/android/build_release.py \
 The release build targets API 36 and supports Android 13 and later on ARM64, subject to
 device and Vulkan compatibility. It is non-debuggable. Keep the release signing key
 separate from the development key. GitHub receives the audited APK and its SHA-256 checksum.
+
+Source regressions run locally. With the build dependencies installed, run
+`python -m unittest discover -s tests -v` from the repository root. See
+[Building](building.md) for the host toolchain and test dependencies.
