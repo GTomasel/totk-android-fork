@@ -67,8 +67,9 @@ static void focal_interpolation(void) {
         const double y=0.5-world_y*focal/4;
         const double n=side?0.1:1,far=side?5000:25000;
         const float d=(float)(far/(far-n)-far*n/((far-n)*2));
-        CHECK(fg_math_project(transform[side],(float)x,(float)y,d,uv),
-              "reverse FOV source point projects with its own clip range");
+        int projected=fg_math_project(transform[side],(float)x,(float)y,d,uv);
+        CHECK(projected,"reverse FOV source point projects with its own clip range");
+        if (!projected) continue;
         close_to(uv[0],0.31,2e-6,"reverse FOV horizontal analytic midpoint");
         close_to(uv[1],0.64,2e-6,"reverse FOV vertical analytic midpoint");
     }

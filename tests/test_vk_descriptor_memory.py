@@ -83,7 +83,8 @@ static VkResult vkAllocateDescriptorSets(int device, const VkDescriptorSetAlloca
  return 0;
 }
 '''
-        source += section(recorder, 'const VkDescriptorPoolSize vk_desc_pool_sizes', 'int vk_desc_layout_fits(')
+        source += section(recorder, 'const VkDescriptorPoolSize vk_desc_pool_sizes', 'uint32_t vk_desc_idle_keep(')
+        source += section(recorder, 'VkResult vk_desc_pool_create(', 'int vk_desc_layout_fits(')
         source += section(recorder, 'static uint32_t alloc_sets(', '/* Descriptor-set stock')
         source += section(primary, 'static uint32_t slot_alloc_sets(', 'VkDescriptorSet vk_alloc_set(')
         source += r'''

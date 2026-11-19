@@ -115,6 +115,8 @@ static const struct fake_jni jni = {
 };
 '''
         source += section(frontend, 'static jmethodID surface_parent_method(',
+                          '/* The activity stays live until on_destroy')
+        source += section(frontend, 'static void frame_rate_hint_update(',
                           '/* Optional Java32 root hint listener')
         source += r'''
 static void settings(const char *on, const char *hz) {

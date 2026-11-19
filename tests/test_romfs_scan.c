@@ -17,6 +17,11 @@ static int visit(void *user, const char *rel, const char *file, const struct sta
 
 int main(int argc, char **argv) {
     if (argc < 2) return 2;
+    if (argc > 2 && !strcmp(argv[2], "recover")) {
+        int rc = romfs_import_recover(argv[1]);
+        printf("R\t%d\t%d\n", rc, rc == -1 ? errno : 0);
+        return 0;
+    }
     stop_after = argc > 2 && !strcmp(argv[2], "stop");
     RomfsScanCounts c;
     int rc = romfs_scan_tree(argv[1], visit, NULL, &c);

@@ -41,15 +41,19 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     uint32_t w = mip(d->width, level), h = one_d ? 1 : mip(d->height, level);
     *slices = d->target == 2 ? mip(d->depth ? d->depth : 1, level) : 1;
     *row_bytes = (w + bw - 1) / bw * *bpb; *rows = (h + bh - 1) / bh;
-    *base = (uint64_t)layer * L.layer_size + nvn_tex_level_offset(d, level);
-    nvn_tex_level_tiles(d, level, th, td);
+    unsigned tiles[2];
+    nvn_tex_level_layout(d, level, &L, base, tiles);
+    *base += (uint64_t)layer * L.layer_size;
+    *th = tiles[0];
+    *td = tiles[1];
     return 0;
 }
 
 /* Storage-order traversal lets the same engine move a bounded contiguous guest span. Padding is never copied.
-   Full decode/encode use the entire span; settled write-back resumes at GOB boundaries without a second swizzler. */
+   Full decode/encode use the entire span; span_into addresses only the supplied destination object. */
 static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch,
-                int to_linear, uint64_t first, uint64_t count) {
+                int to_linear, uint64_t first, uint64_t count, int span_into) {
+    uint64_t origin = span_into ? first : 0;
     if (nvn_tex_is_linear(d)) {
         if (level || layer || d->samples > 1 || (d->target != 0 && d->target != 1 && d->target != 7)) return -1;
         int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
@@ -64,51 +68,113 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
             uint64_t lo = first > y * stride ? first - y * stride : 0;
             uint64_t hi = end - y * stride < row ? end - y * stride : row;
             if (lo >= hi) continue;
-            if (to_linear) memcpy(lin + y * pitch + lo, bl + y * stride + lo, (size_t)(hi - lo));
-            else memcpy(bl + y * stride + lo, lin + y * pitch + lo, (size_t)(hi - lo));
+            uint8_t *p = bl + (y * stride + lo - origin);
+            if (to_linear) memcpy(lin + y * pitch + lo, p, (size_t)(hi - lo));
+            else memcpy(p, lin + y * pitch + lo, (size_t)(hi - lo));
         }
         return 0;
     }
     uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes) return -1;
-    if (first % 512 || (count != UINT64_MAX && count % 512)) return -1;
+    if (!span_into && (first % 512 || (count != UINT64_MAX && count % 512))) return -1;
     uint64_t bh = UINT64_C(1) << th, bd = UINT64_C(1) << td, gx = (row_bytes + 63) / 64;
     uint64_t by = (rows + 8 * bh - 1) / (8 * bh), bz = (slices + bd - 1) / bd;
-    uint64_t total = gx * by * bz * bh * bd * 512;
-    if (first >= total) return 0;
+    unsigned block_shift = th + td;
+    uint64_t block_gobs = UINT64_C(1) << block_shift;
+    uint64_t total = gx * by * bz * block_gobs * 512;
+    if (first >= total || !count) return 0;
     uint64_t end = count < total - first ? first + count : total;
-    bl += base;
-    for (uint64_t gob = first / 512; gob < end / 512; gob++) {
-        uint64_t block = gob / (bh * bd), within = gob % (bh * bd);
-        uint32_t x = (uint32_t)(block % gx * 64), y = (uint32_t)(block / gx % by * 8 * bh + within % bh * 8);
-        uint32_t z = (uint32_t)(block / (gx * by) * bd + within / bh);
-        if (z >= slices) continue;
-        for (uint32_t yy = 0; yy < 8 && y + yy < rows; yy++) {
-            uint8_t *row = lin + ((size_t)z * rows + y + yy) * pitch;
-            for (uint32_t xx = 0; xx < 64 && x + xx < row_bytes; xx += 16) {
-                uint32_t n = row_bytes - x - xx < 16 ? row_bytes - x - xx : 16;
-                uint8_t *p = bl + gob * 512 + gob_off(xx, yy);
-                if (to_linear) memcpy(row + x + xx, p, n); else memcpy(p, row + x + xx, n);
+    if (span_into) {
+        /* An alias span can begin or end within a GOB. Limit each copy
+           to bytes owned by this contiguous mapping. */
+        for (uint64_t gob = first / 512; gob <= (end - 1) / 512; gob++) {
+            uint64_t block = gob >> block_shift, within = gob & (block_gobs - 1);
+            uint32_t x = (uint32_t)(block % gx * 64);
+            uint32_t y = (uint32_t)((block / gx % by * bh + (within & (bh - 1))) * 8);
+            uint32_t z = (uint32_t)(block / (gx * by) * bd + (within >> th));
+            if (z >= slices) continue;
+            for (uint32_t yy = 0; yy < 8 && y + yy < rows; yy++) {
+                uint8_t *row = lin + ((size_t)z * rows + y + yy) * pitch;
+                for (uint32_t xx = 0; xx < 64 && x + xx < row_bytes; xx += 16) {
+                    uint32_t bytes = row_bytes - x - xx < 16 ? row_bytes - x - xx : 16;
+                    uint64_t offset = gob * 512 + gob_off(xx, yy);
+                    if (offset >= end || first >= offset + bytes) continue;
+                    uint32_t lo = first > offset ? (uint32_t)(first - offset) : 0;
+                    if (end - offset < bytes) bytes = (uint32_t)(end - offset);
+                    memcpy(bl + (offset + lo - origin), row + x + xx + lo, bytes - lo);
+                }
             }
+        }
+        return 0;
+    }
+    bl += base;
+    /* A requested span can start inside a block. Decode its coordinates once,
+       then advance through x/y/z in storage order. */
+    uint64_t gob = first / 512, last_gob = end / 512, block = gob >> block_shift;
+    uint64_t block_row = block / gx;
+    uint64_t block_x = block % gx, block_y = block_row % by, block_z = block_row / by;
+    while (gob < last_gob) {
+        uint32_t x = (uint32_t)(block_x * 64);
+        uint32_t width = row_bytes - x < 64 ? row_bytes - x : 64;
+        uint64_t within = gob & (block_gobs - 1), take = block_gobs - within;
+        if (take > last_gob - gob) take = last_gob - gob;
+        for (uint64_t i = 0; i < take; i++, within++, gob++) {
+            uint32_t y = (uint32_t)((block_y * bh + (within & (bh - 1))) * 8);
+            uint32_t z = (uint32_t)(block_z * bd + (within >> th));
+            if (z >= slices || y >= rows) continue;
+            uint8_t *rows_start = lin + ((size_t)z * rows + y) * pitch + x;
+            uint8_t *tile = bl + gob * 512;
+            uint32_t height = rows - y < 8 ? rows - y : 8;
+            for (uint32_t yy = 0; yy < height; yy++) {
+                uint8_t *row = rows_start + yy * pitch;
+                uint8_t *p = tile + gob_off(0, yy);
+                if (width == 64) {
+                    /* Four complete 16-byte runs. A fixed-size copy lets both
+                       ARM64 and x86-64 use unaligned vector loads and stores. */
+                    if (to_linear) {
+                        memcpy(row, p, 16);
+                        memcpy(row + 16, p + 32, 16);
+                        memcpy(row + 32, p + 256, 16);
+                        memcpy(row + 48, p + 288, 16);
+                    } else {
+                        memcpy(p, row, 16);
+                        memcpy(p + 32, row + 16, 16);
+                        memcpy(p + 256, row + 32, 16);
+                        memcpy(p + 288, row + 48, 16);
+                    }
+                } else for (uint32_t xx = 0; xx < width; xx += 16) {
+                    uint32_t n = width - xx < 16 ? width - xx : 16;
+                    uint8_t *edge = tile + gob_off(xx, yy);
+                    if (to_linear) memcpy(row + xx, edge, n); else memcpy(edge, row + xx, n);
+                }
+            }
+        }
+        if (++block_x == gx) {
+            block_x = 0;
+            if (++block_y == by) { block_y = 0; block_z++; }
         }
     }
     return 0;
 }
 
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
-    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 0, UINT64_MAX);
+    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 0, UINT64_MAX, 0);
 }
 int nvn_deswizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch,
                        uint64_t offset, uint64_t size) {
-    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, offset, size);
+    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, offset, size, 0);
 }
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
-    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0, 0, UINT64_MAX);
+    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0, 0, UINT64_MAX, 0);
 }
 int nvn_swizzle_span(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t pitch,
                      void *dst, uint64_t offset, uint64_t size) {
-    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, pitch, 0, offset, size);
+    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, pitch, 0, offset, size, 0);
+}
+int nvn_swizzle_span_into(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t pitch,
+                          void *dst_span, uint64_t offset, uint64_t size) {
+    return move(d, level, layer, (uint8_t *)dst_span, (uint8_t *)src, pitch, 0, offset, size, 1);
 }
 
 /* Traverse only the requested rows, splitting at the GOB's contiguous 16-byte

@@ -148,9 +148,10 @@ class ModImportTests(unittest.TestCase):
         self.assertEqual(self.probe('zip', self.zipped(big), self.files, 'interrupt'), 'failed interrupted source')
         self.assertEqual(self.probe('tree', self.tree(big, 'Bigger'), self.files, 'interrupt'), 'failed interrupted before commit')
         self.assertEqual((self.installed(), self.leftovers()), (before, ['v143']))
-        # a swap cut short between its two renames: the menu (recover) and the next import put the earlier mods back
+        # The menu reads a stranded backup without racing an import; recovery happens under the game lock.
         (self.files / 'mods/v143').rename(self.files / 'mods/v143.old')
-        self.assertEqual(self.probe('read', self.files), 'none')
+        self.assertEqual(self.probe('read', self.files), f'{SUMMARY} source=Merged')
+        self.assertEqual(self.leftovers(), ['v143.old'])
         self.assertEqual(self.probe('recover', self.files), f'{SUMMARY} source=Merged')
         self.assertEqual((self.installed(), self.leftovers()), (before, ['v143']))
         (self.files / 'mods/v143').rename(self.files / 'mods/v143.old')
@@ -166,9 +167,27 @@ class ModImportTests(unittest.TestCase):
         self.assertEqual(self.probe('tree', root, self.files), 'imported files=1 bytes=1 patches=0 modules= ignored=0 source=Merged')
         self.assertEqual(self.installed(), {'romfs/a.bin', 'import.txt'})
 
+    def test_ignored_zip_directory_payload_counts_against_expansion_limit(self):
+        # Use the production parser with a small quota so the rejected input stays tiny.
+        source = self.case / 'ModImport.java'
+        code = SOURCES[0].read_text()
+        self.assertIn('MAX_BYTES = 64L << 30', code)
+        source.write_text(code.replace('MAX_BYTES = 64L << 30', 'MAX_BYTES = 1024L'))
+        classes = self.case / 'bounded-classes'
+        subprocess.run([shutil.which('javac'), '--release', '17', '-d', str(classes), str(source), str(SOURCES[1])],
+                       capture_output=True, text=True, check=True)
+        source_zip = self.zipped({'ignored/': b'x' * 2048, 'romfs/file.bin': b'y'})
+        result = subprocess.run([self.java, '-cp', str(classes), 'com.aure.totk.setup.ModProbe',
+                                 'zip', str(source_zip), str(self.files)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), 'invalid too_big')
+        self.assertEqual((self.installed(), self.leftovers()), (set(), []))
+
     def test_the_runtime_looks_where_the_import_writes(self):
         frontend = (GAME / 'runtime/frontend_android.c').read_text()
         self.assertIn('a->internalDataPath', frontend[frontend.index('Player mods (runtime/romfs.c'):][:2500])
+        self.assertLess(frontend.index('g_game_lock = android_game_lock'),
+                        frontend.index('romfs_import_recover(p)'))
         self.assertIn('"mods/" + VERSION', SOURCES[0].read_text())
         self.assertIn('VERSION = "v143"', SOURCES[0].read_text())
 

@@ -112,6 +112,19 @@ class RomfsScan(unittest.TestCase):
         files, counts = self.scan(self.tree({'a.bin': 1, 'b.bin': 1, 'c/d.bin': 1}), 'stop')
         self.assertEqual((len(files), counts[0]), (1, 7))
 
+    def test_cold_start_recovers_an_interrupted_mod_swap(self):
+        parent = self.tree({'v143.old/romfs/old.bin': 4, 'v143.incoming/romfs/uncommitted.bin': 3})
+        active = parent / 'v143'
+        command = [str(self.exe), str(active), 'recover']
+        self.assertEqual(subprocess.check_output(command, text=True), 'R\t0\t0\n')
+        self.assertEqual(self.scan(active / 'romfs')[0], {'old.bin': 4})
+        self.assertTrue((parent / 'v143.incoming/romfs/uncommitted.bin').is_file())
+        self.assertFalse((parent / 'v143.old').exists())
+        (parent / 'v143.old').mkdir()
+        self.assertEqual(subprocess.check_output(command, text=True), 'R\t0\t0\n')
+        self.assertTrue((active / 'romfs/old.bin').is_file())
+        self.assertTrue((parent / 'v143.old').is_dir())
+
 
 if __name__ == '__main__':
     unittest.main()

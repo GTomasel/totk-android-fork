@@ -93,6 +93,27 @@ int main(int argc, char **argv) {
         if (vk_seed_pack_open(&valid_fixture, malformed) || valid_fixture.count != 2) errors++;
         vk_seed_pack_close(&valid_fixture);
     }
+    /* Index order follows names, while valid payload offsets may be reversed. */
+    put64(fixture + 32 + 88, 248);
+    put64(fixture + 136 + 88, 240);
+    if (!write_file(malformed, fixture, sizeof fixture)) errors++;
+    else {
+        vk_seed_pack reordered = {0};
+        const char *name;
+        const void *data;
+        size_t size;
+        if (vk_seed_pack_open(&reordered, malformed) ||
+            !vk_seed_pack_entry(&reordered, 0, &name, &data, &size) ||
+            strcmp(name, "a.spv") || size != 1 || *(const unsigned char *)data != 0x22 ||
+            !vk_seed_pack_entry(&reordered, 1, &name, &data, &size) ||
+            strcmp(name, "b.vk") || size != 1 || *(const unsigned char *)data != 0x11) errors++;
+        vk_seed_pack_close(&reordered);
+    }
+    put64(fixture + 136 + 96, 9);
+    if (!write_file(malformed, fixture, sizeof fixture) || !expect_rejected(malformed)) errors++;
+    put64(fixture + 136 + 96, 1);
+    put64(fixture + 32 + 88, 240);
+    put64(fixture + 136 + 88, 248);
     if (!write_file(malformed, fixture, sizeof fixture)) errors++;
     else {
         unsigned char saved = fixture[0];

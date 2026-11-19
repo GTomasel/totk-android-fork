@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #ifdef __linux__
 #include <sys/prctl.h>
+#include <unistd.h>
 #endif
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
@@ -29,6 +30,8 @@ enum { REC_WORKERS = 4, REC_RING = 8, REC_DS_CACHE = 2048, REC_POOL_SETS = 1024,
 enum { REC_STORAGE_CLASSES = 24, REC_STORAGE_MIN = 256, REC_STORAGE_SLAB = 1 << 20 };
 typedef struct rec_storage_block {
     struct rec_storage_block *next; struct rec_storage_slab *slab; size_t bytes;
+    uint32_t free_generation;
+    int discarded;
     _Alignas(16) unsigned char data[];
 } rec_storage_block;
 typedef struct rec_storage_slab {
@@ -79,6 +82,12 @@ typedef struct {
     rec_pass pass;
     vk_gpuprof_end_token end; /* assembler never reads the walking profiler */
 } rec_profile_pass;
+enum { REC_DESCRIPTOR_BATCH_LAYOUTS = 4, REC_DESCRIPTOR_BATCH_SIZE = 8 };
+typedef struct {
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet available[REC_DESCRIPTOR_BATCH_SIZE];
+    uint32_t count, singles;
+} rec_descriptor_batch;
 typedef struct rec_context {
     uint32_t lease_head, lease_tail, ncb;
     struct rec_context *retired_next; int retired; /* rec_mu: return-list publication */
@@ -87,6 +96,9 @@ typedef struct rec_context {
     uint64_t stock_events[VK_DESC_STOCK_REASONS + 1];   /* per reason, then pools destroyed; published with the counts */
     vk_desc_stock *stock; /* TOTK_VK_DESC_STOCK=1 only */
     int stock_on;         /* this owner's stock policy, switched only at its generation handoff (descriptors_recycle) */
+    vk_desc_idle desc_idle;
+    uint32_t descriptor_batch_count;
+    rec_descriptor_batch descriptor_batch[REC_DESCRIPTOR_BATCH_LAYOUTS];
     struct {
         uint64_t hash[2]; VkDescriptorSetLayout layout; uint32_t count; VkDescriptorSet set;
         uint64_t guard_ticket; const vk_record_spans *guard_spans;
@@ -146,7 +158,7 @@ static rec_pass *pending_head, *pending_tail;
 static rec_job *small_head, *small_tail; static uint32_t small_jobs, small_draws;
 static rec_job *guard_building;
 static uint32_t current_slot, chunk_draws = 128, lead_draws = 32, inline_draws, pass_draws;
-static int threads = -1, ds_off, dyn_off, vma_names, descriptor_stock;
+static int threads = -1, ds_off, dyn_off, vma_names, descriptor_stock, descriptor_batch;
 static uint32_t descriptor_stock_max;   /* TOTK_VK_DESC_STOCK_MAX_SETS launch value, 0: no ceiling */
 static struct {
     uint32_t ncolor; VkFormat color[8], depth, stencil; VkSampleCountFlagBits samples;
@@ -165,12 +177,18 @@ static _Atomic uint64_t memory_draws, memory_info, memory_cbs, memory_dpools;
 /* Retained descriptor pools of the primary slots (nvn_vk.c) beside memory_dpools (recorder contexts), and the sets held
    in every owner's TOTK_VK_DESC_STOCK stock: the descriptors line reports both arms' retained descriptor memory. */
 static _Atomic uint64_t memory_primary_dpools, stock_sets_retained;
+static _Atomic uint64_t descriptor_idle_freed[2];
+void vk_record_descriptor_idle_free(int primary, uint32_t pools) {
+    if (pools) atomic_fetch_add_explicit(&descriptor_idle_freed[primary != 0], pools, memory_order_relaxed);
+}
 void vk_record_primary_pools(int64_t delta) {
     atomic_fetch_add_explicit(&memory_primary_dpools, (uint64_t)delta, memory_order_relaxed);
 }
 static uint64_t storage_limit = UINT64_C(64) << 20;
 static _Atomic uint64_t storage_reclaims, storage_reclaimed, cb_reclaimed;
 static uint64_t storage_trim_ns, storage_referenced;
+static size_t storage_discard_page;
+static _Atomic uint64_t storage_discard_calls, storage_discarded_bytes;
 /* Descriptor accounting is cumulative; publish owner-local driver counts once per job, not per set. */
 static struct { _Atomic uint64_t sets, calls, resets, stock[VK_DESC_STOCK_REASONS + 1]; } descriptor_stats[REC_WORKERS + 1];
 /* Elapsed timers run only with TOTK_VK_REC_PROFILE=1 or frame tracing (vk_rec_timing_on); the counts are always on. */
@@ -400,12 +418,14 @@ static void *storage_get(rec_storage *storage, size_t bytes, int info, const cha
     STORAGE_UNPOISON(block + 1, info ? capacity - sizeof *block : bytes);
     return block + 1;
 }
-static void storage_put(rec_storage *storage, void *address) {
+static void storage_put(rec_storage *storage, void *address, uint32_t generation) {
     if (!address) return;
     rec_storage_block *block = (rec_storage_block *)address - 1;
     unsigned index = storage_class(block->bytes);
     block->slab->live -= block->bytes; storage_referenced -= block->bytes;
     STORAGE_POISON(address, block->bytes - sizeof *block);
+    block->free_generation = generation;
+    block->discarded = 0;
     block->next = storage->free[index]; storage->free[index] = block;
 }
 static uint32_t storage_capacity(const void *address, size_t element) {
@@ -416,16 +436,40 @@ static uint32_t storage_capacity(const void *address, size_t element) {
 }
 /* Preserve current-scene arrays even when their working set exceeds the idle retention
    allowance. Unlink all free blocks from an empty slab before releasing its mapping. */
-static uint64_t storage_trim(rec_storage *storage, int info) {
+static uint64_t storage_trim(rec_storage *storage, int info, uint32_t generation, size_t page) {
+    enum { DISCARD_AGE = 8, DISCARD_CALLS = 16 };
+    unsigned attempts = 0;
     int empty = 0;
     for (rec_storage_slab *s = storage->slabs; s; s = s->next) empty |= !s->live;
-    if (!empty) return 0;
+    if (!empty && !page) return 0;
     for (unsigned i = 0; i < REC_STORAGE_CLASSES; i++) {
+        int can_discard = page && ((size_t)REC_STORAGE_MIN << i) > page;
+        if (!empty && !can_discard) continue;
         for (rec_storage_block **link = &storage->free[i]; *link; ) {
             rec_storage_block *b = *link;
-            if (!b->slab->live) *link = b->next; else link = &b->next;
+            if (!b->slab->live) { *link = b->next; continue; }
+#ifdef __linux__
+            if (can_discard && attempts < DISCARD_CALLS && !b->discarded &&
+                generation - b->free_generation >= DISCARD_AGE) {
+                /* The header and boundary pages can contain live neighbors
+                   or allocator lists. Only discard whole payload pages. */
+                uintptr_t first = ((uintptr_t)(b + 1) + page - 1) & ~(uintptr_t)(page - 1);
+                uintptr_t end = ((uintptr_t)b + b->bytes) & ~(uintptr_t)(page - 1);
+                if (first < end) {
+                    attempts++;
+                    if (!madvise((void *)first, end - first, MADV_DONTNEED)) {
+                        b->discarded = 1;
+                        atomic_fetch_add_explicit(&storage_discard_calls, 1, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&storage_discarded_bytes, end - first, memory_order_relaxed);
+                    }
+                }
+            }
+#endif
+            if (!empty && attempts >= DISCARD_CALLS) return 0;
+            link = &b->next;
         }
     }
+    if (!empty) return 0;
     uint64_t bytes = 0;
     for (rec_storage_slab **link = &storage->slabs; *link; ) {
         rec_storage_slab *s = *link;
@@ -446,6 +490,46 @@ void vk_record_memory(uint64_t bytes[4]) {
     bytes[3] = atomic_load_explicit(&memory_dpools, memory_order_relaxed);
 }
 #ifdef TOTK_VK_TESTS
+#ifdef __linux__
+static uint64_t test_storage_resident(rec_storage_slab *slab, size_t page) {
+    size_t pages = slab->bytes / page;
+    unsigned char *state = VK_MALLOC(pages);
+    if (mincore(slab, slab->bytes, state)) DIE("recorder storage mincore: %s", strerror(errno));
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < pages; i++) bytes += (state[i] & 1) * page;
+    free(state);
+    return bytes;
+}
+void vk_record_test_discard_free(int enabled, uint64_t out[8]) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    if (page != 4096 && page != 16384 && page != 65536) DIE("unexpected test page size %zu", page);
+    size_t bytes = REC_STORAGE_SLAB / 4 - sizeof(rec_storage_block);
+    rec_storage storage = {0};
+    uint8_t *left = storage_get(&storage, bytes, 0, __func__, "left");
+    uint8_t *hole = storage_get(&storage, bytes, 0, __func__, "hole");
+    uint8_t *right = storage_get(&storage, bytes, 0, __func__, "right");
+    memset(left, 0xa4, bytes);
+    memset(hole, 0x19, bytes);
+    memset(right, 0x66, bytes);
+    out[0] = test_storage_resident(storage.slabs, page);
+    storage_put(&storage, hole, 10);
+    storage_trim(&storage, 0, 17, enabled ? page : 0);
+    out[1] = test_storage_resident(storage.slabs, page);
+    storage_trim(&storage, 0, 18, enabled ? page : 0);
+    out[2] = test_storage_resident(storage.slabs, page);
+    storage_trim(&storage, 0, 19, enabled ? page : 0);
+    out[3] = atomic_load(&storage_discard_calls);
+    out[4] = atomic_load(&storage_discarded_bytes);
+    out[5] = 1;
+    for (size_t i = 0; i < bytes; i++) out[5] &= left[i] == 0xa4 && right[i] == 0x66;
+    uint8_t *reused = storage_get(&storage, bytes, 0, __func__, "reuse");
+    memset(reused, 0xd2, bytes);
+    out[6] = reused == hole;
+    for (size_t i = 0; i < bytes; i++) out[6] &= reused[i] == 0xd2;
+    storage_put(&storage, left, 20); storage_put(&storage, reused, 20); storage_put(&storage, right, 20);
+    out[7] = storage_trim(&storage, 0, 20, enabled ? page : 0);
+}
+#endif
 void vk_record_test_storage(uint64_t values[4]) {
     values[0] = storage_limit; values[1] = atomic_load(&storage_reclaims);
     values[2] = atomic_load(&storage_reclaimed); values[3] = atomic_load(&cb_reclaimed);
@@ -548,15 +632,30 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
 static pthread_once_t desc_memory_once = PTHREAD_ONCE_INIT;
-static int desc_compact;
+static int desc_compact, desc_trim_idle;
 static void desc_memory_policy(void) {
     const char *e = getenv("TOTK_VK_DESC_COMPACT");
     desc_compact = e && !strcmp(e, "1");
+    e = getenv("TOTK_VK_DESC_TRIM_IDLE");
+    desc_trim_idle = e && !strcmp(e, "1");
     LOGV("descriptor compact pools: %d; quarter descriptor capacity, original maxSets; wide layouts fall back to full-size pools. Retained MiB estimates use base capacities and exclude any wide-layout fallback surplus", desc_compact);
+    LOGV("descriptor idle trim: %d; nonstock owners retain their peak use over %d recycled generations",
+        desc_trim_idle, VK_DESC_IDLE_GENERATIONS);
 }
 int vk_desc_compact_pools(void) {
     pthread_once(&desc_memory_once, desc_memory_policy);
     return desc_compact;
+}
+int vk_desc_trim_idle(void) {
+    pthread_once(&desc_memory_once, desc_memory_policy);
+    return desc_trim_idle;
+}
+uint32_t vk_desc_idle_keep(vk_desc_idle *idle, uint32_t used, uint32_t retained) {
+    if (used > idle->peak) idle->peak = used;
+    if (!retained || ++idle->generations < VK_DESC_IDLE_GENERATIONS) return retained;
+    uint32_t keep = idle->peak ? idle->peak : 1;
+    *idle = (vk_desc_idle){0};
+    return keep < retained ? keep : retained;
 }
 VkResult vk_desc_pool_create(uint32_t max_sets, int full_size, VkDescriptorPool *out) {
     VkDescriptorPoolSize sizes[VK_DESC_POOL_TYPES];
@@ -738,20 +837,46 @@ int vk_desc_stock_retire(vk_desc_stock *st, uint32_t ceiling, uint32_t pools, ui
 }
 static VkDescriptorSet alloc_set(rec_context *c, VkDescriptorSetLayout layout) {
     if (c->stock_on) return vk_desc_stock_take(&c->stock, layout, alloc_sets, c);
+    if (descriptor_batch) {
+        /* Reserve extra sets only after an exact layout has needed a full batch in this generation. */
+        rec_descriptor_batch *batch = NULL;
+        for (uint32_t i = 0; i < c->descriptor_batch_count; i++) {
+            if (c->descriptor_batch[i].layout == layout) {
+                batch = &c->descriptor_batch[i];
+                break;
+            }
+        }
+        if (!batch && c->descriptor_batch_count < REC_DESCRIPTOR_BATCH_LAYOUTS) {
+            batch = &c->descriptor_batch[c->descriptor_batch_count++];
+            batch->layout = layout;
+            batch->count = batch->singles = 0;
+        }
+        if (batch && batch->singles == REC_DESCRIPTOR_BATCH_SIZE) {
+            if (!batch->count)
+                batch->count = alloc_sets(c, layout, REC_DESCRIPTOR_BATCH_SIZE, batch->available);
+            return batch->available[--batch->count];
+        }
+        if (batch) batch->singles++;
+    }
     VkDescriptorSet set; (void)alloc_sets(c, layout, 1, &set); return set;
 }
-/* Pools past keep are empty (reset, or never used since the last rebuild): destroyed, their driver memory goes back. */
-static void descriptors_trim(rec_context *c, uint32_t keep) {
-    if (keep >= c->ndp) return;
+/* The previous owner generation has retired. Destroying a pool also frees any sets still allocated in it. */
+static uint32_t descriptors_trim(rec_context *c, uint32_t keep) {
+    if (keep >= c->ndp) return 0;
+    uint32_t freed = c->ndp - keep;
     for (uint32_t i = keep; i < c->ndp; i++) vkDestroyDescriptorPool(V.dev, c->dp[i], NULL);
-    atomic_fetch_sub_explicit(&memory_dpools, c->ndp - keep, memory_order_relaxed);
-    c->stock_events[VK_DESC_STOCK_REASONS] += c->ndp - keep; c->ndp = keep;
+    atomic_fetch_sub_explicit(&memory_dpools, freed, memory_order_relaxed);
+    c->ndp = keep;
+    return freed;
 }
 static void descriptors_recycle(rec_context *c) {
+    c->descriptor_batch_count = 0; /* the pool resets below invalidate the unused handles */
     int want = vk_desc_stock_want();
+    if (want) c->desc_idle = (vk_desc_idle){0};
     if (c->stock_on && !want) {   /* switched off live: give the stock's sets and pools back */
         vk_desc_stock_free(&c->stock);
-        descriptors_trim(c, 0); c->stock_events[VK_DESC_STOCK_OFF]++;
+        c->stock_events[VK_DESC_STOCK_REASONS] += descriptors_trim(c, 0);
+        c->stock_events[VK_DESC_STOCK_OFF]++;
         c->curdp = c->sets = 0; c->stock_on = 0;
         return;
     }
@@ -764,15 +889,100 @@ static void descriptors_recycle(rec_context *c) {
     } else if (want && c->ndp > vk_desc_stock_pool_limit(ceiling, REC_POOL_SETS)) {   /* switched on live over the limit */
         keep = vk_desc_stock_pool_limit(ceiling, REC_POOL_SETS); c->stock_events[VK_DESC_STOCK_POOL_LIMIT]++;
     }
-    /* A stock rebuild resets only pools allocated since the previous one; the default keeps the old policy. */
+    /* All nonstock allocations start at pool zero and walk forward. The last successful
+       allocation marks the end of the used prefix, and a generation with no sets has none. */
+    int idle = !want && !c->stock_on && vk_desc_trim_idle();
     uint32_t dirty = c->stock_on ? (c->ndp ? c->curdp + 1 : 0) : c->ndp;
+    if (idle) {
+        dirty = c->sets ? c->curdp + 1 : 0;
+        keep = vk_desc_idle_keep(&c->desc_idle, dirty, c->ndp);
+    }
     if (dirty > keep) dirty = keep;
     for (uint32_t i = 0; i < dirty; i++) { VKCHECK(vkResetDescriptorPool(V.dev, c->dp[i], 0)); c->descriptor_resets++; }
-    descriptors_trim(c, keep);
+    uint32_t freed = descriptors_trim(c, keep);
+    if (idle) vk_record_descriptor_idle_free(0, freed);
+    else c->stock_events[VK_DESC_STOCK_REASONS] += freed;
     c->curdp = c->sets = 0;
     c->stock_on = want;   /* switched on live: the stock starts empty on reset pools */
 }
 #ifdef TOTK_VK_TESTS
+int vk_record_test_descriptor_batch(int enabled) {
+    (void)vk_record_enabled();
+    enum { LAYOUTS = REC_DESCRIPTOR_BATCH_LAYOUTS + 2, REQUESTS = 2 * REC_DESCRIPTOR_BATCH_SIZE + 2 };
+    rec_context *c = VK_CALLOC(1, sizeof *c);
+    VkDescriptorSetLayout layouts[LAYOUTS];
+    for (unsigned i = 0; i < LAYOUTS; i++) {
+        VkDescriptorSetLayoutBinding binding = {.binding = i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+        VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1, .pBindings = &binding};
+        VKCHECK(vkCreateDescriptorSetLayout(V.dev, &ci, NULL, &layouts[i]));
+    }
+    VkDescriptorSet used[LAYOUTS * REQUESTS];
+    unsigned total = 0;
+    int ok = descriptor_batch == enabled && !vk_desc_stock_want();
+    for (unsigned pass = 0; pass < REQUESTS; pass++) {
+        for (unsigned i = 0; i < LAYOUTS; i++) {
+            VkDescriptorSet set = alloc_set(c, layouts[i]);
+            ok &= set != VK_NULL_HANDLE;
+            for (unsigned j = 0; j < total; j++) ok &= used[j] != set;
+            used[total++] = set;
+        }
+        if (pass + 1 == REC_DESCRIPTOR_BATCH_SIZE)
+            ok &= c->descriptor_sets == total && c->descriptor_calls == total;
+    }
+    unsigned repeated = REQUESTS - REC_DESCRIPTOR_BATCH_SIZE;
+    unsigned batches = (repeated + REC_DESCRIPTOR_BATCH_SIZE - 1) / REC_DESCRIPTOR_BATCH_SIZE;
+    unsigned reserved = enabled ? REC_DESCRIPTOR_BATCH_LAYOUTS * (batches * REC_DESCRIPTOR_BATCH_SIZE - repeated) : 0;
+    unsigned calls = enabled ? REC_DESCRIPTOR_BATCH_LAYOUTS * (REC_DESCRIPTOR_BATCH_SIZE + batches) +
+        (LAYOUTS - REC_DESCRIPTOR_BATCH_LAYOUTS) * REQUESTS : total;
+    ok &= c->descriptor_sets == total + reserved && c->descriptor_calls == calls && c->ndp == 1;
+    printf("descriptor batch: requested=%u allocated=%llu calls=%llu pools=%u\n", total,
+        (unsigned long long)c->descriptor_sets, (unsigned long long)c->descriptor_calls, c->ndp);
+    descriptors_recycle(c);
+    ok &= c->descriptor_batch_count == 0 && !c->sets;
+    (void)alloc_set(c, layouts[0]);
+    ok &= c->descriptor_sets == total + reserved + 1 && c->descriptor_calls == calls + 1;
+    descriptors_trim(c, 0);
+    for (unsigned i = 0; i < LAYOUTS; i++) vkDestroyDescriptorSetLayout(V.dev, layouts[i], NULL);
+    free(c->dp);
+    free(c);
+    return ok;
+}
+
+int vk_record_test_descriptor_idle(int enabled) {
+    rec_context *c = VK_CALLOC(1, sizeof *c);
+    VkDescriptorSetLayoutBinding binding = {.binding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &binding};
+    VkDescriptorSetLayout layout;
+    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &ci, NULL, &layout));
+    for (unsigned i = 0; i <= 2 * REC_POOL_SETS; i++) (void)alloc_set(c, layout);
+    int ok = c->ndp == 3 && !vk_desc_stock_want();
+    for (unsigned epoch = 0; epoch < VK_DESC_IDLE_GENERATIONS; epoch++) {
+        if (epoch) (void)alloc_set(c, layout);
+        descriptors_recycle(c);
+        ok &= c->ndp == 3;
+    }
+    uint64_t previous = c->descriptor_resets;
+    for (unsigned epoch = 0; epoch < VK_DESC_IDLE_GENERATIONS; epoch++) {
+        if (epoch) (void)alloc_set(c, layout);
+        descriptors_recycle(c);
+        if (epoch + 1 < VK_DESC_IDLE_GENERATIONS) ok &= c->ndp == 3;
+    }
+    uint64_t quiet_resets = c->descriptor_resets - previous;
+    ok &= c->ndp == (enabled ? 1u : 3u);
+    ok &= quiet_resets == (enabled ? VK_DESC_IDLE_GENERATIONS - 1u : 3u * VK_DESC_IDLE_GENERATIONS);
+    printf("descriptor-idle recorder: retained=%u quiet-resets=%llu\n", c->ndp, (unsigned long long)quiet_resets);
+    for (unsigned i = 0; i <= 2 * REC_POOL_SETS; i++) (void)alloc_set(c, layout);
+    ok &= c->ndp == 3;
+    descriptors_trim(c, 0);
+    free(c->dp);
+    free(c);
+    vkDestroyDescriptorSetLayout(V.dev, layout, NULL);
+    return ok;
+}
 int vk_record_test_descriptor_stock(void) {
     (void)vk_record_enabled();
     rec_context *c = VK_CALLOC(1, sizeof *c); c->stock_on = vk_desc_stock_want();
@@ -952,11 +1162,10 @@ VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, cons
         const vk_record_descriptor *d = &input[i];
         if (n && entries[n - 1].dstBinding == d->binding && entries[n - 1].descriptorType == d->type &&
             entries[n - 1].dstArrayElement + entries[n - 1].descriptorCount == d->element) { entries[n - 1].descriptorCount++; continue; }
-        size_t offset = d->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || d->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ?
-            offsetof(vk_record_descriptor, b) : d->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || d->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ?
-            offsetof(vk_record_descriptor, t) : offsetof(vk_record_descriptor, i);
+        /* All typed Vulkan payloads start at the same union offset. */
         entries[n++] = (VkDescriptorUpdateTemplateEntry){.dstBinding = d->binding, .dstArrayElement = d->element,
-            .descriptorCount = 1, .descriptorType = d->type, .offset = i * sizeof *input + offset, .stride = sizeof *input};
+            .descriptorCount = 1, .descriptorType = d->type,
+            .offset = i * sizeof *input + offsetof(vk_record_descriptor, b), .stride = sizeof *input};
     }
     VkDescriptorUpdateTemplateCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
         .descriptorUpdateEntryCount = n, .pDescriptorUpdateEntries = entries,
@@ -971,7 +1180,9 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
     vk_record_descriptor *info = c->info; memcpy(info, input, count * sizeof *info);
     for (uint32_t i = 0; i < count; i++) {
         vk_record_descriptor *d = &info[i];
-        if (d->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || d->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+        switch (d->type) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
             if (!d->b.buffer) {
                 VkBuffer buffer; uint64_t offset, available;
                 if (d->raw.address && vk_record_resolve(c->spans, d->raw.address, 1, &buffer, &offset, &available, c->hints)) {
@@ -980,7 +1191,15 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
                     d->b = (VkDescriptorBufferInfo){buffer, offset, range < available ? range : available};
                 } else d->b = zero_buffer(c);
             }
-        } else if (d->i.imageView) d->i.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_SAMPLER:
+            break;
+        default:
+            if (d->i.imageView) d->i.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            break;
+        }
     }
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};
     const uint8_t *bytes = (const uint8_t *)info; size_t n = count * sizeof *info, i = 0;
@@ -1287,6 +1506,8 @@ int vk_record_enabled(void) {
     const int default_threads = 0;
 #endif
     const char *e = getenv("TOTK_VK_DESC_STOCK"); descriptor_stock = e && atoi(e) != 0;
+    e = getenv("TOTK_VK_DESC_BATCH"); descriptor_batch = e && !strcmp(e, "1");
+    if (descriptor_batch) LOGV("descriptor batching enabled for recorder slots without stock (TOTK_VK_DESC_BATCH=1)");
     LOGV("descriptor stock: %s (TOTK_VK_DESC_STOCK=1 keeps per-layout sets per recorder/primary slot; 0/unset resets every pool per slot generation)",
         descriptor_stock ? "on" : "off");
     e = getenv("TOTK_VK_DESC_STOCK_MAX_SETS");
@@ -1315,6 +1536,13 @@ int vk_record_enabled(void) {
     e = getenv("TOTK_VK_REC_INLINE_DRAWS"); if (e && *e) { long n = atol(e); inline_draws = n < 0 ? 0 : n > 512 ? 512 : (uint32_t)n; }
     e = getenv("TOTK_VK_REC_MEMORY_MB");
     if (e && *e) { long n = atol(e); storage_limit = (uint64_t)(n < 16 ? 16 : n > 512 ? 512 : n) << 20; }
+#ifdef __linux__
+    e = getenv("TOTK_VK_REC_DISCARD_FREE");
+    if (e && !strcmp(e, "1")) {
+        long page = sysconf(_SC_PAGESIZE);
+        if (page > 0 && !(page & (page - 1))) storage_discard_page = (size_t)page;
+    }
+#endif
     ds_off = vk_off("ds"); dyn_off = vk_off("dyn");
     int requested = threads;
     for (int i = 0; i < requested; i++) {
@@ -1336,16 +1564,18 @@ void vk_record_slot_reset(unsigned slot) {
     if (retained > storage_limit && ++slots[slot].prune_uses == 8) {
         slots[slot].prune_uses = 0;
         uint64_t trim_start = host_now_ns();
+        uint32_t generation = (uint32_t)slots[slot].generation;
         for (rec_job *j = slots[slot].jobs; j; j = j->all_next) {
             int idle = slots[slot].generation - j->generation >= 32;
             if (j->draw && (idle || j->small_draw_uses == 32)) {
-                storage_put(&slots[slot].draw_storage, j->draw); j->draw = NULL; j->capdraw = j->small_draw_uses = 0;
+                storage_put(&slots[slot].draw_storage, j->draw, generation); j->draw = NULL; j->capdraw = j->small_draw_uses = 0;
             }
             if (j->info && (idle || j->small_info_uses == 32)) {
-                storage_put(&slots[slot].info_storage, j->info); j->info = NULL; j->capinfo = j->ninfo = j->small_info_uses = 0;
+                storage_put(&slots[slot].info_storage, j->info, generation); j->info = NULL; j->capinfo = j->ninfo = j->small_info_uses = 0;
             }
         }
-        uint64_t freed = storage_trim(&slots[slot].draw_storage, 0) + storage_trim(&slots[slot].info_storage, 1);
+        uint64_t freed = storage_trim(&slots[slot].draw_storage, 0, generation, storage_discard_page);
+        freed += storage_trim(&slots[slot].info_storage, 1, generation, storage_discard_page);
         if (freed) atomic_fetch_add_explicit(&storage_reclaims, 1, memory_order_relaxed);
         storage_trim_ns += host_now_ns() - trim_start;
     }
@@ -1398,7 +1628,8 @@ vk_record_draw *vk_record_draw_begin(VkPipeline pipeline, VkPipelineLayout layou
         vk_record_draw *draw = storage_get(storage, bytes, 0, __func__, "calloc");
         if (building->count) memcpy(draw, building->draw, (size_t)building->count * sizeof *draw);
         memset(draw + building->count, 0, (capacity - building->count) * sizeof *draw);
-        storage_put(storage, building->draw); building->draw = draw; building->capdraw = capacity;
+        storage_put(storage, building->draw, (uint32_t)slots[current_slot].generation);
+        building->draw = draw; building->capdraw = capacity;
     }
     vk_record_draw *d = &building->draw[building->count];
     d->pipeline = pipeline; d->layout = layout; memset(d->sets, 0, sizeof d->sets);
@@ -1425,7 +1656,7 @@ vk_record_descriptor *vk_record_descriptors(vk_record_draw *draw, unsigned set, 
         rec_storage *storage = &slots[current_slot].info_storage;
         vk_record_descriptor *info = storage_get(storage, (size_t)j->ninfo * sizeof *info, 1, __func__, "j->info");
         if (first) memcpy(info, j->info, (size_t)first * sizeof *info);
-        storage_put(storage, j->info); j->info = info;
+        storage_put(storage, j->info, (uint32_t)slots[current_slot].generation); j->info = info;
         j->capinfo = storage_capacity(info, sizeof *info);
     }
     draw->sets[set].layout = layout; draw->sets[set].first = first; draw->sets[set].count = count;
@@ -1687,6 +1918,11 @@ void vk_record_stats(uint64_t frame) {
             (stock_now[VK_DESC_STOCK_REASONS] - stock_previous[VK_DESC_STOCK_REASONS]) / 300.0);
         memcpy(stock_previous, stock_now, sizeof stock_previous);
         memcpy(previous, now, sizeof previous);
+        if (vk_desc_trim_idle())
+            LOGV("[descriptor-idle-trim] frame=%llu recorder_pools_freed=%llu primary_pools_freed=%llu",
+                (unsigned long long)frame,
+                (unsigned long long)atomic_load_explicit(&descriptor_idle_freed[0], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&descriptor_idle_freed[1], memory_order_relaxed));
     }
     if (threads <= 0 || frame % 300) return;
     pthread_mutex_lock(&rec_mu);
@@ -1731,6 +1967,11 @@ void vk_record_stats(uint64_t frame) {
         retained / 1048576.0, (unsigned long long)(storage_limit >> 20), retained > storage_limit, storage_referenced / 1048576.0,
         (unsigned long long)atomic_load(&storage_reclaims), atomic_load(&storage_reclaimed) / 1048576.0,
         (unsigned long long)atomic_load(&cb_reclaimed));
+    if (storage_discard_page)
+        LOGV("[recorder-free-pages] frame=%llu calls=%llu discarded_bytes=%llu",
+            (unsigned long long)frame,
+            (unsigned long long)atomic_load_explicit(&storage_discard_calls, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&storage_discarded_bytes, memory_order_relaxed));
     uint64_t active = 0, peak = 0, returned = 0, cold = 0;
     for (int worker = 0; worker <= threads; worker++) {
         active += atomic_load(&command_stats[worker].in_use); peak += atomic_load(&command_stats[worker].peak);

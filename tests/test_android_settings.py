@@ -372,8 +372,12 @@ class SettingsTests(unittest.TestCase):
         self.assertIn('TOTK_GYRO=0', self.env(motion='off'))
         self.assertIn('TOTK_RUMBLE_GAIN=1.0', self.env(rumble='33'))   # not a menu value: the default
 
-    def test_explicit_1080p_and_camera_aspect_choices(self):
-        self.assertIn('TOTK_RENDER_RES=1920x1080', self.env(render_res='1920x1080'))
+    def test_saved_1080p_beta_choice_falls_back_to_game_resolution(self):
+        self.assertEqual(self.values(self.run_probe('stored render_res=1920x1080')[0])['render_res'], 'game')
+        self.assertFalse(any(line.startswith('TOTK_RENDER_RES=') for line in self.env(render_res='1920x1080')))
+        self.assertIn('TOTK_RENDER_RES=1280x720', self.env(render_res='1280x720'))
+
+    def test_camera_aspect_choices(self):
         self.assertFalse(any(line.startswith('TOTK_ASPECT=') for line in self.env()))
         for ratio in ('4:3', '21:9', '32:9'):
             with self.subTest(ratio=ratio):

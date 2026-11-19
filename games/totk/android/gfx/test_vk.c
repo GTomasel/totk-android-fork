@@ -1162,6 +1162,8 @@ static void arena_check_copy(VkBuffer source, VkDeviceSize offset, VkBuffer dest
     vkCmdCopyBuffer(vk_cb(), source, destination, 1, &copy);
 }
 uint64_t vk_test_slot_arena_bytes(void);
+void vk_test_arena_memory(uint64_t slot[5], uint64_t snapshot[5], uint64_t *combined_peak);
+void vk_mem_report(void);
 /* TOTK_VK_STAGING_RETAIN_MB: a 45 MiB burst of staging in one slot (five 9 MiB uploads' worth), then 16 quiet
    submissions through every slot. Retained slot-arena bytes before/after; with a cap, the burst slot keeps at most it. */
 static int staging_retain_checks(void) {
@@ -1179,11 +1181,217 @@ static int staging_retain_checks(void) {
     uint64_t settled = vk_test_slot_arena_bytes();
     printf("staging-retain cap=%ld MiB/slot: slot arenas %.1f MiB before, %.1f MiB after the burst, %.1f MiB after 16 quiet submissions\n",
         cap, base / 1048576.0, burst / 1048576.0, settled / 1048576.0);
-    if (cap < 0) CHECK(settled >= (45u << 20), "without a cap the burst slot keeps its high-water (%.1f MiB)", settled / 1048576.0);
-    else CHECK(settled <= (uint64_t)8 * ((uint64_t)(cap < 8 ? 8 : cap) << 20), "each slot keeps at most the cap (%.1f MiB)", settled / 1048576.0);
+    if (!e || !*e) CHECK(settled >= (45u << 20), "without a cap the burst slot keeps its high-water (%.1f MiB)", settled / 1048576.0);
+    else CHECK(settled <= (uint64_t)8 * ((uint64_t)(cap < 1 ? 8 : cap) << 20), "each slot keeps at most the cap (%.1f MiB)", settled / 1048576.0);
     printf("%s: staging retain %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
     return fails != 0;
 }
+
+static int staging_warm_retain_checks(int cap) {
+    enum { MIB = 1 << 20, POOL_COUNT = 8, CHUNKS = 5 };
+    setenv("TOTK_VK_STAGING_RETAIN_MB", cap == 4 ? "4" : "8", 1);
+    setenv("TOTK_VK_ARENA_PEAK_LOG", "1", 1);
+    setenv("TOTK_FRAME_LAG", "1", 1);
+    setenv("TOTK_VK_LAG_MODE", "copy", 1);
+    uint8_t *guest = mmap(NULL, MIB, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(guest != MAP_FAILED, "snapshot source maps");
+    if (guest == MAP_FAILED) return 1;
+    mtl_init(); mtl_pool_add(guest, MIB);
+    mtl_sub_begin();
+    VkBuffer buffers[CHUNKS];
+    uint64_t requirements[CHUNKS], peak = 0;
+    for (int i = 0; i < CHUNKS; i++) {
+        VkDeviceSize offset;
+        uint8_t *tmp = vk_transient((i ? 9 : 1) * MIB, 256, &buffers[i], &offset);
+        memset(tmp, 0x40 + i, 256);
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(V.dev, buffers[i], &req);
+        requirements[i] = req.size;
+        peak += req.size;
+    }
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "mixed staging burst completes");
+    for (int i = 1; i < POOL_COUNT; i++) {
+        mtl_sub_begin(); (void)vk_cb();
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "idle slot %d completes", i);
+    }
+    mtl_sub_begin(); (void)vk_cb(); /* Opens the same slot without yet needing any bytes. */
+    uint64_t slot[5], snapshot[5], combined;
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(slot[0] == (uint64_t)cap * MIB && slot[1] == requirements[0] && slot[3] == 1 && slot[4] == CHUNKS,
+          "the retention cap preserves the existing %d MiB buffer and frees the four larger ones", cap);
+    CHECK(!snapshot[1] && slot[2] == peak && combined == peak,
+          "peak retains the actual allocation requirements after the burst has retired");
+    VkBuffer warm; VkDeviceSize offset;
+    uint8_t *tmp = vk_transient(1 * MIB, 256, &warm, &offset);
+    CHECK(warm == buffers[0] && !offset && tmp[0] == 0x40, "the next submission uses the retained buffer");
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(slot[4] == CHUNKS, "reuse does not allocate and map a sixth Vulkan memory object");
+    VkDescriptorBufferInfo frozen;
+    CHECK(vk_lag_read((uintptr_t)guest, 4096, 256, &frozen, VK_LAG_COPY),
+          "snapshot allocation follows the retired slot burst");
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(snapshot[1] && snapshot[2] == snapshot[1] && combined == peak && combined < slot[2] + snapshot[2],
+          "the combined peak excludes a snapshot allocation made after the staging peak");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "warm slot work completes");
+    vk_mem_report();
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(slot[2] == requirements[0] && combined == requirements[0] + snapshot[1],
+          "the periodic report starts the next interval at current commitments");
+    mtl_pool_del(guest); munmap(guest, MIB);
+    printf("%s: staging warm retention %d checks, %d failed; %.1f MiB peak, %.1f MiB after trim, no remap\n",
+           fails ? "FAILED" : "ok", checks, fails, peak / 1048576.0, slot[1] / 1048576.0);
+    return fails != 0;
+}
+
+static int staging_early_trim_checks(int enabled) {
+    enum { MIB = 1 << 20 };
+    setenv("TOTK_VK_STAGING_RETAIN_MB", "8", 1);
+    setenv("TOTK_VK_STAGING_EARLY_TRIM", enabled ? "1" : "0", 1);
+    uint8_t *guest = mmap(NULL, MIB, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (guest == MAP_FAILED) DIE("staging fixture destination");
+    mtl_init(); mtl_pool_add(guest, MIB);
+    VkBuffer destination, upload, general, warm, spare;
+    uint64_t resolved;
+    if (!vk_resolve((uintptr_t)guest, MIB, &destination, &resolved) || resolved) DIE("staging fixture buffer");
+    VkDeviceSize upload_offset, general_offset, warm_offset, offset;
+    mtl_sub_begin();
+    memset(vk_transient(MIB, 16, &warm, &warm_offset), 0x31, 256);
+    memset(vk_texture_staging(9 * MIB, &upload, &upload_offset), 0x7d, 256);
+    memset(vk_transient(9 * MIB, 16, &general, &general_offset), 0x90, 256);
+    arena_check_copy(upload, upload_offset, destination, 0);
+    arena_check_copy(general, general_offset, destination, 1);
+    uint64_t lease = vk_replay_lease_begin_immutable();
+    CHECK(lease != 0, "first upload slot can be pinned");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "source slot completes while replay ownership remains");
+    CHECK(guest[0] == 0x7d && guest[256] == 0x90, "GPU read both staging and general allocations");
+    CHECK(vk_test_slot_arena_bytes() == 26 * MIB, "initial burst reserves 26 MiB");
+
+    mtl_sub_begin();
+    memset(vk_texture_staging(10 * MIB, &spare, &offset), 0x52, 256);
+    uint8_t data[256];
+    CHECK(vk_replay_frozen_buffer_copy(upload, upload_offset, sizeof data, data) && data[0] == 0x7d,
+          "growth in another slot preserves pinned uploads");
+    CHECK(vk_test_slot_arena_bytes() == 36 * MIB, "no memory from the pinned slot was released");
+    uint64_t covered = mtl_sub_commit();
+    CHECK(mtl_wait(covered, 5000000000ull) && vk_replay_lease_end(lease, covered), "terminal work releases the pin");
+
+    mtl_sub_begin();
+    memset(vk_texture_staging(11 * MIB, &spare, &offset), 0xac, 256);
+    uint64_t capacity = vk_test_slot_arena_bytes();
+    CHECK(capacity == (enabled ? 38 : 47) * MIB, "next growth releases only the retired upload chunk (%.0f MiB)",
+          capacity / 1048576.0);
+    int still_original = vk_replay_frozen_buffer_copy(upload, upload_offset, sizeof data, data) && data[0] == 0x7d;
+    CHECK(still_original == !enabled,
+          "only the opt-in arm removed the completed upload buffer");
+    CHECK(vk_replay_frozen_buffer_copy(general, general_offset, sizeof data, data) && data[0] == 0x90,
+          "the other large allocation is still accessible");
+    CHECK(vk_replay_frozen_buffer_copy(warm, warm_offset, sizeof data, data) && data[0] == 0x31,
+          "ordinary warm allocation stays readable");
+    arena_check_copy(spare, offset, destination, 2);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && guest[512] == 0xac, "the replacement upload finishes and matches");
+    uint64_t slot[5], snapshot[5], combined;
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(slot[2] == (enabled ? 38 : 47) * MIB && combined == slot[2], "peak Vulkan reservation captures the overlap reduction");
+    vk_mem_report();
+    mtl_pool_finalize(guest); munmap(guest, MIB);
+    printf("%s: early texture staging trim %s, %.0f MiB peak, %d checks, %d failed\n",
+           fails ? "FAILED" : "ok", enabled ? "on" : "off", slot[2] / 1048576.0, checks, fails);
+    return fails != 0;
+}
+
+static int arena_tail_checks(int enabled) {
+    if (enabled) unsetenv("TOTK_VK_OFF");
+    else setenv("TOTK_VK_OFF", "arenatails", 1);
+    setenv("TOTK_FRAME_LAG", "1", 1);
+    setenv("TOTK_VK_LAG_MODE", "copy", 1);
+    enum { MIB = 1 << 20, COUNT = 4, READ_BYTES = 256, ALIGN = 512 };
+    const size_t bytes = COUNT * MIB;
+    uint8_t *guest = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(guest != MAP_FAILED, "snapshot arena maps its source");
+    if (guest == MAP_FAILED) return 1;
+    mtl_init(); mtl_pool_add(guest, bytes);
+    for (int snapshot = 0; snapshot <= 1; snapshot++) {
+        const size_t unit = snapshot ? MIB : 8 * MIB;
+        const size_t size[COUNT] = {3 * unit / 8 + 1, 7 * unit / 8, unit / 2, unit / 8};
+        VkDescriptorBufferInfo src[COUNT];
+        uint64_t previous[VK_MEMORY_PURPOSES], after[VK_MEMORY_PURPOSES];
+        vk_memory_counts(previous);
+        mtl_sub_begin();
+        for (int i = 0; i < COUNT; i++) {
+            uint8_t pattern = 0x30 + 8 * snapshot + i;
+            if (snapshot) {
+                uint8_t *input = guest + (size_t)i * MIB;
+                memset(input, pattern, size[i]);
+                int captured = vk_lag_read((uintptr_t)input, size[i], ALIGN, &src[i], VK_LAG_COPY);
+                CHECK(captured, "snapshot %d owns the guest input", i);
+                if (!captured) return 1;
+            } else {
+                uint8_t *input = vk_transient(size[i], ALIGN, &src[i].buffer, &src[i].offset);
+                memset(input, pattern, READ_BYTES);
+                src[i].range = size[i];
+            }
+        }
+        vk_memory_counts(after);
+        int purpose = snapshot ? VK_MEMORY_SNAPSHOT : VK_MEMORY_SLOT;
+        uint64_t added = after[purpose] - previous[purpose];
+        CHECK(added == (enabled ? 2 : 3), "arena %d uses %llu new Vulkan memory objects",
+              snapshot, (unsigned long long)added);
+        uint64_t bytes = 0;
+        for (int i = 0; i < COUNT; i++) {
+            int first = 1;
+            for (int j = 0; j < i; j++) first &= src[j].buffer != src[i].buffer;
+            if (!first) continue;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(V.dev, src[i].buffer, &req);
+            bytes += req.size;
+        }
+        uint64_t slot_memory[5], snapshot_memory[5], combined;
+        vk_test_arena_memory(slot_memory, snapshot_memory, &combined);
+        uint64_t *kind = snapshot ? snapshot_memory : slot_memory;
+        CHECK(kind[0] == added * unit && kind[1] == bytes && kind[2] == bytes && kind[3] == added,
+              "arena %d accounting agrees with independent driver requirements", snapshot);
+        CHECK(combined == slot_memory[1] + snapshot_memory[1], "combined peak observes both classes simultaneously");
+        CHECK(src[0].offset == 0 && src[1].offset == 0 && src[0].buffer != src[1].buffer,
+              "first two inputs occupy different buffers");
+        if (enabled) {
+            CHECK(src[2].buffer == src[0].buffer && src[2].offset == 3 * unit / 8 + ALIGN,
+                  "third input uses the first buffer's aligned remaining space");
+            CHECK(src[3].buffer == src[1].buffer && src[3].offset == 7 * unit / 8,
+                  "fourth input fits exactly in the second buffer's remaining space");
+        } else {
+            CHECK(src[2].buffer != src[0].buffer && src[2].buffer != src[1].buffer && src[2].offset == 0,
+                  "the control allocates a third buffer");
+            CHECK(src[3].buffer == src[2].buffer && src[3].offset == unit / 2,
+                  "the control appends to its latest buffer");
+        }
+        if (!snapshot) {
+            CHECK(vk_test_slot_arena_bytes() == added * unit, "slot capacity equals the allocated buffers");
+        }
+        VkBuffer destination;
+        VkDeviceSize offset;
+        uint8_t *out = vk_transient(COUNT * READ_BYTES, ALIGN, &destination, &offset);
+        for (int i = 0; i < COUNT; i++) {
+            uint8_t frozen[READ_BYTES], expected[READ_BYTES];
+            memset(expected, 0x30 + 8 * snapshot + i, sizeof expected);
+            CHECK(vk_replay_frozen_buffer_copy(src[i].buffer, src[i].offset, READ_BYTES, frozen) &&
+                  !memcmp(frozen, expected, sizeof frozen), "frozen copy identifies input %d after buffer reordering", i);
+            VkBufferCopy copy = {.srcOffset = src[i].offset, .dstOffset = offset + i * READ_BYTES, .size = READ_BYTES};
+            vkCmdCopyBuffer(vk_cb(), src[i].buffer, destination, 1, &copy);
+        }
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "arena %d copies complete", snapshot);
+        for (int i = 0; i < COUNT; i++) {
+            uint8_t expected[READ_BYTES];
+            memset(expected, 0x30 + 8 * snapshot + i, sizeof expected);
+            CHECK(!memcmp(out + i * READ_BYTES, expected, sizeof expected), "GPU readback preserves input %d", i);
+        }
+        printf("arena tails %s %s: %llu buffers, %llu MiB\n", enabled ? "on" : "off",
+               snapshot ? "snapshot" : "slot", (unsigned long long)added, (unsigned long long)(added * unit / MIB));
+    }
+    mtl_pool_del(guest); munmap(guest, bytes);
+    printf("%s: arena tails %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 static int arena_bo_checks(void) {
     setenv("TOTK_FRAME_LAG", "1", 1); setenv("TOTK_VK_LAG_MODE", "copy", 1);
     mtl_init();
@@ -1564,6 +1772,7 @@ static int texture_upload_bench(void) {
 /* Replacement keeps guest bindings and the vk_tex/vk_img owners unchanged. Both
    descriptor freezes and TLS ID lookups must nevertheless see the new image. */
 static int texture_replacement_checks(void) {
+    extern int vk_res_test_mismatched_upgrade(vk_tex *x);
     const size_t bytes = 1u << 20;
     uint8_t *guest = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     CHECK(guest != MAP_FAILED, "replacement guest allocation");
@@ -1583,6 +1792,12 @@ static int texture_replacement_checks(void) {
     VkImageView old = vk_tex_by_id(71, &want, NULL);
     CHECK(old && vk_tex_by_id(72, &want, NULL) == old, "two unchanged bindings cache the original view");
     uint64_t revision = vk_treg_revision();
+    uint64_t before[7], after[7];
+    vk_res_counters(before);
+    CHECK(!vk_res_test_mismatched_upgrade(object), "an incompatible image shape refuses format upgrade");
+    vk_res_counters(after);
+    CHECK(before[0] == after[0] && vk_tex_image(object) == image && vk_treg_revision() == revision,
+          "refusal records no replacement image or layout transition");
     view_t integer = {.set_format = 1, .format = 0x27};
     CHECK(vk_tex_view(object, &texture, &integer, 0) != VK_NULL_HANDLE, "out-of-list integer view upgrades the image");
     CHECK(vk_tex_image(object) != image, "format-list upgrade actually replaces the image");
@@ -1758,7 +1973,835 @@ static int shared_idle_checks(void) {
     return fails != 0;
 }
 
+static int image_ownership_checks(void) {
+    extern void vk_res_test_image_ownership(uint64_t stats[5]);
+    uint8_t backing[4096] = {0};
+    tex_t shared = {.d = {.target = 1, .format = 0x25, .width = 4, .height = 4, .depth = 1, .levels = 1},
+                    .mem = backing, .serial = 1};
+    nvn_tex_layout(&shared.d, &shared.L);
+    tex_t alias = shared, mirror = shared, private = shared;
+    alias.serial = 2;
+    mirror.serial = 3; mirror.has_layout = 1;
+    private.serial = 4; private.mem = NULL;
+    mtl_sub_begin();
+    vk_tex *original = vk_tex_get(&shared), *reused = vk_tex_get(&alias);
+    CHECK(original && reused && vk_tex_image(original) == vk_tex_image(reused),
+          "shared aliases resolve to one backing image");
+    vk_tex *uploaded = vk_tex_get(&mirror), *alone = vk_tex_get(&private);
+    CHECK(uploaded && alone, "private images were realized");
+    if (uploaded && alone) {
+        VkMemoryRequirements mirror_req, private_req;
+        vkGetImageMemoryRequirements(V.dev, vk_tex_image(uploaded), &mirror_req);
+        vkGetImageMemoryRequirements(V.dev, vk_tex_image(alone), &private_req);
+        uint64_t bytes[5];
+        vk_res_test_image_ownership(bytes);
+        CHECK(bytes[0] == mirror_req.size && bytes[2] == private_req.size &&
+              !bytes[1] && !bytes[3] && !bytes[4],
+              "the mirror and private target are each counted once and exclude shared backing");
+        mtl_tex_release(&mirror);
+        vk_res_test_image_ownership(bytes);
+        CHECK(!bytes[0] && bytes[2] == private_req.size,
+              "a released image has left the live ownership counters");
+    }
+    mtl_tex_release(&shared); mtl_tex_release(&alias); mtl_tex_release(&private);
+    mtl_sub_commit(); mtl_finish();
+    printf("%s: image ownership %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
+static int buffer_view_release_checks(void) {
+    extern void vk_res_test_buffer_releases(uint64_t stats[4]);
+    enum { POOL_BYTES = 65536, ALIASES = 4096, VIEWS = 4, FIRST_ID = 121 };
+    uint8_t *storage = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(storage != MAP_FAILED, "view test maps two independent buffers");
+    if (storage == MAP_FAILED) return 1;
+    unsetenv("TOTK_FRAME_LAG");
+    mtl_init();
+    mtl_pool_add(storage, POOL_BYTES); mtl_pool_add(storage + POOL_BYTES, POOL_BYTES);
+    mtl_sub_begin();
+
+    tex_t alias = {.d = {.target = 1, .format = 0x25, .width = 4, .height = 4, .depth = 1, .levels = 1},
+                   .mem = storage + 4096, .serial = 100000};
+    nvn_tex_layout(&alias.d, &alias.L);
+    vk_tex *first = vk_tex_get(&alias);
+    if (!first) return 1;
+    VkImage shared = vk_tex_image(first);
+    int all_shared = 1;
+    for (unsigned i = 1; i < ALIASES; i++) {
+        alias.serial = 100000 + i;
+        vk_tex *object = vk_tex_get(&alias);
+        all_shared &= object && vk_tex_image(object) == shared;
+    }
+    CHECK(all_shared, "all %d ordinary texture objects share a single image", ALIASES);
+
+    VkBuffer buffer[2];
+    uint64_t offset;
+    int mapped = vk_resolve((uintptr_t)storage, 256, &buffer[0], &offset) &&
+                 vk_resolve((uintptr_t)storage + POOL_BYTES, 256, &buffer[1], &offset);
+    CHECK(mapped && buffer[0] != buffer[1], "the two storage pools use different Vulkan buffers");
+    if (!mapped) return 1;
+    tex_t desc[VIEWS];
+    VkBufferView view[VIEWS];
+    for (int i = 0; i < VIEWS; i++) {
+        desc[i] = (tex_t){.d = {.target = 10, .format = 0x25, .width = 64},
+                          .mem = storage + (i / 2) * POOL_BYTES + (i % 2) * 4096, .serial = 200000 + i};
+        mtl_reg_tex(FIRST_ID + i, &desc[i], NULL);
+        view[i] = vk_tbuf_by_id(FIRST_ID + i, 0);
+        CHECK(view[i], "buffer view %d was created", i);
+    }
+    mtl_reg_tex(FIRST_ID, NULL, NULL); mtl_tex_release(&desc[0]);
+    mtl_reg_tex(FIRST_ID + 2, NULL, NULL); mtl_tex_release(&desc[2]);
+    uint64_t old[4], stats[4], memory[8];
+    vk_res_test_buffer_releases(old);
+    vk_res_mem(memory);
+    CHECK(memory[2] == 4 && old[3] >= ALIASES, "both retired views and their host objects are pending");
+    vk_res_buffer_released(buffer[0]); /* The fixture never submits commands using those views. */
+    vk_res_test_buffer_releases(stats);
+    vk_res_mem(memory);
+    CHECK(stats[0] - old[0] == 2 && stats[1] - old[1] == 2 && stats[2] - old[2] == 2,
+          "release checks only the four buffer views and destroys the two that use this buffer");
+    CHECK(memory[2] == 3 && vk_tbuf_by_id(FIRST_ID + 3, 0) == view[3],
+          "the other buffer's live and retired views keep their owners");
+    CHECK(vk_tbuf_by_id(FIRST_ID + 1, 0), "cleared live texture can create a fresh view");
+    vk_res_buffer_released(buffer[0]);
+    vk_res_test_buffer_releases(stats);
+    CHECK(stats[2] - old[2] == 3, "recreated view is indexed and invalidated on later release");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "retirement ticket completes");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    vk_res_mem(memory);
+    CHECK(!memory[2], "normal fence sweep destroys the remaining retired view and host records");
+
+    mtl_reg_tex(FIRST_ID + 1, NULL, NULL); mtl_tex_release(&desc[1]);
+    mtl_reg_tex(FIRST_ID + 3, NULL, NULL); mtl_tex_release(&desc[3]);
+    vk_res_test_buffer_releases(old);
+    vk_res_buffer_released(buffer[0]);
+    vk_res_test_buffer_releases(stats);
+    CHECK(stats[0] == old[0] && stats[1] - old[1] == 1 && stats[2] == old[2],
+          "with no live views the release examines only separate retired view records");
+    for (unsigned i = 0; i < ALIASES; i++) {
+        alias.serial = 100000 + i;
+        mtl_tex_release(&alias);
+    }
+    mtl_sub_begin(); (void)vk_cb(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "remaining views retire");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    mtl_pool_del(storage); mtl_pool_del(storage + POOL_BYTES); munmap(storage, 2 * POOL_BYTES);
+    printf("%s: buffer view release %d checks, %d failed; four view probes with %llu registry slots\n",
+        fails ? "FAILED" : "ok", checks, fails, (unsigned long long)old[3]);
+    return fails != 0;
+}
+
+static int buffer_view_pool_lifetime_checks(void) {
+    extern void vk_res_test_buffer_releases(uint64_t stats[4]);
+    extern int vk_res_test_texel_backing(uint64_t serial, VkBuffer buffer, VkDeviceSize offset);
+    enum { POOL_BYTES = 65536, ALIAS_BYTES = 4096, DIRECT_ID = 141, ALIAS_ID, RETIRED_ID };
+    uint8_t *memory = mmap(NULL, 3 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(memory != MAP_FAILED, "pool view fixture maps its areas");
+    if (memory == MAP_FAILED) return 1;
+    unsetenv("TOTK_FRAME_LAG");
+    uint8_t *a = memory, *b = memory + POOL_BYTES, *v = memory + 2 * POOL_BYTES;
+    mtl_init();
+    mtl_pool_add(a, POOL_BYTES); mtl_pool_add(b, POOL_BYTES);
+    nvn_dirty_add_range(a, POOL_BYTES);
+    vk_record_test_alias(v, (uintptr_t)a + ALIAS_BYTES, ALIAS_BYTES);
+    VkBuffer donor_a, donor_b;
+    uint64_t off;
+    int resolved = vk_resolve((uintptr_t)a, 256, &donor_a, &off) &&
+                   vk_resolve((uintptr_t)b, 256, &donor_b, &off);
+    CHECK(resolved && donor_a != donor_b, "both physical donors resolve to distinct buffers");
+    if (!resolved) return 1;
+    tex_t direct = {.d = {.target = 10, .format = 0x25, .width = 64}, .mem = a, .serial = 21100};
+    tex_t alias = direct, retired = direct;
+    alias.serial++; alias.mem = v; retired.serial += 2;
+    mtl_reg_tex(DIRECT_ID, &direct, NULL);
+    mtl_reg_tex(ALIAS_ID, &alias, NULL);
+    mtl_reg_tex(RETIRED_ID, &retired, NULL);
+    mtl_sub_begin();
+    VkBufferView direct_view = vk_tbuf_by_id(DIRECT_ID, 0), alias_view = vk_tbuf_by_id(ALIAS_ID, 0);
+    CHECK(direct_view && alias_view && vk_tbuf_by_id(RETIRED_ID, 0), "initial direct and aliased views are cached");
+    CHECK(vk_res_test_texel_backing(direct.serial, donor_a, 0) &&
+          vk_res_test_texel_backing(alias.serial, donor_a, ALIAS_BYTES),
+          "the first alias view uses the first donor's exact offset");
+    vk_record_test_alias(v, (uintptr_t)b + 2 * ALIAS_BYTES, ALIAS_BYTES);
+    VkBufferView remapped_view = vk_tbuf_by_id(ALIAS_ID, 0);
+    CHECK(remapped_view && remapped_view != alias_view && vk_res_test_texel_backing(alias.serial, donor_b, 2 * ALIAS_BYTES),
+          "same serial and descriptor re-resolve the new alias donor and exact offset");
+    CHECK(vk_tbuf_by_id(DIRECT_ID, 0) == direct_view, "an unrelated mapping change keeps the still-valid direct view");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "initial buffer-view work completes");
+    mtl_reg_tex(RETIRED_ID, NULL, NULL); mtl_tex_release(&retired);
+    uint64_t before[4], after[4];
+    vk_res_test_buffer_releases(before);
+    mtl_pool_finalize(a);
+    vk_res_test_buffer_releases(after);
+    CHECK(after[2] - before[2] >= 2, "physical finalization destroys both live and queued views of its buffer");
+    CHECK(!vk_tbuf_by_id(DIRECT_ID, 0) && vk_tbuf_by_id(ALIAS_ID, 0) == remapped_view,
+          "the old direct view is unavailable while the other donor's view survives");
+    mtl_pool_add(a, POOL_BYTES);
+    mtl_sub_begin();
+    CHECK(vk_resolve((uintptr_t)a, 256, &donor_a, &off) &&
+          vk_tbuf_by_id(DIRECT_ID, 0) && vk_res_test_texel_backing(direct.serial, donor_a, 0),
+          "the same serial creates a new direct view for the re-registered pool");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "replacement descriptor work completes");
+    mtl_reg_tex(DIRECT_ID, NULL, NULL); mtl_tex_release(&direct);
+    mtl_reg_tex(ALIAS_ID, NULL, NULL); mtl_tex_release(&alias);
+    mtl_pool_finalize(a); mtl_pool_finalize(b);
+    mtl_sub_begin(); (void)vk_cb(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "remaining host retirement completes");
+    munmap(memory, 3 * POOL_BYTES);
+    printf("%s: buffer view pool lifetime %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
+static void reclaim_test_clear(vk_tex *texture, unsigned channel) {
+    VkClearColorValue color = {.float32 = {0, 0, 0, 1}};
+    color.float32[channel] = 1;
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkCommandBuffer cb = vk_cb();
+    vk_barrier_all(cb);
+    vkCmdClearColorImage(cb, vk_tex_image(texture), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+}
+
+static uint8_t *texture_test_read_at(vk_tex *texture, unsigned mip, unsigned layer,
+        VkOffset3D origin, unsigned block_size, unsigned bytes) {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    uint8_t *result = vk_transient(bytes, 16, &buffer, &offset);
+    VkBufferImageCopy copy = {.bufferOffset = offset,
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1}, .imageOffset = origin,
+        .imageExtent = {block_size, block_size, 1}};
+    VkCommandBuffer cb = vk_cb();
+    vk_barrier_all(cb);
+    vkCmdCopyImageToBuffer(cb, vk_tex_image(texture), VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
+    return result;
+}
+static uint8_t *texture_test_read_block(vk_tex *texture, unsigned mip, unsigned layer,
+        unsigned block_size, unsigned bytes) {
+    return texture_test_read_at(texture, mip, layer, (VkOffset3D){0}, block_size, bytes);
+}
+static uint8_t *texture_test_read_pixel(vk_tex *texture, unsigned mip, unsigned layer) {
+    return texture_test_read_block(texture, mip, layer, 1, 4);
+}
+
+static int recorder_descriptor_layout_checks(void) {
+    CHECK(sizeof(vk_record_descriptor) == 64, "packed recorder descriptors have a 64-byte stride");
+    mtl_init();
+    mtl_sub_begin();
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2, VK_SHADER_STAGE_FRAGMENT_BIT, NULL},
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3, .pBindings = bindings};
+    VkDescriptorSetLayout layout;
+    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &layout_info, NULL, &layout));
+    vk_record_descriptor input[6] = {0};
+    VkBufferView views[2];
+    tex_t textures[2];
+    const VkPhysicalDeviceLimits *limits = &V.props.limits;
+    for (unsigned i = 0; i < 2; i++) {
+        VkDescriptorBufferInfo uniform = {.range = 16};
+        memset(vk_transient(16, limits->minUniformBufferOffsetAlignment, &uniform.buffer, &uniform.offset), i + 1, 16);
+        input[i] = (vk_record_descriptor){.b = uniform, .binding = 0, .element = i, .type = bindings[0].descriptorType};
+        VkBufferViewCreateInfo view = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .format = VK_FORMAT_R32_UINT, .range = 16};
+        memset(vk_transient(16, limits->minTexelBufferOffsetAlignment, &view.buffer, &view.offset), i + 5, 16);
+        VKCHECK(vkCreateBufferView(V.dev, &view, NULL, &views[i]));
+        input[4 + i] = (vk_record_descriptor){.t = views[i], .lag_range = {view.buffer, view.offset, view.range},
+            .lag_reason = NVN_DIRTY_LAG_GPU, .binding = 4, .element = i, .type = bindings[2].descriptorType};
+        tex_t *texture = &textures[i];
+        *texture = (tex_t){.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x25, .width = 4,
+            .height = 4, .depth = 1, .levels = 1}, .serial = 91200 + i};
+        nvn_tex_layout(&texture->d, &texture->L);
+        vk_tex *realized = vk_tex_get(texture);
+        CHECK(realized, "sampled image %u exists", i);
+        if (!realized) return 1;
+        VkImageView image_view = vk_tex_view(realized, texture, NULL, 0);
+        CHECK(image_view, "sampled image view %u exists", i);
+        if (!image_view) return 1;
+        input[2 + i] = (vk_record_descriptor){.i = {vk_dummy_sampler(), image_view, VK_IMAGE_LAYOUT_GENERAL},
+            .binding = 2, .element = i, .type = bindings[1].descriptorType};
+    }
+    CHECK(views[0] != views[1] && input[0].b.offset != input[1].b.offset &&
+          input[2].i.imageView != input[3].i.imageView, "each array entry resolves to distinct resource data");
+    VkDescriptorSet set = vk_alloc_set(layout);
+    VkDescriptorUpdateTemplate update = vk_record_template(layout, input, 6);
+    CHECK(update && update == vk_record_template(layout, input, 6), "mixed typed template is created and reused");
+    vkUpdateDescriptorSetWithTemplate(V.dev, set, update, input);
+    CHECK(vk_draw_test_descriptor_arrays(vk_alloc_set(layout), input),
+          "direct writes preserve both entries of all three descriptor arrays");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "mixed descriptor update retires with the actual driver");
+    for (unsigned i = 0; i < 2; i++) {
+        vkDestroyBufferView(V.dev, views[i], NULL);
+        mtl_tex_release(&textures[i]);
+    }
+    vkDestroyDescriptorSetLayout(V.dev, layout, NULL);
+    printf("%s: mixed recorder and direct descriptor arrays %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
+static int upload_preparation_checks(int optimized, int grouping) {
+    enum { STRIDE = 4 << 20, POOL_BYTES = 4 * STRIDE, MAX_REGIONS = 18 };
+    if (grouping) unsetenv("TOTK_VK_OFF");
+    else setenv("TOTK_VK_OFF", optimized ? "uploadlayers" : "uploadinline,uploadfreshbarrier,uploadlayers", 1);
+    setenv("TOTK_VK_UPLOAD_THREADS", "1", 1);
+    uint8_t *guest = mmap(NULL, POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(guest != MAP_FAILED, "upload preparation pool maps");
+    if (guest == MAP_FAILED) return 1;
+    mtl_init();
+    mtl_pool_add(guest, POOL_BYTES); nvn_dirty_add_range(guest, POOL_BYTES);
+    pool_t pool = {.mem = guest, .size = POOL_BYTES, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    tex_t textures[] = {
+        {.d = {.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = 0x25, .width = 64, .height = 64, .depth = 2, .levels = 3}},
+        {.d = {.target = NVN_TEXTURE_TARGET_CUBEMAP, .format = 0x25, .width = 256, .height = 256, .depth = 6, .levels = 3}},
+        {.d = {.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = 0x25, .width = 129, .height = 65, .depth = 6, .levels = 3}},
+        {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0x25, .width = 19, .height = 9, .depth = 1, .levels = 1,
+               .flags = NVN_TEXTURE_FLAGS_LINEAR, .stride = 96}},
+    };
+    uint8_t *linear = malloc(256 * 256 * 4);
+    if (!linear) DIE("upload fixture allocation");
+    for (unsigned i = 0; i < sizeof textures / sizeof *textures; i++) {
+        tex_t *texture = &textures[i];
+        texture->pool = &pool;
+        texture->mem = guest + i * STRIDE;
+        texture->serial = 91110 + i;
+        nvn_tex_layout(&texture->d, &texture->L);
+        CHECK(texture->L.size <= STRIDE, "upload fixture %u fits its pool range", i);
+        for (unsigned pass = 0; pass < 2; pass++) {
+            for (unsigned mip = 0; mip < texture->d.levels; mip++) {
+                size_t row = (texture->d.width >> mip) * 4, pixels = row * (texture->d.height >> mip);
+                for (unsigned layer = 0; layer < texture->L.layers; layer++) {
+                    uint8_t color = 16 + i * 32 + pass * 96 + mip * 8 + layer;
+                    memset(linear, color, pixels);
+                    memset(linear + pixels - 4, color ^ 0xff, 4);
+                    CHECK(!nvn_swizzle(&texture->d, mip, layer, linear, row, texture->mem),
+                          "seed fixture %u pass %u mip %u layer %u", i, pass, mip, layer);
+                }
+            }
+            uint64_t before[3], after[3];
+            vk_upload_test_preparation(before);
+            mtl_sub_begin();
+            vk_tex *realized = vk_tex_get(texture);
+            CHECK(realized, "fixture %u pass %u resolves", i, pass);
+            if (!realized) return 1;
+            uint8_t *readbacks[MAX_REGIONS], *corners[MAX_REGIONS];
+            unsigned n = 0;
+            for (unsigned mip = 0; mip < texture->d.levels; mip++)
+                for (unsigned layer = 0; layer < texture->L.layers; layer++) {
+                    VkOffset3D origin = {(int32_t)(texture->d.width >> mip) - 1, (int32_t)(texture->d.height >> mip) - 1, 0};
+                    readbacks[n] = texture_test_read_pixel(realized, mip, layer);
+                    corners[n++] = texture_test_read_at(realized, mip, layer, origin, 1, 4);
+                }
+            CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "fixture %u pass %u finishes its GPU read-back", i, pass);
+            n = 0;
+            for (unsigned mip = 0; mip < texture->d.levels; mip++)
+                for (unsigned layer = 0; layer < texture->L.layers; layer++) {
+                    uint8_t color = 16 + i * 32 + pass * 96 + mip * 8 + layer;
+                    uint8_t expected[] = {color, color, color, color};
+                    CHECK(!memcmp(readbacks[n], expected, sizeof expected),
+                        "GPU sees fixture %u pass %u mip %u layer %u", i, pass, mip, layer);
+                    memset(expected, color ^ 0xff, sizeof expected);
+                    CHECK(!memcmp(corners[n++], expected, sizeof expected),
+                        "GPU sees the last texel of fixture %u pass %u mip %u layer %u", i, pass, mip, layer);
+                }
+            vk_upload_test_preparation(after);
+            const unsigned joined[] = {3, 15, 10, 0};
+            CHECK(after[0] - before[0] == (i < 3 && (!optimized || (!grouping && i != 0))),
+                "copy plans fit inline once compatible layers are joined");
+            CHECK(after[1] - before[1] == (optimized && !pass && i < 3),
+                "omit the entry barrier only for the initial staged image copy");
+            CHECK(after[2] - before[2] == (grouping ? joined[i] : 0),
+                "only contiguous layers without padding share a copy region");
+        }
+        mtl_tex_release(texture);
+    }
+    vk_upload_report(300);
+    free(linear);
+    nvn_dirty_remove_range(guest); mtl_pool_del(guest); munmap(guest, POOL_BYTES);
+    printf("%s: upload preparation %s, layer grouping %s, %d checks, %d failed\n",
+        fails ? "FAILED" : "ok", optimized ? "on" : "off", grouping ? "on" : "off", checks, fails);
+    return fails != 0;
+}
+
+static void upload_fixture_fill(const tex_t *texture, uint8_t *linear, unsigned mip, unsigned layer, uint8_t value) {
+    int bw, bh, bytes = nvn_fmt_bpb(texture->d.format, &bw, &bh);
+    size_t row = (texture->d.width >> mip) / bw * bytes, rows = (texture->d.height >> mip) / bh;
+    uint64_t offset = nvn_tex_level_offset(&texture->d, mip) + layer * texture->L.layer_size;
+    dm_guest_write_prepare(texture->mem + offset, 4);
+    memset(linear, value, row * rows);
+    CHECK(!nvn_swizzle(&texture->d, mip, layer, linear, row, texture->mem),
+          "seed upload mip %u layer %u", mip, layer);
+}
+
+static int partial_upload_checks(int enabled, int tracked, int coarse, int compressed, int split) {
+    enum { LAYERS = 6, LEVELS = 3, POOL_BYTES = 4 << 20, BASE_BYTES = 256 * 256 * 4 };
+    const uint64_t full = (BASE_BYTES + BASE_BYTES / 4 + BASE_BYTES / 16) * LAYERS;
+    unsigned width = compressed ? 512 : 256, block_size = compressed ? 4 : 1, bytes = compressed ? 16 : 4;
+    setenv("TOTK_VK_PARTIAL_TEX_UPLOAD", enabled ? "1" : "0", 1);
+    unsetenv("TOTK_DIRTY_UNIT");
+    setenv("TOTK_DIRTY_UNIT_KB", coarse ? "64" : "0", 1);
+    setenv("TOTK_VK_UPLOAD_THREADS", "1", 1);
+    uint8_t *guest = mmap(NULL, POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (guest == MAP_FAILED) DIE("partial upload pool");
+    uint8_t *linear = VK_MALLOC(BASE_BYTES);
+    mtl_init();
+    mtl_pool_add(guest, POOL_BYTES);
+    if (tracked) nvn_dirty_add_range(guest, POOL_BYTES);
+    pool_t pool = {.mem = guest, .size = POOL_BYTES, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    tex_t texture = {.d = {.target = NVN_TEXTURE_TARGET_2D_ARRAY, .format = compressed ? NVN_FORMAT_RGBA_DXT5 : NVN_FORMAT_RGBA8,
+        .width = width, .height = width, .depth = LAYERS, .levels = LEVELS}, .serial = 91125, .pool = &pool, .mem = guest};
+    nvn_tex_layout(&texture.d, &texture.L);
+    CHECK(texture.L.size <= POOL_BYTES, "array storage fits the guest pool");
+    if (texture.L.size > POOL_BYTES) return 1;
+    uint8_t expected[LEVELS][LAYERS];
+    for (unsigned m = 0; m < LEVELS; m++) for (unsigned l = 0; l < LAYERS; l++) {
+        expected[m][l] = 16 + m * 8 + l;
+        upload_fixture_fill(&texture, linear, m, l, expected[m][l]);
+    }
+    uint64_t isolated = 0;
+    for (unsigned phase = 0; phase < 4; phase++) {
+        if (phase == 2) {
+            VkBuffer buffer; uint64_t offset;
+            CHECK(vk_resolve((uintptr_t)guest, bytes, &buffer, &offset), "resolve the guest buffer for a real GPU write");
+            mtl_sub_begin();
+            VkCommandBuffer cb = vk_cb();
+            vk_gpu_write((uintptr_t)guest, bytes);
+            if (enabled) {
+                int unchanged = 1;
+                CHECK(!vk_upload_guest_revision((uintptr_t)guest, texture.L.size, 0, &unchanged),
+                      "an unsubmitted overlapping GPU writer prevents a partial update");
+            }
+            vkCmdFillBuffer(cb, buffer, offset, bytes, 0x74747474);
+            CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "GPU write to a different mip completes");
+            CHECK(guest[0] == 0x74, "device write reached the guest bytes");
+            expected[0][0] = 0x74;
+        }
+        if (phase == 3) {
+            void *write = nvn_dirty_gpu_write_begin(guest, bytes);
+            memset(guest, 0x85, bytes);
+            nvn_dirty_gpu_write_end(write);
+            if (enabled) vk_upload_guest_landed((uintptr_t)guest, bytes);
+            expected[0][0] = 0x85;
+        }
+        if (phase == 1 && split) {
+            const unsigned dirty[] = {0, 1, 4};
+            for (unsigned i = 0; i < sizeof dirty / sizeof *dirty; i++) {
+                unsigned layer = dirty[i];
+                expected[2][layer] = 71 + layer;
+                upload_fixture_fill(&texture, linear, 2, layer, expected[2][layer]);
+            }
+        } else if (phase) {
+            expected[2][3] = 64 + phase;
+            upload_fixture_fill(&texture, linear, 2, 3, expected[2][3]);
+        }
+        uint64_t before[3], after[3], prep_before[3], prep_after[3];
+        vk_upload_test_partial(before);
+        vk_upload_test_preparation(prep_before);
+        mtl_sub_begin();
+        vk_tex *realized = vk_tex_get(&texture);
+        CHECK(realized, "fixture phase %u resolves", phase);
+        if (!realized) return 1;
+        uint8_t *readbacks[LEVELS][LAYERS];
+        for (unsigned m = 0; m < LEVELS; m++) for (unsigned l = 0; l < LAYERS; l++)
+            readbacks[m][l] = texture_test_read_block(realized, m, l, block_size, bytes);
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "fixture phase %u retires", phase);
+        for (unsigned m = 0; m < LEVELS; m++) for (unsigned l = 0; l < LAYERS; l++) {
+            uint8_t block[16]; memset(block, expected[m][l], bytes);
+            CHECK(!memcmp(block, readbacks[m][l], bytes), "phase %u preserves mip %u layer %u", phase, m, l);
+        }
+        vk_upload_test_partial(after);
+        vk_upload_test_preparation(prep_after);
+        uint64_t staged = after[0] - before[0];
+        if (phase == 1) isolated = staged;
+        int partial = enabled && tracked && phase == 1;
+        CHECK(after[1] - before[1] == (uint64_t)partial &&
+              after[2] - before[2] == full - staged, "phase %u reports only omitted staging bytes (%llu staged)", phase,
+              (unsigned long long)staged);
+        CHECK(partial ? staged < full && (coarse || staged == (split ? 3 : 1) * BASE_BYTES / 16) : staged == full,
+              "phase %u stages the selected subresources or the entire array for a fallback", phase);
+        if (partial && split)
+            CHECK(prep_after[2] - prep_before[2] == (vk_off("uploadlayers") ? 0 : 1),
+                  "merge adjacent dirty layers and keep the isolated layer in a separate region");
+    }
+    vk_upload_report(300);
+    mtl_tex_release(&texture); mtl_pool_finalize(guest);
+    mtl_sub_begin(); (void)vk_cb();
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "partial upload cleanup completes");
+    munmap(guest, POOL_BYTES);
+    free(linear);
+    printf("%s: partial upload %s tracked=%d coarse=%d compressed=%d isolated_bytes=%llu full_bytes=%llu, %d checks, %d failed\n",
+        fails ? "FAILED" : "ok", enabled ? "on" : "off", tracked, coarse, compressed, (unsigned long long)isolated,
+        (unsigned long long)full, checks, fails);
+    return fails != 0;
+}
+
+static int pool_image_lifetime_checks(void) {
+    extern void vk_res_test_pool_images(uint64_t stats[3]);
+    setenv("TOTK_VK_IMAGE_BLOCK_MB", "16", 1);
+    setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1);
+    unsetenv("TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW");
+    enum { MIB = 1 << 20, POOL_BYTES = 16 * MIB };
+    const uint8_t red[] = {255, 0, 0, 255}, green[] = {0, 255, 0, 255}, blue[] = {0, 0, 255, 255};
+    uint8_t *storage = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(storage != MAP_FAILED, "two guest ranges map");
+    if (storage == MAP_FAILED) return 1;
+    mtl_init();
+    mtl_pool_add(storage, POOL_BYTES); mtl_pool_add(storage + POOL_BYTES, POOL_BYTES);
+    nvn_dirty_add_range(storage, POOL_BYTES);
+    tex_t old = {.d = {.target = 1, .format = 0x25, .width = 2048, .height = 1536, .depth = 1, .levels = 1},
+                 .mem = storage, .serial = 51000};
+    nvn_tex_layout(&old.d, &old.L);
+    tex_t alias = old, neighbor = old, replacement = old, second = old;
+    alias.serial++; neighbor.serial += 2; neighbor.mem += POOL_BYTES;
+    replacement.serial += 3; second.serial += 4;
+    mtl_sub_begin();
+    vk_tex *old_tex = vk_tex_get(&old), *alias_tex = vk_tex_get(&alias), *near_tex = vk_tex_get(&neighbor);
+    CHECK(old_tex && alias_tex && near_tex, "old and neighboring pool images realized");
+    if (!old_tex || !alias_tex || !near_tex) return 1;
+    CHECK(vk_tex_image(alias_tex) == vk_tex_image(old_tex), "old serials share their pool backing");
+    reclaim_test_clear(old_tex, 0); reclaim_test_clear(near_tex, 2);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "old rendering completes");
+
+    mtl_pool_finalize(storage);
+    uint64_t stats[3], memory[8];
+    vk_res_test_pool_images(stats); vk_res_mem(memory);
+    CHECK(stats[0] == 1 && !stats[1] && memory[4] == 1,
+          "finalization detaches only the old shared image and keeps both old serials alive");
+    mtl_pool_add(storage, POOL_BYTES);
+    mtl_sub_begin();
+    vk_tex *new_tex = vk_tex_get(&replacement), *new_alias = vk_tex_get(&second);
+    CHECK(new_tex && new_alias, "reused guest address creates images for both new serials");
+    if (!new_tex || !new_alias) return 1;
+    CHECK(vk_tex_image(new_tex) != vk_tex_image(old_tex) && vk_tex_image(new_alias) == vk_tex_image(new_tex),
+          "new serials share only the new pool image");
+    reclaim_test_clear(new_tex, 1);
+    uint8_t *old_pixel = texture_test_read_pixel(alias_tex, 0, 0), *new_pixel = texture_test_read_pixel(new_tex, 0, 0);
+    uint8_t *near_pixel = texture_test_read_pixel(near_tex, 0, 0);
+    uint64_t ticket = vk_submit_now();
+    CHECK(mtl_wait(ticket, 5000000000ull), "readbacks from both pool generations complete");
+    CHECK(!memcmp(old_pixel, red, 4) && !memcmp(new_pixel, green, 4) && !memcmp(near_pixel, blue, 4),
+          "old, new and adjacent GPU contents remain independent");
+    vk_res_mem(memory);
+    CHECK(memory[0] == 48 * MIB && memory[7] == 36 * MIB && memory[4] == 2,
+          "all three Vulkan images still occupy separate blocks");
+    mtl_tex_release(&old);
+    vk_res_test_pool_images(stats);
+    CHECK(!stats[1], "one surviving serial keeps the detached image alive");
+    mtl_tex_release(&alias);
+    vk_res_test_pool_images(stats); vk_res_mem(memory);
+    CHECK(stats[1] == 1 && stats[2] == 12 * MIB && memory[0] == 48 * MIB,
+          "the last owner queues immediate retirement without freeing backing before its ticket");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "old retirement reaches its fence");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    vk_res_mem(memory);
+    CHECK(memory[0] == 32 * MIB && memory[7] == 24 * MIB && memory[4] == 2,
+          "normal fence sweeping recovers the entire old block at the next boundary");
+
+    mtl_tex_release(&replacement); mtl_tex_release(&second); mtl_tex_release(&neighbor);
+    mtl_pool_finalize(storage); mtl_pool_finalize(storage + POOL_BYTES);
+    mtl_sub_begin(); (void)vk_cb();
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "the other pool images finish retiring");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    vk_res_mem(memory);
+    CHECK(!memory[0] && !memory[4], "final cleanup returns all pooled images");
+    munmap(storage, 2 * POOL_BYTES);
+    printf("%s: pool image lifetime %d checks, %d failed; retired block 16 MiB\n",
+           fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
+static PFN_vkAllocateMemory image_test_allocate;
+static VkDeviceSize image_test_failure_size;
+static VkResult image_test_failure_result;
+static unsigned image_test_attempts;
+
+static VKAPI_ATTR VkResult VKAPI_CALL image_test_alloc_once(VkDevice device, const VkMemoryAllocateInfo *info,
+                                                             const VkAllocationCallbacks *callbacks,
+                                                             VkDeviceMemory *memory) {
+    if (info->allocationSize == image_test_failure_size && ++image_test_attempts == 1)
+        return image_test_failure_result;
+    return image_test_allocate(device, info, callbacks, memory);
+}
+
+static vk_tex *image_test_with_pressure(tex_t *texture, int dedicated) {
+    image_test_attempts = 0;
+    image_test_failure_size = (dedicated ? 24u : 32u) << 20;
+    image_test_failure_result = dedicated ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    image_test_allocate = vkAllocateMemory;
+    vkAllocateMemory = image_test_alloc_once;
+    vk_tex *result = vk_tex_get(texture);
+    vkAllocateMemory = image_test_allocate;
+    return result;
+}
+
+static VkResult image_retry_injection;
+static PFN_vkCreateImage image_retry_create;
+static PFN_vkBindImageMemory image_retry_bind;
+static unsigned image_retry_creates;
+
+static VKAPI_ATTR VkResult VKAPI_CALL count_image_creates(VkDevice device, const VkImageCreateInfo *info,
+        const VkAllocationCallbacks *callbacks, VkImage *image) {
+    if (info->extent.width == 13 && info->extent.height == 9) {
+        image_retry_creates++;
+        if (image_retry_injection) return image_retry_injection;
+    }
+    return image_retry_create(device, info, callbacks, image);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL fail_image_bind(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) {
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+static int image_retry_checks(const char *mode) {
+    int allocation = !strcmp(mode, "allocate"), binding = !strcmp(mode, "bind"), persistent = !strcmp(mode, "persistent");
+    setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1);
+    setenv("TOTK_VK_IMAGE_BLOCK_MB", "32", 1);
+    setenv("TOTK_VK_TEX_MEMO", "1", 1);
+    setenv("TOTK_VK_UBWC", "1", 1);
+    enum { COUNT = 7, DEAD_POOL = 5, PERMANENT = 6, POOL_SIZE = 1 << 16, STRIDE = 4096 };
+    uint8_t *guest = mmap(NULL, 2 * POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (guest == MAP_FAILED) DIE("image retry guest memory");
+    mtl_init();
+    mtl_pool_add(guest, POOL_SIZE); nvn_dirty_add_range(guest, POOL_SIZE);
+    mtl_pool_add(guest + POOL_SIZE, POOL_SIZE); nvn_dirty_add_range(guest + POOL_SIZE, POOL_SIZE);
+    pool_t pools[] = {{.mem = guest, .size = POOL_SIZE, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED},
+                     {.mem = guest + POOL_SIZE, .size = POOL_SIZE, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED}};
+    tex_t textures[COUNT];
+    unsigned completed[DEAD_POOL] = {0};
+    uint64_t failed_at = vk_submit_serial();
+    mtl_sub_begin();
+    image_retry_create = vkCreateImage; vkCreateImage = count_image_creates;
+    image_retry_bind = vkBindImageMemory;
+    for (unsigned i = 0; i < COUNT; i++) {
+        pool_t *pool = &pools[i == DEAD_POOL];
+        tex_t *texture = &textures[i];
+        *texture = (tex_t){.d = {.target = 1, .format = 0x25, .width = 13, .height = 9, .depth = 1, .levels = 1},
+            .serial = 60100 + i, .pool = pool, .mem = pool->mem + i * STRIDE};
+        nvn_tex_layout(&texture->d, &texture->L);
+        uint8_t linear[13 * 9 * 4];
+        memset(linear, 32 + i, sizeof linear);
+        CHECK(texture->L.size <= STRIDE && !nvn_swizzle(&texture->d, 0, 0, linear, 13 * 4, texture->mem), "texture %u seed", i);
+        if (i == PERMANENT) image_retry_injection = VK_ERROR_UNKNOWN;
+        else if (binding) vkBindImageMemory = fail_image_bind;
+        else if (!allocation) image_retry_injection = VK_ERROR_OUT_OF_HOST_MEMORY;
+        CHECK(!(allocation && i != PERMANENT ? image_test_with_pressure(texture, 0) : vk_tex_get(texture)),
+              "texture %u falls back when its first realization fails", i);
+        image_retry_injection = VK_SUCCESS;
+        vkBindImageMemory = image_retry_bind;
+        mtl_reg_tex(101 + i, texture, NULL);
+    }
+    const unsigned initial_attempts = COUNT + 1; /* the non-memory error also tries the format-list fallback */
+    CHECK(image_retry_creates == initial_attempts, "only the format error tries another creation configuration");
+    uint64_t memory[8]; vk_res_mem(memory);
+    CHECK(!memory[0] && !memory[1] && !memory[7], "failed images hold no allocations");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "initial submission retires");
+    mtl_pool_finalize(pools[1].mem);
+    for (unsigned i = 0; i < DEAD_POOL; i++) {
+        uint8_t linear[13 * 9 * 4];
+        memset(linear, 64 + i, sizeof linear);
+        CHECK(!nvn_swizzle(&textures[i].d, 0, 0, linear, 13 * 4, textures[i].mem), "new data for pending texture %u", i);
+    }
+    if (persistent) image_retry_injection = VK_ERROR_OUT_OF_HOST_MEMORY;
+    unsigned complete = 0;
+    for (unsigned frame = 0; frame < 16; frame++) {
+        uint8_t *pixels[DEAD_POOL] = {0};
+        mtl_sub_begin();
+        (void)vk_cb();
+        uint64_t sub = vk_submit_serial();
+        unsigned before = image_retry_creates;
+        for (unsigned i = 0; i < COUNT; i++) {
+            vk_tex *texture = NULL;
+            VkImageView view = vk_tex_by_id(101 + i, NULL, &texture);
+            if (i >= DEAD_POOL || persistent) CHECK(!view && !texture, "cancelled or failed texture %u stays unavailable", i);
+            else if (view && texture && !completed[i]) {
+                pixels[i] = texture_test_read_pixel(texture, 0, 0);
+                completed[i] = 1;
+                complete++;
+            }
+        }
+        CHECK(image_retry_creates - before <= 4, "bounded retries per submission");
+        if (sub - failed_at < 8) CHECK(image_retry_creates == initial_attempts, "no retry inside the eight-submission cooldown");
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "texture retry submission %u retires", frame);
+        for (unsigned i = 0; i < DEAD_POOL; i++) if (pixels[i]) {
+            uint8_t expected[] = {64 + i, 64 + i, 64 + i, 64 + i};
+            CHECK(!memcmp(pixels[i], expected, sizeof expected), "recovered texture %u contains exact guest pixels", i);
+        }
+        if (complete == DEAD_POOL) break;
+    }
+    CHECK(image_retry_creates == initial_attempts + DEAD_POOL, "only eligible images retry, once each");
+    CHECK(complete == (persistent ? 0 : DEAD_POOL), "expected textures are recoverable through the ID cache");
+    image_retry_injection = VK_SUCCESS;
+    vkCreateImage = image_retry_create;
+    for (unsigned i = 0; i < COUNT; i++) { mtl_reg_tex(101 + i, NULL, NULL); mtl_tex_release(&textures[i]); }
+    mtl_pool_finalize(pools[0].mem);
+    mtl_sub_begin(); (void)vk_cb(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "image retry cleanup retires");
+    mtl_sub_begin(); (void)vk_cb(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "retired textures are swept");
+    vk_res_mem(memory);
+    CHECK(!memory[0] && !memory[1] && !memory[7] && !memory[2], "cleanup leaves no allocations or retired images");
+    munmap(guest, 2 * POOL_SIZE);
+    printf("%s: image retry %s, %u recovered, %d checks, %d failed\n", fails ? "FAILED" : "ok", mode, complete, checks, fails);
+    return fails != 0;
+}
+
+static int image_reclaim_checks(int enabled, int dedicated, int pressure) {
+    setenv("TOTK_VK_IMAGE_BLOCK_MB", "32", 1);
+    setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1);
+    setenv("TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW", enabled ? "1" : "0", 1);
+    unsetenv("TOTK_VK_IMAGE_PACK");
+    enum { MIB = 1 << 20, COUNT = 5 };
+    const uint8_t blue[] = {0, 0, 255, 255}, green[] = {0, 255, 0, 255}, red[] = {255, 0, 0, 255};
+    tex_t texture[COUNT];
+    vk_tex *resident[COUNT];
+    uint64_t memory[8];
+    uint8_t *old_pixel = NULL;
+    uint64_t initial_spans = dedicated ? 0 : 48 * MIB;
+    uint64_t initial_dedicated = dedicated ? 96 * MIB : 0;
+    uint64_t initial_blocks = dedicated ? 0 : 64 * MIB;
+    mtl_sub_begin();
+    for (int i = 0; i < COUNT; i++) {
+        texture[i] = (tex_t){.d = {.target = 1, .format = 0x25, .width = 2048, .height = dedicated ? 3072 : 1536,
+                                  .depth = 1, .levels = 1}, .serial = 60000 + i};
+        nvn_tex_layout(&texture[i].d, &texture[i].L);
+    }
+    for (int i = 0; i < 4; i++) {
+        resident[i] = vk_tex_get(&texture[i]);
+        CHECK(resident[i], "private texture %d realized", i);
+        if (!resident[i]) return 1;
+        if (i == 0) {
+            reclaim_test_clear(resident[0], 2);
+            old_pixel = texture_test_read_pixel(resident[0], 0, 0);
+            mtl_tex_release(&texture[0]);
+        }
+    }
+    reclaim_test_clear(resident[1], 1);
+    vk_res_mem(memory);
+    CHECK(memory[0] == initial_blocks && memory[1] == initial_dedicated && memory[7] == initial_spans && memory[2] == 2,
+          "before submission the retired image and its host record stay queued");
+    uint64_t pending = mtl_last_fence() + 1, submitted = vk_submit_now();
+    CHECK(submitted == pending && mtl_wait(submitted, 5000000000ull), "the retiring image's slot completes");
+    CHECK(!memcmp(old_pixel, blue, 4), "commands recorded before retirement read the old texture correctly");
+    vk_res_mem(memory);
+    CHECK(memory[2] == 2 && memory[1] == initial_dedicated && memory[7] == initial_spans,
+          "the ordinary sweep has not processed the completed retirement");
+    mtl_tex_release(&texture[2]);   /* the next ticket is still unsubmitted */
+    resident[4] = pressure ? image_test_with_pressure(&texture[4], dedicated) : vk_tex_get(&texture[4]);
+    if (pressure) CHECK(image_test_attempts == (dedicated ? 2u : 1u),
+        "one simulated shortage leads to one retry or reuse of a completed span");
+    CHECK(resident[4], "replacement texture realized");
+    if (!resident[4]) return 1;
+    vk_res_mem(memory);
+    int reclaimed = enabled || pressure;
+    CHECK(memory[0] == initial_blocks + (!reclaimed && !dedicated ? 32 * MIB : 0) &&
+          memory[1] == initial_dedicated + (!reclaimed && dedicated ? 24 * MIB : 0) &&
+          memory[7] == initial_spans + (!reclaimed && !dedicated ? 12 * MIB : 0),
+          "eligible reclamation avoids growing the allocation total during replacement");
+    CHECK(memory[2] == (reclaimed ? 3 : 4), "the future image and both retired host records stay queued");
+    uint64_t committed = (memory[0] + memory[1]) / MIB;
+    if (pressure) {
+        tex_t blocked = texture[4];
+        blocked.serial++;
+        CHECK(!image_test_with_pressure(&blocked, dedicated) && image_test_attempts == 1,
+              "another failed allocation returns promptly when remaining images have future tickets");
+        mtl_tex_release(&blocked);
+    }
+    reclaim_test_clear(resident[4], 0);
+    uint8_t *survivor = texture_test_read_pixel(resident[1], 0, 0), *replacement = texture_test_read_pixel(resident[4], 0, 0);
+    CHECK(mtl_wait(vk_submit_now(), 5000000000ull), "texture readbacks complete");
+    CHECK(!memcmp(survivor, green, 4) && !memcmp(replacement, red, 4),
+          "span reuse preserves the other live image and replacement bytes");
+    mtl_tex_release(&texture[1]); mtl_tex_release(&texture[3]); mtl_tex_release(&texture[4]);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "final retirement ticket completes");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    vk_res_mem(memory);
+    CHECK(!memory[0] && !memory[1] && !memory[7] && !memory[2], "final sweep releases all memory and queue records");
+    printf("%s: retire before %s growth %s, committed %llu MiB, %d checks, %d failed\n",
+        fails ? "FAILED" : "ok", dedicated ? "dedicated" : "block", pressure ? "pressure" : enabled ? "on" : "off",
+        (unsigned long long)committed, checks, fails);
+    return fails != 0;
+}
+
+static int image_reclaim_fit_checks(void) {
+    setenv("TOTK_VK_IMAGE_BLOCK_MB", "32", 1);
+    setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1);
+    setenv("TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW", "1", 1);
+    unsetenv("TOTK_VK_IMAGE_PACK");
+    enum { MIB = 1 << 20, SMALL = 16, STAY = SMALL, RETIRE = SMALL + 1, REPLACE = SMALL + 2, COUNT };
+    const uint8_t colors[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {0, 0, 0, 255}};
+    tex_t textures[COUNT];
+    vk_tex *images[COUNT];
+    mtl_sub_begin();
+    for (unsigned i = 0; i < COUNT; i++) {
+        textures[i] = (tex_t){.d = {.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8,
+            .width = i < SMALL ? 1024 : 2048, .height = i < SMALL ? 512 : i == REPLACE ? 2048 : 1536,
+            .depth = 1, .levels = 1}, .serial = 60700 + i};
+        nvn_tex_layout(&textures[i].d, &textures[i].L);
+        if (i == REPLACE) continue;
+        images[i] = vk_tex_get(&textures[i]);
+        CHECK(images[i], "fragmented fixture image %u is realized", i);
+        if (!images[i]) return 1;
+    }
+    uint64_t memory[8];
+    vk_res_mem(memory);
+    CHECK(memory[0] == 64 * MIB && !memory[1] && memory[7] == 56 * MIB,
+          "two blocks contain interleaved small spans and two large spans");
+    reclaim_test_clear(images[STAY], 0);
+    reclaim_test_clear(images[RETIRE], 2);
+    uint8_t *old = texture_test_read_pixel(images[RETIRE], 0, 0);
+    for (unsigned i = 0; i < SMALL; i += 2) mtl_tex_release(&textures[i]);
+    mtl_tex_release(&textures[RETIRE]);
+    CHECK(mtl_wait(vk_submit_now(), 5000000000ull), "covering ticket for the nine retirements completes");
+    CHECK(!memcmp(old, colors[2], 4), "the old large image stays readable until its covering ticket");
+    reclaim_test_clear(images[1], 1);
+    uint8_t *future = texture_test_read_pixel(images[1], 0, 0);
+    for (unsigned i = 1; i < SMALL; i += 2) mtl_tex_release(&textures[i]);
+    images[REPLACE] = vk_tex_get(&textures[REPLACE]);
+    CHECK(images[REPLACE], "replacement image is realized");
+    if (!images[REPLACE]) return 1;
+    vk_res_mem(memory);
+    CHECK(memory[0] == 64 * MIB && !memory[1], "large completed span merges with the free tail without growing (got %llu MiB)",
+          (unsigned long long)(memory[0] >> 20));
+    CHECK(memory[2] == 33 && memory[7] == 60 * MIB,
+          "reclaim selects the large span and leaves all other retirements queued (%llu records, %llu MiB used)",
+          (unsigned long long)memory[2], (unsigned long long)(memory[7] >> 20));
+    reclaim_test_clear(images[REPLACE], 3);
+    uint8_t *survivor = texture_test_read_pixel(images[STAY], 0, 0);
+    uint8_t *replacement = texture_test_read_pixel(images[REPLACE], 0, 0);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "future and replacement uses complete");
+    CHECK(!memcmp(future, colors[1], 4), "the unsubmitted use was preserved");
+    CHECK(!memcmp(survivor, colors[0], 4) && !memcmp(replacement, colors[3], 4), "survivor and replacement contents match");
+    mtl_tex_release(&textures[STAY]); mtl_tex_release(&textures[REPLACE]);
+    mtl_sub_begin(); (void)vk_cb(); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "remaining retirements complete");
+    mtl_sub_begin(); (void)vk_cb(); mtl_sub_commit();
+    vk_res_mem(memory);
+    CHECK(!memory[0] && !memory[1] && !memory[2] && !memory[7], "cleanup releases the remaining spans and host records");
+    printf("%s: image reclamation fit, %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--image-reclaim-fit")) return image_reclaim_fit_checks();
+    if (argc == 3 && !strcmp(argv[1], "--image-retry")) return image_retry_checks(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--recorder-descriptor-layout")) return recorder_descriptor_layout_checks();
+    if (argc == 2 && !strcmp(argv[1], "--buffer-view-pool-lifetime")) return buffer_view_pool_lifetime_checks();
+    if (argc == 2 && !strcmp(argv[1], "--pool-image-lifetime")) return pool_image_lifetime_checks();
+    if (argc == 2 && !strcmp(argv[1], "--staging-warm-retain")) return staging_warm_retain_checks(8);
+    if (argc == 2 && !strcmp(argv[1], "--staging-warm-retain-small")) return staging_warm_retain_checks(4);
+    if (argc == 3 && !strcmp(argv[1], "--staging-early-trim")) {
+        if (!strcmp(argv[2], "on")) return staging_early_trim_checks(1);
+        if (!strcmp(argv[2], "off")) return staging_early_trim_checks(0);
+        return 2;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--buffer-view-release")) return buffer_view_release_checks();
+    if (argc == 3 && !strcmp(argv[1], "--arena-tails")) {
+        if (!strcmp(argv[2], "on")) return arena_tail_checks(1);
+        if (!strcmp(argv[2], "off")) return arena_tail_checks(0);
+        return 2;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--image-reclaim") || !strcmp(argv[1], "--image-reclaim-dedicated"))) {
+        int dedicated = !strcmp(argv[1], "--image-reclaim-dedicated");
+        if (!strcmp(argv[2], "on")) return image_reclaim_checks(1, dedicated, 0);
+        if (!strcmp(argv[2], "off")) return image_reclaim_checks(0, dedicated, 0);
+        if (!strcmp(argv[2], "pressure")) return image_reclaim_checks(0, dedicated, 1);
+        return 2;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--image-ownership")) return image_ownership_checks();
     if (argc == 2 && !strcmp(argv[1], "--shared-idle")) return shared_idle_checks();
     if (argc == 2 && !strcmp(argv[1], "--texel-regions")) return texel_regions();
     if (argc == 2 && !strcmp(argv[1], "--mprotect-bench")) return mprotect_bench();
@@ -1766,6 +2809,21 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--texture-cache-bench")) return texture_cache_bench();
     if (argc == 2 && !strcmp(argv[1], "--texture-churn-bench")) return texture_churn_bench();
     if (argc == 2 && !strcmp(argv[1], "--texture-upload-bench")) return texture_upload_bench();
+    if (argc == 3 && !strcmp(argv[1], "--upload-preparation")) {
+        if (!strcmp(argv[2], "on")) return upload_preparation_checks(1, 1);
+        if (!strcmp(argv[2], "scalar")) return upload_preparation_checks(1, 0);
+        if (!strcmp(argv[2], "off")) return upload_preparation_checks(0, 0);
+        return 2;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--upload-partial")) {
+        if (!strcmp(argv[2], "on")) return partial_upload_checks(1, 1, 0, 0, 0);
+        if (!strcmp(argv[2], "off")) return partial_upload_checks(0, 1, 0, 0, 0);
+        if (!strcmp(argv[2], "coarse")) return partial_upload_checks(1, 1, 1, 0, 0);
+        if (!strcmp(argv[2], "untracked")) return partial_upload_checks(1, 0, 0, 0, 0);
+        if (!strcmp(argv[2], "compressed")) return partial_upload_checks(1, 1, 1, 1, 0);
+        if (!strcmp(argv[2], "split")) return partial_upload_checks(1, 1, 0, 0, 1);
+        return 2;
+    }
     if (argc == 2 && !strcmp(argv[1], "--texture-replacement")) return texture_replacement_checks();
     if (argc == 2 && !strcmp(argv[1], "--record-binding-bench")) return vk_draw_test_binding_bench();
     if (argc == 2 && !strcmp(argv[1], "--span-resolve-bench")) return span_resolve_bench();
@@ -1921,7 +2979,13 @@ int main(int argc, char **argv) {
             f = mtl_sub_commit();
             vk_lag_capture_take(&copied, &copy_ns, &copy_ranges, &excluded);
             nvn_dirty_lag_sticky_stats(&r1, &u1, &p1, &d1);
-            if (frame < 2 || frame == 3) CHECK(r1 == r0 + 1, "rewritten cold unit re-arms once before frame %d", frame);
+            if (frame < 2 || frame == 3) {
+                /* The first copy also protects its previously unused destination.
+                   Subsequent copies advance that destination's existing ticket. */
+                uint64_t expected_rearms = frame == 0 ? 2 : 1;
+                CHECK(r1 - r0 == expected_rearms, "cold source and destination re-arms before frame %d: %llu (expected %llu)",
+                    frame, (unsigned long long)(r1 - r0), (unsigned long long)expected_rearms);
+            }
             if (!frame) {
                 nvn_dirty_mp_stats(&mc0, &mp0, &mn0);
                 for (int repeat = 0; repeat < 16; repeat++) nvn_dirty_lag_protect(src, 256, f);

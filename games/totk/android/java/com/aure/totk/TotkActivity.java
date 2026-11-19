@@ -2,7 +2,9 @@ package com.aure.totk;
 
 import android.app.NativeActivity;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
@@ -54,6 +56,15 @@ public final class TotkActivity extends NativeActivity {
     private static native void nativeTextInputDone(long serial, byte[] utf8);
     private static native void nativeGameFocus(boolean focused, boolean singleDisplay);
     private static native void nativeGameInputFocus(boolean top);
+
+    /** The overlay's background sampler uses the sticky system snapshot when battery sysfs is unreadable. */
+    private int batteryTemperatureDeciC() {
+        Intent battery = getApplicationContext().registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery == null || !battery.getBooleanExtra(BatteryManager.EXTRA_PRESENT, false)) {
+            return Integer.MIN_VALUE;
+        }
+        return battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+    }
 
     /** runtime/frontend_android.c, on this (the UI) thread: the game asks for text (nn::swkbd). TextEntry answers exactly
      * once: the UTF-8 text, or null when the player cancelled. */

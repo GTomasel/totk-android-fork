@@ -88,48 +88,145 @@ static void wb_diag_sweep(uint64_t start, uint64_t bytes, uint64_t chunks, int y
 /* ---------- device memory: first-fit blocks per memory type; big images get their own ---------- */
 #define IMAGE_DEDICATED_THRESHOLD (16ull << 20)
 typedef struct { VkDeviceSize off, size; } span_t;
-typedef struct { VkDeviceMemory mem; uint32_t type; span_t *free; int nfree, capfree; VkDeviceSize used; } block_t;
-static block_t *g_blocks; static int g_nblocks;
+typedef struct {
+    VkDeviceMemory mem;
+    uint32_t type;
+    span_t *free;
+    int nfree, capfree, live_allocations;
+    VkDeviceSize used;
+} block_t;
+static block_t *g_blocks;
+static int g_nblocks, g_capblocks;
 static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes, g_mem_block_allocs, g_mem_block_releases;
+static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes, g_mem_block_used;
+static uint64_t g_mem_block_allocs, g_mem_block_releases, g_mem_reclaim_reuses;
+static uint64_t g_mem_pressure_events, g_mem_pressure_recovered;
+typedef struct {
+    uint64_t blocks, dedicated, block_used_at_commit, occupied;
+} image_memory_peaks;
+static image_memory_peaks g_mem_peaks;
+static uint64_t g_mem_peak_last_log;
 static pthread_once_t g_mem_policy_once = PTHREAD_ONCE_INIT;
-static int g_mem_free_empty, g_mem_pack;
+static int g_mem_free_empty, g_mem_pack, g_mem_peak_log, g_mem_reclaim;
 static VkDeviceSize g_mem_block_size;
 static void image_memory_policy(void) {
     const char *value = getenv("TOTK_VK_IMAGE_FREE_EMPTY");
     g_mem_free_empty = value && !strcmp(value, "1");
     value = getenv("TOTK_VK_IMAGE_PACK");
     g_mem_pack = value && !strcmp(value, "1");
+    value = getenv("TOTK_VK_IMAGE_PEAK_LOG");
+    g_mem_peak_log = value && !strcmp(value, "1");
+    value = getenv("TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW");
+    g_mem_reclaim = value && !strcmp(value, "1");
     value = getenv("TOTK_VK_IMAGE_BLOCK_MB");
     g_mem_block_size = 64ull << 20;
     if (value && !strcmp(value, "32")) g_mem_block_size = 32ull << 20;
     else if (value && !strcmp(value, "16")) g_mem_block_size = 16ull << 20;
 }
 
-static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
-    int i = 0; while (i < b->nfree && b->free[i].off < off) i++;
-    if (b->nfree == b->capfree) { b->capfree = b->capfree ? 2 * b->capfree : 16; b->free = realloc(b->free, (size_t)b->capfree * sizeof *b->free); }
-    memmove(b->free + i + 1, b->free + i, (size_t)(b->nfree - i) * sizeof *b->free); b->free[i] = (span_t){off, size}; b->nfree++;
-    if (i + 1 < b->nfree && b->free[i].off + b->free[i].size == b->free[i + 1].off) { b->free[i].size += b->free[i + 1].size; memmove(b->free + i + 1, b->free + i + 2, (size_t)(b->nfree - i - 2) * sizeof *b->free); b->nfree--; }
-    if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == b->free[i].off) { b->free[i - 1].size += b->free[i].size; memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--; }
+static void image_memory_record_peaks_locked(void) {
+    uint64_t committed = g_mem_block_bytes + g_mem_dedicated_bytes;
+    uint64_t occupied = g_mem_block_used + g_mem_dedicated_bytes;
+    if (occupied > g_mem_peaks.occupied) g_mem_peaks.occupied = occupied;
+    if (committed <= g_mem_peaks.blocks + g_mem_peaks.dedicated) return;
+    g_mem_peaks.blocks = g_mem_block_bytes;
+    g_mem_peaks.dedicated = g_mem_dedicated_bytes;
+    g_mem_peaks.block_used_at_commit = g_mem_block_used;
+    if (g_mem_peak_log && committed - g_mem_peak_last_log >= (16ull << 20)) {
+        g_mem_peak_last_log = committed;
+        LOGV("[image-allocation-high] sub=%llu blocks=%llu dedicated=%llu occupied=%llu",
+            (unsigned long long)vk_submit_serial(), (unsigned long long)g_mem_block_bytes,
+            (unsigned long long)g_mem_dedicated_bytes, (unsigned long long)occupied);
+    }
 }
-int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out) {
+
+static image_memory_peaks image_memory_take_peaks_locked(void) {
+    image_memory_peaks peaks = g_mem_peaks;
+    g_mem_peaks = (image_memory_peaks){
+        g_mem_block_bytes, g_mem_dedicated_bytes, g_mem_block_used, g_mem_block_used + g_mem_dedicated_bytes
+    };
+    g_mem_peak_last_log = g_mem_block_bytes + g_mem_dedicated_bytes;
+    return peaks;
+}
+
+static int block_reserve_free(block_t *b, int needed) {
+    if (needed <= b->capfree) return 1;
+    int capacity = b->capfree ? b->capfree * 2 : 16;
+    span_t *spans = realloc(b->free, (size_t)capacity * sizeof *spans);
+    if (!spans) return 0;
+    b->free = spans;
+    b->capfree = capacity;
+    return 1;
+}
+
+static int block_free_lower_bound(const block_t *b, VkDeviceSize off) {
+    int lo = 0, hi = b->nfree;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (b->free[mid].off < off) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
+    int i = block_free_lower_bound(b, off);
+    int join_next = i < b->nfree && off + size == b->free[i].off;
+    if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == off) {
+        b->free[i - 1].size += size;
+        if (join_next) {
+            b->free[i - 1].size += b->free[i].size;
+            memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free);
+            b->nfree--;
+        }
+        return;
+    }
+    if (join_next) {
+        b->free[i].off = off;
+        b->free[i].size += size;
+        return;
+    }
+    memmove(b->free + i + 1, b->free + i, (size_t)(b->nfree - i) * sizeof *b->free); b->free[i] = (span_t){off, size}; b->nfree++;
+}
+enum image_reclaim_kind { IMAGE_RECLAIM_SPANS, IMAGE_RECLAIM_DEDICATED, IMAGE_RECLAIM_PRESSURE };
+typedef struct { VkDeviceSize size, alignment; uint32_t type; } image_span_request;
+static int reclaim_completed_images(enum image_reclaim_kind kind, VkDeviceSize target, const image_span_request *fit);
+static int memory_shortage(VkResult result) {
+    return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+static VkResult mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out, int texture) {
+    memset(out, 0, sizeof *out);
+    if (!req->size) return VK_ERROR_UNKNOWN;
     pthread_once(&g_mem_policy_once, image_memory_policy);
     int type = vk_pick_type(req->memoryTypeBits, want);
     if (type < 0) type = vk_pick_type(req->memoryTypeBits, 0);
-    if (type < 0) return 0;
-    memset(out, 0, sizeof *out);
+    if (type < 0) return VK_ERROR_FEATURE_NOT_PRESENT;
     VkDeviceSize align = req->alignment ? req->alignment : 1;
     if (align < V.props.limits.bufferImageGranularity) align = V.props.limits.bufferImageGranularity;
     if (req->size > IMAGE_DEDICATED_THRESHOLD) {
+        if (texture && g_mem_reclaim) reclaim_completed_images(IMAGE_RECLAIM_DEDICATED, req->size, NULL);
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req->size, .memoryTypeIndex = (uint32_t)type};
-        if (vk_memory_allocate(&mai, &out->mem, VK_MEMORY_IMAGE_DEDICATED)) return 0;
-        out->size = req->size; out->block = -1;
-        pthread_mutex_lock(&g_mem_mu); g_mem_dedicated_bytes += req->size; pthread_mutex_unlock(&g_mem_mu);
-        return 1;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkResult result = vk_memory_allocate(&mai, &memory, VK_MEMORY_IMAGE_DEDICATED);
+        int pressure = texture && memory_shortage(result);
+        if (pressure && reclaim_completed_images(IMAGE_RECLAIM_PRESSURE, req->size, NULL))
+            result = vk_memory_allocate(&mai, &memory, VK_MEMORY_IMAGE_DEDICATED);
+        pthread_mutex_lock(&g_mem_mu);
+        g_mem_pressure_events += pressure;
+        g_mem_pressure_recovered += pressure && !result;
+        if (!result) {
+            *out = (vk_alloc){.mem = memory, .size = req->size, .block = -1};
+            g_mem_dedicated_bytes += req->size;
+            image_memory_record_peaks_locked();
+        }
+        pthread_mutex_unlock(&g_mem_mu);
+        return result;
     }
+    int can_reclaim = texture && g_mem_reclaim, reclaimed = 0, pressure_retry = 0;
+    VkResult failure = VK_ERROR_OUT_OF_HOST_MEMORY;
     pthread_mutex_lock(&g_mem_mu);
-    for (int pass = 0; pass < 2; pass++) {
+    for (int grew = 0; ; ) {
         int block = -1, span = -1;
         VkDeviceSize offset = 0;
         for (int bi = 0; bi < g_nblocks && (g_mem_pack || block < 0); bi++) {
@@ -150,39 +247,88 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
             block_t *b = &g_blocks[block];
             span_t f = b->free[span];
             VkDeviceSize end = f.off + f.size, after = offset + req->size;
-            memmove(b->free + span, b->free + span + 1, (size_t)(b->nfree - span - 1) * sizeof *b->free);
-            b->nfree--;
-            if (offset > f.off) block_free_insert(b, f.off, offset - f.off);
-            if (after < end) block_free_insert(b, after, end - after);
+            // Reserve one free span for every live allocation so retirement never grows the array.
+            int needed = b->nfree + b->live_allocations + (offset > f.off) + (after < end);
+            if (!block_reserve_free(b, needed)) break;
+            if (offset > f.off) {
+                b->free[span].size = offset - f.off;
+                if (after < end) block_free_insert(b, after, end - after);
+            } else if (after < end) {
+                b->free[span] = (span_t){after, end - after};
+            } else {
+                memmove(b->free + span, b->free + span + 1, (size_t)(b->nfree - span - 1) * sizeof *b->free);
+                b->nfree--;
+            }
             b->used += req->size;
+            b->live_allocations++;
+            g_mem_block_used += req->size;
+            image_memory_record_peaks_locked();
+            if (reclaimed && !grew) g_mem_reclaim_reuses++;
+            g_mem_pressure_recovered += pressure_retry;
             out->mem = b->mem; out->off = offset; out->size = req->size; out->block = block;
             pthread_mutex_unlock(&g_mem_mu);
-            return 1;
+            return VK_SUCCESS;
         }
-        if (pass) break;
-        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = g_mem_block_size, .memoryTypeIndex = (uint32_t)type};
-        VkDeviceMemory m;
-        if (vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK)) break;
+        if (can_reclaim) {
+            can_reclaim = 0;
+            // Retirement takes the texture lock and can free block spans.
+            pthread_mutex_unlock(&g_mem_mu);
+            image_span_request fit = {.size = req->size, .alignment = align, .type = (uint32_t)type};
+            reclaimed = reclaim_completed_images(IMAGE_RECLAIM_SPANS, 0, &fit);
+            pthread_mutex_lock(&g_mem_mu);
+            continue;
+        }
+        if (grew) { failure = VK_ERROR_UNKNOWN; break; }
         int bi = 0;
         while (bi < g_nblocks && g_blocks[bi].mem) bi++;
-        if (bi == g_nblocks) {
-            g_nblocks++;
-            g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
+        if (bi == g_capblocks) {
+            int capacity = g_capblocks ? g_capblocks * 2 : 8;
+            block_t *blocks = realloc(g_blocks, (size_t)capacity * sizeof *blocks);
+            if (!blocks) break;
+            g_blocks = blocks;
+            g_capblocks = capacity;
         }
-        block_t *b = &g_blocks[bi]; memset(b, 0, sizeof *b); b->mem = m; b->type = (uint32_t)type;
-        block_free_insert(b, 0, g_mem_block_size);
+        block_t candidate = {.type = (uint32_t)type};
+        if (!block_reserve_free(&candidate, 2)) break;
+        VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = g_mem_block_size, .memoryTypeIndex = (uint32_t)type};
+        VkResult result = vk_memory_allocate(&mai, &candidate.mem, VK_MEMORY_IMAGE_BLOCK);
+        if (result) {
+            free(candidate.free);
+            if (texture && !pressure_retry && memory_shortage(result)) {
+                g_mem_pressure_events++;
+                pthread_mutex_unlock(&g_mem_mu);
+                pressure_retry = reclaim_completed_images(IMAGE_RECLAIM_PRESSURE, req->size, NULL);
+                pthread_mutex_lock(&g_mem_mu);
+                if (pressure_retry) continue;
+            }
+            failure = result;
+            break;
+        }
+        block_free_insert(&candidate, 0, g_mem_block_size);
+        g_blocks[bi] = candidate;
+        if (bi == g_nblocks) g_nblocks++;
         g_mem_block_bytes += g_mem_block_size;
         g_mem_block_allocs++;
+        grew = 1;
     }
     pthread_mutex_unlock(&g_mem_mu);
-    return 0;
+    return failure;
 }
+
+int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out) {
+    return mem_alloc(req, want, out, 0) == VK_SUCCESS;
+}
+
 void vk_mem_free(vk_alloc *a) {
     if (!a->mem) return;
     if (a->block < 0) { vk_memory_release(a->mem, VK_MEMORY_IMAGE_DEDICATED); pthread_mutex_lock(&g_mem_mu); g_mem_dedicated_bytes -= a->size; pthread_mutex_unlock(&g_mem_mu); }
     else {
         pthread_mutex_lock(&g_mem_mu);
-        block_t *b = &g_blocks[a->block]; block_free_insert(b, a->off, a->size); b->used -= a->size;
+        block_t *b = &g_blocks[a->block];
+        block_free_insert(b, a->off, a->size);
+        b->used -= a->size;
+        b->live_allocations--;
+        g_mem_block_used -= a->size;
         if (!b->used && g_mem_free_empty) {
             /* Callers already retired the image's GPU fence. A partially used block is never reclaimed.
              * Leave a reusable hole so every other live vk_alloc keeps its stable block index. */
@@ -248,6 +394,7 @@ typedef struct vk_img {
     tex_stamp identity;
     uint32_t w, h, d, levels, layers, samples; VkImageAspectFlags aspect;
     int shared, refs; stor_key k; uint64_t idle_sub;
+    int storage_gone; /* detached shared image still owned by serials or write-back */
     int trace_selected; uint64_t trace_serial, trace_storage; /* populated only by the opt-in copy diagnostic */
     int wbrefs, orphan;   /* write-back pins are separate from actual texture-object references */
     view_ent *views; int nviews, capviews;
@@ -267,13 +414,27 @@ typedef struct vk_img {
 struct vk_tex {
     uint64_t serial; tex_t t; vk_img *im;
     tex_stamp identity;
-    int mirrored; uint64_t stamp, csub;   /* mirrored: dirty-page stamp of the uploaded content, last submission checked */
+    int mirrored, partial_upload;
+    uint64_t stamp, upload_guest_revision;
+    union {
+        uint64_t csub;      /* last dirty-page check for a realized image */
+        uint64_t retry_at;  /* first eligible submission for an unrealized image; zero means no retry */
+    };
     _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
-    VkBufferView tbv;                     /* TARGET_BUFFER textures */
-    VkBuffer tb_buffer; VkDeviceSize tb_offset, tb_range;
 };
+/* Only TARGET_BUFFER textures need the cached view or participate in its live list. */
+typedef struct vk_tex_buffer {
+    vk_tex texture;
+    VkBufferView view;
+    VkBuffer buffer;
+    VkDeviceSize offset, range;
+    uint64_t mapping_generation;
+    struct vk_tex_buffer *prev, *next;
+} vk_tex_buffer;
+static vk_tex_buffer *g_tex_buffer_views;
+static uint64_t g_buffer_release_live, g_buffer_release_retired, g_buffer_release_destroyed;
 static nvn_hmap g_by_serial = {.klen = 8};          /* serial -> vk_tex */
 static nvn_hmap g_by_storage = {.klen = sizeof(stor_key)};   /* stor_key -> vk_img (shared) */
 static nvn_hmap g_window_serials = {.klen = 8};
@@ -283,11 +444,24 @@ static uint64_t g_native_frame = 1;
    this lock; arena compaction re-enters only to invalidate its cached views. */
 static pthread_mutex_t g_tex_mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static uint64_t g_stat_uploads, g_stat_reuploads, g_stat_upload_bytes, g_stat_images, g_stat_shared_hits, g_stat_swept, g_stat_published, g_stat_switched;
+enum { IMAGE_RETRY_DELAY_SUBMISSIONS = 8, IMAGE_RETRIES_PER_SUBMISSION = 4 };
+static uint64_t g_tex_retry_sub, g_tex_retry_attempts, g_tex_retry_recovered;
+static unsigned g_tex_retries_this_sub;
 /* g_tex_mu: a lower bound on the next possible expiry. A texture becoming live again can leave a
  * stale early deadline; the scan recomputes it from the image's current use and writeback state. */
 enum { SHARED_IMAGE_IDLE_SUBMISSIONS = 600 };
 static uint64_t g_shared_sweep_at = UINT64_MAX, g_shared_scans, g_shared_skips;
+static uint64_t g_pool_images_detached, g_pool_images_retired, g_pool_image_bytes_retired;
+static void retire_img(vk_img *im);
 static void shared_image_idle(vk_img *im) {
+    if (im->storage_gone) {
+        if (!im->wbrefs) {
+            g_pool_images_retired++;
+            g_pool_image_bytes_retired += im->mem.size;
+            retire_img(im);
+        }
+        return;
+    }
     im->idle_sub = vk_submit_serial();
     uint64_t expiry = im->idle_sub + SHARED_IMAGE_IDLE_SUBMISSIONS;
     if (!im->wbrefs && expiry < g_shared_sweep_at) g_shared_sweep_at = expiry;
@@ -304,8 +478,11 @@ static void wb_age_locked(void);   /* GPU write-back records (below) */
 static void wb_sweep_locked(void);
 static void native_index_remove(vk_img *im);
 /* retired objects: destroyed once the GPU is past the submission that last could use them */
-typedef struct { VkImage img; vk_alloc mem; view_ent *views; int nviews; VkBufferView bv; VkBuffer bv_buffer; void *host; uint64_t after; } retired_t;   /* host: a vk_img / vk_tex the replay thread may still hold */
+typedef struct { VkImage img; vk_alloc mem; view_ent *views; int nviews; void *host; uint64_t after; } retired_t;   /* host: a vk_img / vk_tex the replay thread may still hold */
 static retired_t *g_retired; static int g_nretired, g_capretired;
+typedef struct { VkBufferView view; VkBuffer buffer; uint64_t after; } retired_buffer_view;
+static retired_buffer_view *g_retired_buffer_views;
+static int g_nretired_buffer_views, g_capretired_buffer_views;
 static void retire(retired_t r) {
     if (g_nretired == g_capretired) { g_capretired = g_capretired ? 2 * g_capretired : 64; g_retired = realloc(g_retired, (size_t)g_capretired * sizeof *g_retired); }
     r.after = mtl_last_fence() + 1;   /* the submission being recorded now */
@@ -328,43 +505,153 @@ static void retire_img(vk_img *im) {
     for (unsigned j=0;j<3;j++) if (im->scene_aa[j]) retire_img(im->scene_aa[j]);
     retire((retired_t){.img = im->img, .mem = im->mem, .views = im->views, .nviews = im->nviews, .host = im});
 }
-static void retire_bview(VkBufferView bv, VkBuffer buffer) { if (bv) retire((retired_t){.bv = bv, .bv_buffer = buffer}); }
 static void retire_host(void *p) { if (p) retire((retired_t){.host = p}); }
-/* Caller has retired every recording/GPU use of this arena buffer. Cached
-   texel views must not survive its destruction or the lag-off cutover. */
+static void destroy_retired_buffer_view(int index) {
+    vkDestroyBufferView(V.dev, g_retired_buffer_views[index].view, NULL);
+    g_retired_buffer_views[index] = g_retired_buffer_views[--g_nretired_buffer_views];
+}
+
+static void unlink_buffer_view(vk_tex_buffer *texture, int retire_view) {
+    if (!texture->view) return;
+    if (texture->prev) texture->prev->next = texture->next;
+    else g_tex_buffer_views = texture->next;
+    if (texture->next) texture->next->prev = texture->prev;
+    if (retire_view) {
+        if (g_nretired_buffer_views == g_capretired_buffer_views) {
+            int capacity = g_capretired_buffer_views ? 2 * g_capretired_buffer_views : 16;
+            g_retired_buffer_views = VK_REALLOC(g_retired_buffer_views, (size_t)capacity * sizeof *g_retired_buffer_views);
+            g_capretired_buffer_views = capacity;
+        }
+        g_retired_buffer_views[g_nretired_buffer_views++] = (retired_buffer_view){
+            texture->view, texture->buffer, mtl_last_fence() + 1
+        };
+    } else vkDestroyBufferView(V.dev, texture->view, NULL);
+    texture->view = VK_NULL_HANDLE;
+    texture->buffer = VK_NULL_HANDLE;
+    texture->offset = texture->range = 0;
+    texture->prev = texture->next = NULL;
+}
+
+/* Caller has retired every recording/GPU use of this buffer. Cached texel
+   views must not survive its destruction or the lag-off cutover. */
 void vk_res_buffer_released(VkBuffer buffer) {
     pthread_mutex_lock(&g_tex_mu);
-    for (uint32_t i = 0; i < g_by_serial.cap; i++) {
-        vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
-        if (!x || x->tb_buffer != buffer) continue;
-        if (x->tbv) vkDestroyBufferView(V.dev, x->tbv, NULL);
-        x->tbv = VK_NULL_HANDLE; x->tb_buffer = VK_NULL_HANDLE;
-        x->tb_offset = x->tb_range = 0;
+    for (vk_tex_buffer *texture = g_tex_buffer_views, *next; texture; texture = next) {
+        next = texture->next;
+        g_buffer_release_live++;
+        if (texture->buffer != buffer) continue;
+        unlink_buffer_view(texture, 0);
+        g_buffer_release_destroyed++;
     }
-    for (int i = 0; i < g_nretired; ) {
-        retired_t *r = &g_retired[i];
-        if (r->bv_buffer != buffer) { i++; continue; }
-        vkDestroyBufferView(V.dev, r->bv, NULL);
-        g_retired[i] = g_retired[--g_nretired];
+    for (int i = 0; i < g_nretired_buffer_views; ) {
+        g_buffer_release_retired++;
+        if (g_retired_buffer_views[i].buffer != buffer) { i++; continue; }
+        destroy_retired_buffer_view(i);
+        g_buffer_release_destroyed++;
     }
     pthread_mutex_unlock(&g_tex_mu);
 }
+
+static void destroy_retired_locked(int index) {
+    retired_t *r = &g_retired[index];
+    if (r->img && r->host) texcopy_retire(r->host, "destroy");
+    for (int v = 0; v < r->nviews; v++) vkDestroyImageView(V.dev, r->views[v].v, NULL);
+    free(r->views);
+    if (r->img) vkDestroyImage(V.dev, r->img, NULL);
+    vk_mem_free(&r->mem);
+    free(r->host);
+    g_retired[index] = g_retired[--g_nretired];
+}
+
+static uint64_t g_reclaim_runs, g_reclaim_probes, g_reclaim_images, g_reclaim_span_bytes, g_reclaim_peak_ns;
+static uint64_t g_reclaim_dedicated_runs, g_reclaim_dedicated_bytes;
+static uint64_t g_reclaim_single_fits;
+
+/* Called with g_mem_mu. Test the span that would result from the ordinary
+   coalescing free operation, including alignment and both adjacent holes. */
+static int reclaimed_span_fits(const block_t *block, const vk_alloc *mem, const image_span_request *fit) {
+    if (g_mem_free_empty && block->live_allocations == 1) return 0;
+    VkDeviceSize start = mem->off, end = start + mem->size;
+    int i = block_free_lower_bound(block, start);
+    if (i > 0 && block->free[i - 1].off + block->free[i - 1].size == start)
+        start = block->free[i - 1].off;
+    if (i < block->nfree && block->free[i].off == end)
+        end += block->free[i].size;
+    VkDeviceSize aligned = (start + fit->alignment - 1) / fit->alignment * fit->alignment;
+    return aligned <= end && fit->size <= end - aligned;
+}
+
+/* Suballocated images return reusable spans. Dedicated images return their
+   allocation to the driver outright, so stop when enough bytes have drained. */
+static int reclaim_completed_images(enum image_reclaim_kind kind, VkDeviceSize target, const image_span_request *fit) {
+    enum { MAX_PROBES = 64, MAX_IMAGES = 8 };
+    unsigned probes = 0, images = 0;
+    int selected[MAX_IMAGES];
+    uint64_t span_bytes = 0, dedicated_bytes = 0, start = host_now_ns();
+    pthread_mutex_lock(&g_tex_mu);
+    if (fit) pthread_mutex_lock(&g_mem_mu);
+    for (int i = 0; i < g_nretired && probes < MAX_PROBES && (fit || images < MAX_IMAGES); ) {
+        int index = i++;
+        const retired_t *r = &g_retired[index];
+        probes++;
+        int dedicated = r->mem.block < 0;
+        if (!r->img || !r->mem.mem || (dedicated && kind == IMAGE_RECLAIM_SPANS) ||
+            (!dedicated && kind == IMAGE_RECLAIM_DEDICATED) || !mtl_wait(r->after, 0)) continue;
+        if (fit) {
+            const block_t *block = &g_blocks[r->mem.block];
+            if (block->type != fit->type) continue;
+            if (reclaimed_span_fits(block, &r->mem, fit)) {
+                selected[0] = index;
+                images = 1;
+                g_reclaim_single_fits++;
+                break;
+            }
+            if (images < MAX_IMAGES) selected[images++] = index;
+            continue;
+        }
+        if (dedicated) dedicated_bytes += r->mem.size;
+        else span_bytes += r->mem.size;
+        images++;
+        destroy_retired_locked(index);
+        i = index;   /* recheck the entry swapped in from the end */
+        if (target && dedicated_bytes >= target) break;
+    }
+    if (fit) {
+        pthread_mutex_unlock(&g_mem_mu);
+        /* Higher indices first so a swap from the end cannot invalidate
+           a selected lower entry. */
+        for (unsigned i = images; i > 0; i--) {
+            int index = selected[i - 1];
+            span_bytes += g_retired[index].mem.size;
+            destroy_retired_locked(index);
+        }
+    }
+    g_reclaim_runs++;
+    g_reclaim_probes += probes;
+    g_reclaim_images += images;
+    g_reclaim_dedicated_runs += kind == IMAGE_RECLAIM_DEDICATED;
+    g_reclaim_dedicated_bytes += dedicated_bytes;
+    g_reclaim_span_bytes += span_bytes;
+    uint64_t elapsed = host_now_ns() - start;
+    if (elapsed > g_reclaim_peak_ns) g_reclaim_peak_ns = elapsed;
+    pthread_mutex_unlock(&g_tex_mu);
+    return images != 0;
+}
+
 void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
     uint64_t start = host_now_ns();
     pthread_mutex_lock(&g_tex_mu);
     for (int i = 0; i < g_nretired; ) {
         vk_rec_service_check();
-        if (i >= g_nretired) break; /* a serviced readback may compact retired buffer views through slot reuse */
-        retired_t *r = &g_retired[i];
-        if (!mtl_wait(r->after, 0)) { i++; continue; }
-        if (r->img && r->host) texcopy_retire(r->host, "destroy");
-        for (int v = 0; v < r->nviews; v++) vkDestroyImageView(V.dev, r->views[v].v, NULL);
-        free(r->views);
-        if (r->img) vkDestroyImage(V.dev, r->img, NULL);
-        vk_mem_free(&r->mem);
-        if (r->bv) vkDestroyBufferView(V.dev, r->bv, NULL);
-        free(r->host);
-        g_retired[i] = g_retired[--g_nretired];
+        if (i >= g_nretired) break;
+        if (!mtl_wait(g_retired[i].after, 0)) { i++; continue; }
+        destroy_retired_locked(i);
+    }
+    for (int i = 0; i < g_nretired_buffer_views; ) {
+        vk_rec_service_check();
+        if (i >= g_nretired_buffer_views) break; /* a serviced readback can reuse a slot */
+        if (!mtl_wait(g_retired_buffer_views[i].after, 0)) { i++; continue; }
+        destroy_retired_buffer_view(i);
     }
     wb_sweep_locked();
     wb_age_locked();
@@ -444,8 +731,18 @@ static int tex_mirrored(const tex_t *t) {   /* nvn_mtl.m tex_mirrored */
 }
 extern uint64_t g_frame_pub __attribute__((weak));
 static int wb_tile_match(const tex_t *t);
+static pthread_once_t g_wb_tile_trace_once = PTHREAD_ONCE_INIT;
+static int g_wb_tile_trace;
+static void wb_tile_trace_init(void) {
+    const char *value = getenv("TOTK_VK_WB_TILE_TRACE");
+    g_wb_tile_trace = value && !strcmp(value, "1");
+}
+static int wb_tile_trace_on(void) {
+    pthread_once(&g_wb_tile_trace_once, wb_tile_trace_init);
+    return g_wb_tile_trace;
+}
 static void texcopy_resource(const char *event, vk_tex *x) {
-    if (x && wb_tile_match(&x->t))
+    if (x && wb_tile_match(&x->t) && wb_tile_trace_on())
         LOGV("[settledwb-tile-view] event=%s frame=%llu sub=%llu storage=%p bytes=%llu ser=%llu image=%#llx mirrored=%d cpu_pool=%d shared=%d gpu_written=%d",
             event, (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)vk_submit_serial(),
             (void *)x->t.mem, (unsigned long long)x->t.L.size, (unsigned long long)x->serial,
@@ -514,7 +811,7 @@ static VkFormat srgb_twin(VkFormat f) {
         default: return VK_FORMAT_UNDEFINED;
     }
 }
-static vk_img *img_create_ex(const tex_t *t, int all_formats) {
+static vk_img *img_create_ex(const tex_t *t, const vk_img *original, int *shortage) {
     VkFormat f; VkComponentMapping fs;
     if (!vk_fmt(t->d.format, &f, &fs) || !f) { RED(8, "texture format %#x has no Vulkan format (ser %llu %ux%u)", t->d.format, (unsigned long long)t->serial, t->d.width, t->d.height); return NULL; }
     VkFormatFeatureFlags ff = fmt_features(f);
@@ -522,10 +819,19 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
         RED(8, "texture format %#x (Vulkan %d) is not supported by this driver", t->d.format, f); return NULL;
     }
     vk_img *im = calloc(1, sizeof *im);
+    if (!im) { if (shortage) *shortage = 1; return NULL; }
     image_layers(t, &im->type, &im->w, &im->h, &im->d, &im->layers, &im->samples);
     uint32_t biggest = MAXV(im->w, im->h); if (im->type == VK_IMAGE_TYPE_3D) biggest = MAXV(biggest, im->d);
     uint32_t allowed = 1; for (uint32_t v = biggest; v > 1; v >>= 1) allowed++;
     im->levels = t->d.levels ? t->d.levels : 1; if (im->levels > allowed) im->levels = allowed; if (im->samples > 1) im->levels = 1;
+    if (original && (im->w != original->w || im->h != original->h || im->d != original->d ||
+                     im->levels != original->levels || im->layers != original->layers ||
+                     im->type != original->type || im->samples != original->samples)) {
+        /* Reject before creating an image or recording its initial layout transition. */
+        RED(4, "texture upgrade for format views: shape changed (ser %llu)", (unsigned long long)t->serial);
+        free(im);
+        return NULL;
+    }
     im->fmt = f; im->nvn_fmt = t->d.format; im->aspect = vk_fmt_aspect(t->d.format);
     im->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) im->usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -550,20 +856,36 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
         .mipLevels = im->levels, .arrayLayers = im->layers, .samples = (VkSampleCountFlagBits)im->samples, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = im->usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VkImageFormatListCreateInfo fl = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-    if ((flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !compressed && !all_formats && ubwc_lists_on()) {
+    if ((flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !compressed && !original && ubwc_lists_on()) {
         im->lst[0] = f; im->nlst = 1; if ((im->lst[1] = srgb_twin(f))) im->nlst = 2;
         fl.viewFormatCount = (uint32_t)im->nlst; fl.pViewFormats = im->lst; ci.pNext = &fl;
     }
     if (blk_rt) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkResult r = vkCreateImage(V.dev, &ci, NULL, &im->img);
-    if (r && ci.pNext) { ci.pNext = NULL; im->nlst = 0; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
-    if (r && blk_rt) { blk_rt = 0; ci.usage = im->usage; ci.flags &= ~(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT); r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
-    if (r && (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) { ci.flags &= ~VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !memory_shortage(r) && ci.pNext) { ci.pNext = NULL; im->nlst = 0; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !memory_shortage(r) && blk_rt) { blk_rt = 0; ci.usage = im->usage; ci.flags &= ~(VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT); r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
+    if (r && !memory_shortage(r) && (ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)) { ci.flags &= ~VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT; r = vkCreateImage(V.dev, &ci, NULL, &im->img); }
     im->usage = ci.usage; im->blk_rt = blk_rt; im->arr3d = !!(ci.flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT);
-    if (r) { RED(8, "vkCreateImage %ux%ux%u fmt %d levels %u layers %u: %d", im->w, im->h, im->d, f, im->levels, im->layers, r); free(im); return NULL; }
+    if (r) {
+        RED(8, "vkCreateImage %ux%ux%u fmt %d levels %u layers %u: %d", im->w, im->h, im->d, f, im->levels, im->layers, r);
+        if (shortage) *shortage = memory_shortage(r);
+        free(im);
+        return NULL;
+    }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
-    if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->mem)) { RED(8, "out of GPU memory for a %ux%u texture (%llu MiB)", im->w, im->h, (unsigned long long)(req.size >> 20)); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
-    VKCHECK(vkBindImageMemory(V.dev, im->img, im->mem.mem, im->mem.off));
+    r = mem_alloc(&req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &im->mem, 1);
+    if (!r) {
+        r = vkBindImageMemory(V.dev, im->img, im->mem.mem, im->mem.off);
+        if (r && !memory_shortage(r)) VK_DIE_RESULT(r, "vkBindImageMemory failed: %d", r);
+    }
+    if (r) {
+        RED(8, "texture memory %ux%u (%llu MiB) failed: %d", im->w, im->h, (unsigned long long)(req.size >> 20), r);
+        if (shortage) *shortage = memory_shortage(r);
+        vkDestroyImage(V.dev, im->img, NULL);
+        vk_mem_free(&im->mem);
+        free(im);
+        return NULL;
+    }
     image_barrier_init(vk_pre_cb(), im->img, im->aspect);
     g_stat_images++;
     im->identity = tex_stamp_new();
@@ -571,7 +893,7 @@ static vk_img *img_create_ex(const tex_t *t, int all_formats) {
     totk_ft_count(FT_COUNT_TEX_REALIZATIONS, 1);
     return im;
 }
-static vk_img *img_create(const tex_t *t) { return img_create_ex(t, 0); }
+static vk_img *img_create(const tex_t *t) { return img_create_ex(t, NULL, NULL); }
 static void tex_epoch_bump(void);   /* every replacement invalidates ID lookups and recorder freezes */
 static uint64_t g_stat_image_replacements;
 /* A view of a format outside the image's list: the image is made again with every format allowed (UBWC off), its
@@ -580,11 +902,8 @@ static uint64_t g_stat_image_replacements;
    submission's pre buffer, so writes recorded since the last chunk submission (at most TOTK_VK_CHUNK_DRAWS draws) are not
    carried over. On the Mac this path was never taken in the world. */
 static int img_upgrade_inner(vk_tex *x, VkFormat want) {
-    vk_img *old = x->im, *nu = img_create_ex(&x->t, 1);
+    vk_img *old = x->im, *nu = img_create_ex(&x->t, old, NULL);
     if (!nu) return 0;
-    if (nu->w != old->w || nu->h != old->h || nu->d != old->d || nu->levels != old->levels || nu->layers != old->layers) {
-        RED(4, "texture upgrade for format views: size changed (ser %llu)", (unsigned long long)x->t.serial); vkDestroyImage(V.dev, nu->img, NULL); vk_mem_free(&nu->mem); tex_stamp_drop(nu->identity); free(nu); return 0;
-    }
     int in_pass = vk_in_pass();
     VkCommandBuffer cb = in_pass ? vk_pre_cb() : vk_cb();
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
@@ -615,9 +934,21 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
     return 1;
 }
 static int img_upgrade(vk_tex *x, VkFormat want) { return VK_REC_VALUE(VK_REC_S_RESOURCE, img_upgrade_inner(x, want)); }
+#ifdef TOTK_VK_TESTS
+int vk_res_test_mismatched_upgrade(vk_tex *x) {
+    vk_tex probe = {.t = x->t, .im = x->im};
+    probe.t.d.width++;
+    return img_upgrade(&probe, probe.im->fmt);
+}
+#endif
 
 /* Upload cost per present window, any switch value: count, bytes and wall time of upload_inner on its caller. */
 static _Atomic uint64_t g_win_uploads, g_win_upload_bytes, g_win_upload_ns;
+static _Atomic uint64_t g_upload_heap_regions, g_upload_fresh_barriers_skipped;
+static _Atomic uint64_t g_upload_regions_joined;
+static _Atomic uint64_t g_upload_partial_count, g_upload_partial_bytes;
+static int g_upload_inline_regions, g_upload_fresh_barrier_elision, g_upload_join_layers;
+int vk_upload_partial_on;
 /* TOTK_VK_UPLOAD_THREADS=<1..3> (default unset/0 = serial): block-linear uploads of at least UPLOAD_POOL_MIN_BYTES
    deswizzle on that many helper threads plus the caller (vk_upload_pool.c); the copy is recorded after all runs.
    Live (runtime/live_ctl.h): each upload takes the current value before it starts; helpers are still started by the
@@ -641,6 +972,11 @@ static void upload_threads_refresh(void) {
 void vk_upload_threads_init(void) {
     const char *e = getenv("TOTK_VK_UPLOAD_THREADS"); int n = e && *e ? atoi(e) : 0;
     n = n < 0 ? 0 : n > UPLOAD_POOL_MAX_HELPERS ? UPLOAD_POOL_MAX_HELPERS : n;
+    g_upload_inline_regions = !vk_off("uploadinline");
+    g_upload_fresh_barrier_elision = !vk_off("uploadfreshbarrier");
+    g_upload_join_layers = !vk_off("uploadlayers");
+    const char *partial = getenv("TOTK_VK_PARTIAL_TEX_UPLOAD");
+    vk_upload_partial_on = partial && !strcmp(partial, "1");
     g_upload_launch = n; atomic_store_explicit(&g_upload_configured, n, memory_order_relaxed);
     upload_pool_configure(n);
     if (n) LOGV("TOTK_VK_UPLOAD_THREADS=%d: block-linear uploads of %u KiB or more deswizzle on %d helper thread(s) plus the caller",
@@ -653,9 +989,58 @@ void vk_upload_report(uint64_t frame) {
     LOGV("frame %llu, texture uploads: %llu (%.1f MiB) in %.1f ms, %.3f ms/frame; parallel deswizzles %llu (%llu runs, %llu on helpers) (TOTK_VK_UPLOAD_THREADS=%d)",
          (unsigned long long)frame, (unsigned long long)n, bytes / 1048576.0, ns / 1e6, ns / 300e6,
          (unsigned long long)s.jobs, (unsigned long long)s.runs, (unsigned long long)s.helper_runs, upload_pool_helpers());
+    LOGV("[upload-prep] frame=%llu heap_region_plans=%llu fresh_barriers_skipped=%llu regions_joined=%llu",
+         (unsigned long long)frame,
+         (unsigned long long)atomic_load_explicit(&g_upload_heap_regions, memory_order_relaxed),
+         (unsigned long long)atomic_load_explicit(&g_upload_fresh_barriers_skipped, memory_order_relaxed),
+         (unsigned long long)atomic_load_explicit(&g_upload_regions_joined, memory_order_relaxed));
+    if (vk_upload_partial_on)
+        LOGV("[upload-partial] frame=%llu uploads=%llu staging_bytes_avoided=%llu",
+             (unsigned long long)frame, (unsigned long long)atomic_load_explicit(&g_upload_partial_count, memory_order_relaxed),
+             (unsigned long long)atomic_load_explicit(&g_upload_partial_bytes, memory_order_relaxed));
 }
+#ifdef TOTK_VK_TESTS
+void vk_upload_test_preparation(uint64_t out[3]) {
+    out[0] = atomic_load_explicit(&g_upload_heap_regions, memory_order_relaxed);
+    out[1] = atomic_load_explicit(&g_upload_fresh_barriers_skipped, memory_order_relaxed);
+    out[2] = atomic_load_explicit(&g_upload_regions_joined, memory_order_relaxed);
+}
+void vk_upload_test_partial(uint64_t out[3]) {
+    out[0] = g_stat_upload_bytes;
+    out[1] = atomic_load_explicit(&g_upload_partial_count, memory_order_relaxed);
+    out[2] = atomic_load_explicit(&g_upload_partial_bytes, memory_order_relaxed);
+}
+#endif
+
+/* Dirty stamps cover pages. Include an entire mip/layer if any page overlaps
+   its block-linear storage, including a page shared with the next subresource. */
+enum { UPLOAD_MAX_LEVELS = 32, UPLOAD_MAX_LAYERS = 64 };
+static int upload_dirty_layers(const tex_t *t, const vk_img *im, uint64_t stamp, uint64_t masks[UPLOAD_MAX_LEVELS]) {
+    if (im->levels > UPLOAD_MAX_LEVELS || im->layers > UPLOAD_MAX_LAYERS ||
+        im->layers != t->L.layers || !t->L.layer_size || t->L.size / im->layers != t->L.layer_size)
+        return -1;
+    unsigned selected = 0;
+    uint64_t start = 0;
+    for (unsigned mip = 0; mip < im->levels; mip++) {
+        uint64_t end = t->L.layer_size;
+        if (mip + 1 < im->levels) nvn_tex_level_layout(&t->d, mip + 1, &t->L, &end, NULL);
+        if (end <= start || end > t->L.layer_size) return -1;
+        uint64_t layers = 0;
+        for (unsigned layer = 0; layer < im->layers; layer++) {
+            uint64_t offset = layer * t->L.layer_size + start;
+            if (nvn_dirty_since(t->mem + offset, end - start, stamp)) {
+                layers |= UINT64_C(1) << layer;
+                selected++;
+            }
+        }
+        masks[mip] = layers;
+        start = end;
+    }
+    return (int)selected;
+}
+
 /* Upload a mirrored texture from the guest's bytes (pre command buffer). */
-static void upload_inner(vk_tex *x) {
+static void upload_inner(vk_tex *x, int fresh) {
     const tex_t *t = &x->t; vk_img *im = x->im;
     if (totk_texcopy_match(t))
         totk_texcopy_log(vk_submit_serial(), "phase=res event=upload ser=%llu mem=%p image=%#llx guest_bytes=%llu guest_nonzero=%zu",
@@ -663,11 +1048,32 @@ static void upload_inner(vk_tex *x) {
             (unsigned long long)t->L.size, totk_texcopy_nonzero(t->mem, (size_t)t->L.size));
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) return;
+    uint64_t previous = x->stamp;
     x->stamp = nvn_dirty_now();   /* before the copy: a write during it is newer than this content */
-    nvn_dirty_protect(t->mem, t->L.size);
+    int watched = nvn_dirty_protect(t->mem, t->L.size);
     int is3d = im->type == VK_IMAGE_TYPE_3D, linear = nvn_tex_is_linear(&t->d);
+    unsigned layers = is3d ? 1 : im->layers, capacity = im->levels * layers;
+    uint64_t masks[UPLOAD_MAX_LEVELS];
+    int partial = 0;
+    if (x->partial_upload && !linear && im->samples == 1 && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+        !(bpb & (bpb - 1)) && capacity > 1) {
+        int unchanged = 0;
+        x->upload_guest_revision = watched ? vk_upload_guest_revision((uint64_t)(uintptr_t)t->mem, t->L.size,
+            x->upload_guest_revision, &unchanged) : 0;
+        if (previous && !fresh && unchanged) {
+            int selected = upload_dirty_layers(t, im, previous, masks);
+            if (selected > 0 && (unsigned)selected < capacity) {
+                partial = 1;
+                capacity = (unsigned)selected;
+            }
+        }
+    }
     VkCommandBuffer cb = vk_pre_cb();
-    vk_barrier_all(cb);
+    /* For a new image, its initial transition already orders the destination.
+       Non-linear uploads read a fresh arena span written by the host before
+       submission. A linear upload can read a GPU-written guest buffer. */
+    int skip_barrier = fresh && !linear && g_upload_fresh_barrier_elision;
+    if (!skip_barrier) vk_barrier_all(cb);
     if (linear && !is3d && im->layers == 1) {   /* pitch textures: the pool bytes are already rows */
         size_t stride = nvn_tex_linear_stride(&t->d); VkBuffer pb; uint64_t po;
         uint32_t w = im->w, h = im->h; size_t rows = (h + bh - 1) / bh;
@@ -684,52 +1090,92 @@ static void upload_inner(vk_tex *x) {
             return;
         }
     }
-    size_t total = 0;
+    int join_layers = g_upload_join_layers && !linear && layers > 1 && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    uint32_t region_count = 0, joined_levels = 0;
+    size_t full = 0, avoided = 0;
     for (unsigned l = 0; l < im->levels; l++) {
         uint32_t w = MAXV(im->w >> l, 1u), h = MAXV(im->h >> l, 1u), z = is3d ? MAXV(im->d >> l, 1u) : 1;
-        total += (((size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z + 15) & ~(size_t)15) * (is3d ? 1 : im->layers);
+        size_t bytes = (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z;
+        size_t subresource = (bytes + 15) & ~(size_t)15;
+        unsigned count = partial ? (unsigned)__builtin_popcountll(masks[l]) : layers;
+        full += subresource * layers;
+        avoided += subresource * (layers - count);
+        /* Vulkan advances a multi-layer copy by the tight byte size of each layer,
+           so layers with alignment padding still need individual regions. */
+        if (join_layers && bytes == subresource && count > 1) {
+            joined_levels |= UINT32_C(1) << l;
+            count = partial ? (unsigned)__builtin_popcountll(masks[l] & ~(masks[l] << 1)) : 1;
+        }
+        region_count += count;
     }
-    VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(total ? total : 16, 16, &sb, &so);
-    VkBufferImageCopy *regions = calloc((size_t)im->levels * im->layers, sizeof *regions); int nr = 0;
+    size_t total = full - avoided;
+    VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_texture_staging(total ? total : 16, &sb, &so);
+    enum { INLINE_REGIONS = 16 };
+    VkBufferImageCopy local_regions[INLINE_REGIONS], *regions = local_regions;
+    unsigned nr = 0;
+    int fits_inline = g_upload_inline_regions && region_count <= INLINE_REGIONS;
+    if (!fits_inline) {
+        regions = VK_MALLOC((size_t)region_count * sizeof *regions);
+        atomic_fetch_add_explicit(&g_upload_heap_regions, 1, memory_order_relaxed);
+    }
     /* With helpers, block-linear subresources are only collected here and decoded together below. */
     if (!linear) upload_threads_refresh();
-    int pooled = !linear && upload_pool_helpers();
-    upload_sub *subs = pooled ? malloc((size_t)im->levels * im->layers * sizeof *subs) : NULL; unsigned ns = 0;
-    if (!subs) pooled = 0;
+    upload_sub local_subs[INLINE_REGIONS], *subs = NULL;
+    if (!linear && total >= UPLOAD_POOL_MIN_BYTES && upload_pool_helpers())
+        subs = capacity <= INLINE_REGIONS ? local_subs : malloc((size_t)capacity * sizeof *subs);
+    unsigned ns = 0;
     size_t off = 0;
     for (unsigned l = 0; l < im->levels; l++) {
         uint32_t w = MAXV(im->w >> l, 1u), h = MAXV(im->h >> l, 1u), z = is3d ? MAXV(im->d >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
-        for (unsigned y = 0; y < (is3d ? 1u : im->layers); y++) {
+        VkBufferImageCopy *run = NULL;
+        for (unsigned y = 0; y < layers; y++) {
+            if (partial && !(masks[l] & (UINT64_C(1) << y))) { run = NULL; continue; }
             int bad;
             if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
-            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
+            else if (subs) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
             else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
-            if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
-            regions[nr++] = (VkBufferImageCopy){.bufferOffset = so + off, .imageSubresource = {im->aspect, l, y, 1}, .imageExtent = {w, h, z}};
+            if (bad) goto bad_layout;
+            if (run) run->imageSubresource.layerCount++;
+            else {
+                regions[nr] = (VkBufferImageCopy){.bufferOffset = so + off, .imageSubresource = {im->aspect, l, y, 1}, .imageExtent = {w, h, z}};
+                if (joined_levels & (UINT32_C(1) << l)) run = &regions[nr];
+                nr++;
+            }
             off += (pitch * rows * z + 15) & ~(size_t)15;
         }
     }
-    if (pooled) {
-        int bad = upload_pool_deswizzle(&t->d, t->mem, subs, ns, UPLOAD_POOL_MIN_BYTES);
-        free(subs);
-        if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
-    }
+    if (subs && upload_pool_deswizzle(&t->d, t->mem, subs, ns, UPLOAD_POOL_MIN_BYTES)) goto bad_layout;
     if (nr) {
         if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
         vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)nr, regions);
-        for (unsigned level = 0; level < im->levels; level++)
+        if (nr < capacity) atomic_fetch_add_explicit(&g_upload_regions_joined, capacity - nr, memory_order_relaxed);
+        if (skip_barrier) atomic_fetch_add_explicit(&g_upload_fresh_barriers_skipped, 1, memory_order_relaxed);
+        if (partial) {
+            for (unsigned i = 0; i < nr; i++)
+                vk_pso_life_external_write(x, regions[i].imageSubresource.mipLevel,
+                    regions[i].imageSubresource.baseArrayLayer, regions[i].imageSubresource.layerCount, "upload");
+            atomic_fetch_add_explicit(&g_upload_partial_count, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_upload_partial_bytes, avoided, memory_order_relaxed);
+        } else for (unsigned level = 0; level < im->levels; level++)
             vk_pso_life_external_write(x, level, 0, im->layers, "upload");
         totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
     }
-    free(regions);
+    if (subs != local_subs) free(subs);
+    if (!fits_inline) free(regions);
     vk_barrier_all(cb);
     if (vk_gpuprof_on && nr) vk_gpuprof_scope_end(cb);
     g_stat_upload_bytes += total; atomic_fetch_add(&g_win_upload_bytes, total);
+    return;
+bad_layout:
+    x->upload_guest_revision = 0;
+    if (subs != local_subs) free(subs);
+    if (!fits_inline) free(regions);
+    RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target);
 }
-static void upload(vk_tex *x) {
+static void upload(vk_tex *x, int fresh) {
     uint64_t started = host_now_ns();
-    VK_REC_DO(VK_REC_O_UPLOAD, upload_inner(x));
+    VK_REC_DO(VK_REC_O_UPLOAD, upload_inner(x, fresh));
     atomic_fetch_add(&g_win_uploads, 1); atomic_fetch_add(&g_win_upload_ns, host_now_ns() - started);
 }
 
@@ -737,7 +1183,7 @@ static void tex_drop_locked(vk_tex *x) {
     if (!x) return;
     tex_stamp_drop(x->identity);
     texcopy_resource("drop", x);
-    if (x->tbv) retire_bview(x->tbv, x->tb_buffer);
+    if (x->t.d.target == 10) unlink_buffer_view((vk_tex_buffer *)x, 1);
     if (x->im) {
         if (x->im->shared) { if (--x->im->refs == 0) shared_image_idle(x->im); }
         else if (x->im->wbrefs) x->im->orphan = 1;   /* a rendering waiting for write-back keeps it */
@@ -745,38 +1191,17 @@ static void tex_drop_locked(vk_tex *x) {
     }
     retire_host(x);
 }
-static vk_tex *tex_get_inner(const tex_t *t) {
-    if (!t || !t->serial) return NULL;
-    pthread_mutex_lock(&g_tex_mu);
-    vk_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
-    uint64_t sub = vk_submit_serial();
-    if (x && x->im && x->mirrored && !x->im->gpu_written && x->csub != sub) {   /* once per submission: changed since the upload? */
-        x->csub = sub;
-        stor_key k; vk_img *g = NULL;
-        if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
-            retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
-            tex_stamp_bump(&x->identity);
-            texcopy_resource("switch", x);
-        } else if (!nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
-            texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
-        }
-    }
-    /* TOTK_VK_TEX_MEMO: whatever this submission needs for x (above) is done; memo hits on mirrored textures wait for it. */
-    if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
-        atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
-    if (x) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
-    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
-    x->identity = tex_stamp_new();
-    if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
-    nvn_hm_put(&g_by_serial, &t->serial, x);
-    if (t->d.target == 10) { pthread_mutex_unlock(&g_tex_mu); return x; }   /* buffer textures: vk_tbuf_by_id */
-    x->mirrored = x->cpu_pool = tex_mirrored(t);
+/* Both the first realization and a delayed retry take the same storage and upload path. */
+static void tex_realize_image(vk_tex *x, uint64_t sub, int *shortage) {
+    const tex_t *t = &x->t;
     stor_key k;
     if (x->mirrored && mirshare_on() && stor_key_of(t, &k)) {   /* a GPU-written image already holds this storage */
         vk_img *g = nvn_hm_get(&g_by_storage, &k);
         if (g && g->gpu_written) {
             x->mirrored = 0; g->refs++; x->im = g; g_stat_shared_hits++;
-            texcopy_resource("realize-shared-gpu-hit", x); pthread_mutex_unlock(&g_tex_mu); return x;
+            x->csub = sub;
+            texcopy_resource("realize-shared-gpu-hit", x);
+            return;
         }
     }
     if (!x->mirrored && stor_key_of(t, &k)) {
@@ -785,7 +1210,7 @@ static vk_tex *tex_get_inner(const tex_t *t) {
         if (im) { g_stat_shared_hits++;
             if (fmt_class(im->nvn_fmt) != fmt_class(t->d.format)) { uint64_t n = ++g_stat_xfmt;
                 if (n <= 8) LOGV("storage %p (%ux%u) shared across formats: image NVN format %#x, texture %#x%s (%llu so far)", (void *)t->mem, t->d.width, t->d.height, im->nvn_fmt, t->d.format, stor_compressed(t) ? ", compressible" : "", (unsigned long long)n); } }
-        else if ((im = img_create(t))) { im->shared = 1; im->k = k; nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
+        else if ((im = img_create_ex(t, NULL, shortage))) { im->shared = 1; im->k = k; nvn_hm_put(&g_by_storage, &k, im); if (k.fcls) {
             stor_key k0 = k; k0.fcls = 0; uintptr_t prev = (uintptr_t)nvn_hm_get(&g_comp_owner, &k0);
             if (prev && prev != k.fcls) { uint64_t n = ++g_stat_compsplit;
                 if (n <= 8) LOGV("compressible storage %p (%ux%u) now NVN format %#x: it gets its own image, the other format keeps its content (%llu so far)", (void *)t->mem, t->d.width, t->d.height, t->d.format, (unsigned long long)n); }
@@ -793,15 +1218,73 @@ static vk_tex *tex_get_inner(const tex_t *t) {
         } }
         if (im) {
             im->refs++; x->im = im;
+            x->csub = sub;
             texcopy_resource(storage_hit ? "realize-storage-share" : "realize-gpu-only-undefined", x);
         }
     } else {
-        x->im = img_create(t);
+        x->im = img_create_ex(t, NULL, shortage);
         texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
-        if (x->im && x->mirrored) { upload(x); g_stat_uploads++; }
+        if (x->im) {
+            x->csub = sub;
+            if (x->mirrored) { upload(x, 1); g_stat_uploads++; }
+        }
     }
+}
+
+static int tex_retry_admit(vk_tex *x, uint64_t sub) {
+    if (x->t.d.target == 10 || !x->retry_at || sub < x->retry_at) return 0;
+    if (g_tex_retry_sub != sub) {
+        g_tex_retry_sub = sub;
+        g_tex_retries_this_sub = 0;
+    }
+    if (g_tex_retries_this_sub >= IMAGE_RETRIES_PER_SUBMISSION) return 0;
+    g_tex_retries_this_sub++;
+    g_tex_retry_attempts++;
+    x->retry_at = 0;  /* a sustained shortage cannot trigger repeated retries for this serial */
+    return 1;
+}
+
+static vk_tex *tex_get_inner(const tex_t *t) {
+    if (!t || !t->serial) return NULL;
+    pthread_mutex_lock(&g_tex_mu);
+    vk_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
+    uint64_t sub = vk_submit_serial();
+    if (x) {
+        if (x->im && x->mirrored && !x->im->gpu_written && x->csub != sub) {
+            x->csub = sub;
+            stor_key k; vk_img *g = NULL;
+            if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
+                retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;
+                tex_stamp_bump(&x->identity);
+                texcopy_resource("switch", x);
+            } else if (!nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
+                texcopy_resource("reupload", x); upload(x, 0); g_stat_reuploads++;
+            }
+        } else if (!x->im && tex_retry_admit(x, sub)) {
+            tex_realize_image(x, sub, NULL);
+            g_tex_retry_recovered += x->im != NULL;
+        }
+        /* Memo hits on mirrored textures wait for this submission's content check or retry. */
+        if (vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
+            atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
+    } else {
+        x = calloc(1, t->d.target == 10 ? sizeof(vk_tex_buffer) : sizeof *x);
+        if (!x) { pthread_mutex_unlock(&g_tex_mu); return NULL; }
+        x->serial = t->serial; x->t = *t; atomic_init(&x->memo_sub, sub);
+        x->identity = tex_stamp_new();
+        if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
+        nvn_hm_put(&g_by_serial, &t->serial, x);
+        if (t->d.target == 10) { pthread_mutex_unlock(&g_tex_mu); return x; }   /* buffer textures: vk_tbuf_by_id */
+        x->mirrored = x->cpu_pool = tex_mirrored(t);
+        x->partial_upload = vk_upload_partial_on && x->mirrored && t->pool &&
+            !(t->pool->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL));
+        int shortage = 0;
+        tex_realize_image(x, sub, &shortage);
+        if (shortage) x->retry_at = sub + IMAGE_RETRY_DELAY_SUBMISSIONS;
+    }
+    int ready = x->im || (x->t.d.target == 10 && ((vk_tex_buffer *)x)->view);
     pthread_mutex_unlock(&g_tex_mu);
-    return x->im ? x : NULL;
+    return ready ? x : NULL;
 }
 vk_tex *vk_tex_get(const tex_t *t) { return VK_REC_VALUE(VK_REC_S_RESOURCE, tex_get_inner(t)); }
 void mtl_xv_window_tex(uint64_t serial) {
@@ -827,13 +1310,21 @@ void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was fi
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || (uintptr_t)x->t.mem >= hi || (uintptr_t)x->t.mem + x->t.L.size <= lo) continue;
+        /* Reset the content check for a live image and cancel any retry of an unrealized image over this pool. */
         tex_stamp_bump(&x->identity); x->csub = 0; x->stamp = 0; atomic_store_explicit(&x->memo_sub, 0, memory_order_relaxed);
+        x->partial_upload = 0;
     }
     for (uint32_t i = 0; i < g_by_storage.cap; i++) {
         vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
-        if (!im || im->k.mem < lo || im->k.mem >= hi) continue;
-        if (im->refs || im->wbrefs) continue;
-        stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--;
+        if (!im || im->k.mem >= hi || (im->k.mem < lo && im->k.size <= lo - im->k.mem)) continue;
+        /* Existing owners retain their image. A later pool at the same guest
+           address must never discover it through the storage lookup. */
+        stor_key k = im->k;
+        nvn_hm_del(&g_by_storage, &k);
+        im->storage_gone = 1;
+        g_pool_images_detached++;
+        if (!im->refs) shared_image_idle(im);
+        i--; /* deletion can move the next map entry into this slot */
     }
     pthread_mutex_unlock(&g_tex_mu);
     tex_epoch_bump();
@@ -879,15 +1370,42 @@ typedef struct {
     tex_t t; vk_img *im; uint64_t stamp, sub, producer, pool, quiet, tile_version;
     VkBuffer buffer; VkDeviceMemory memory; uint8_t *bytes; uint64_t fence, allocation;
     void *watch; int cancelled, tracked, fresh_invalidate;
-    uint64_t land_pos, land_src;
+    uint64_t land_pos, land_src, auto_required_size;
     unsigned land_level, land_layer;
 } wb_ent;
 enum wb_land_mode { WB_SYNC, WB_IDLE, WB_INVALIDATE, WB_INVALIDATE_TRY };
 static wb_ent *g_wb; static int g_nwb, g_capwb;   /* g_tex_mu */
 static _Atomic uint64_t g_wb_lo = UINT64_MAX, g_wb_hi; /* unlocked quick reject, conservative until sweep */
+static int g_wb_staged, g_wb_bounds_dirty; /* g_tex_mu, staged counts only the background queue */
+static uint64_t g_wb_unstaged_skips, g_wb_bounds_rebuilds;
 static uint64_t g_wb_done, g_wb_skip_cpu, g_wb_skip_fmt, g_wb_superseded, g_wb_bytes, g_wb_aged;
 static uint64_t g_set_done, g_set_bytes, g_set_skip_cpu, g_set_superseded, g_set_staging, g_set_copies, g_set_invalidate;
+static uint64_t g_set_staging_peak;
 static uint64_t g_set_fresh, g_set_fresh_bytes, g_set_fresh_wait_ns;
+static uint64_t g_wb_invalidate_batches, g_wb_invalidate_heap_batches;
+static int g_wb_invalidate_max_batch;
+static uint64_t g_wb_copy_commands, g_wb_copy_regions;
+/* Optional admission runs on the recorder owner with g_tex_mu held. */
+static struct {
+    int initialized, next, quiet_skip;
+    unsigned attempts_per_seal;
+    uint64_t staging_limit, accepted, attempt_yields, byte_yields, staging_peak;
+    uint64_t next_scan, scanned_writes, scanned_ranges, scanned_watches, seal_skips;
+} g_wb_auto;
+
+static unsigned wb_auto_setting(const char *key, unsigned max) {
+    const char *value = getenv(key);
+    if (!value || *value < '0' || *value > '9') return 0;
+    char *end;
+    unsigned long n = strtoul(value, &end, 10);
+    return !*end && n <= max ? (unsigned)n : 0;
+}
+static void wb_auto_init(void) {
+    g_wb_auto.attempts_per_seal = wb_auto_setting("TOTK_VK_WB_AUTO_COPY_LIMIT", 128);
+    g_wb_auto.staging_limit = (uint64_t)wb_auto_setting("TOTK_VK_WB_AUTO_STAGING_MB", 512) << 20;
+    g_wb_auto.quiet_skip = !vk_off("settledquietscan");
+    g_wb_auto.initialized = 1;
+}
 /* Learning owns metadata, never VkImages/staging. Exact keys survive temporary texture serials. Bounded to 4096
    live storage histories (<1 MiB including hash capacity), deleted with the pool; no image references are retained. */
 typedef struct { uint64_t pool, mem, size; nvn_texdesc desc; } wb_hist_key;
@@ -932,6 +1450,7 @@ static int wb_tile_match(const tex_t *t) {
     return t->d.width == 260 && t->d.height == 260 && t->d.format == 0xd && t->d.levels == 9;
 }
 static void wb_tile_log(const wb_tile *d, const char *event, uint64_t sub, uint64_t address, uint64_t n) {
+    if (!wb_tile_trace_on()) return;
     LOGV("[settledwb-tile] event=%s frame=%llu sub=%llu storage=%p bytes=%llu pool=%llu ser=%llu image=%#llx gpu=%llu gpu_sub=%llu landed=%llu land_sub=%llu staged=%llu reason=%s current=%d invalidate_addr=%p invalidate_bytes=%llu",
         event, (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)sub,
         (void *)(uintptr_t)d->address, (unsigned long long)d->size, (unsigned long long)d->pool,
@@ -1116,8 +1635,17 @@ static void wb_staging_free(wb_ent *e) {
     e->buffer = VK_NULL_HANDLE; e->memory = VK_NULL_HANDLE; e->bytes = NULL; e->allocation = e->fence = 0;
     wb_diag_end(WB_D_FREE, start);
 }
-static void wb_ent_drop_locked(int i) {
+static void wb_bounds_removed(const wb_ent *e) {
+    uint64_t start = (uintptr_t)e->t.mem;
+    if (start == g_wb_lo || start + e->t.L.size == g_wb_hi) g_wb_bounds_dirty = 1;
+}
+static void wb_queue_unindex(int i) {
+    if (g_wb[i].fence) g_wb_staged--;
     wb_lookup_remove(i);
+}
+static void wb_ent_drop_locked(int i) {
+    wb_bounds_removed(&g_wb[i]);
+    wb_queue_unindex(i);
     nvn_dirty_wb_unwatch(g_wb[i].watch);
     wb_staging_free(&g_wb[i]); wb_unref(g_wb[i].im);
     g_wb[i] = g_wb[--g_nwb];
@@ -1141,6 +1669,7 @@ static int wb_watch_tracked(const tex_t *t, void *watch) {
     return cpu_disarm_on() ? watch != NULL : nvn_dirty_tracked(t->mem, t->L.size);
 }
 static void wb_note_locked(vk_tex *x) {
+    if (x->im->storage_gone) return;
     const tex_t *t = &x->t;
     uint64_t tile_version = wb_tile_note(x);
     if ((!wb_on() && !settled_on()) || !x->cpu_pool || !x->im || !t->mem || !t->L.size) {
@@ -1151,6 +1680,7 @@ static void wb_note_locked(vk_tex *x) {
     }
     uint64_t pool = vk_wb_pool_identity(t->pool, t->mem, t->L.size);
     if (!pool) { wb_tile_event(tile_version, "invalid-pool", 0, 0); return; }
+    g_wb_auto.next_scan = 0;   /* a new or replaced record needs its first freshness check */
     uint64_t stamp = nvn_dirty_now(), sub = vk_submit_serial();
     uint64_t m = (uint64_t)(uintptr_t)t->mem;
     if (m < g_wb_lo) g_wb_lo = m;
@@ -1166,7 +1696,9 @@ static void wb_note_locked(vk_tex *x) {
                 nvn_dirty_wb_unwatch(e->watch);
                 e->watch = wb_watch_arm(t, stamp);
             }
+            if (e->t.L.size > t->L.size) wb_bounds_removed(e);
             e->t = *t; e->stamp = stamp; e->sub = sub; e->producer = mtl_last_fence() + 1; e->pool = pool; e->tile_version = tile_version;
+            e->auto_required_size = 0;
             e->tracked = wb_watch_tracked(t, e->watch); wb_lookup_set(i, e); return;
         }
         wb_tile_event(e->tile_version, "image-superseded", 0, 0);
@@ -1227,59 +1759,117 @@ static int wb_cpu_newer(const wb_ent *e) {
 }
 static void wb_cpu_detail(const wb_ent *e, const char *reason) {
     if (!e->tile_version) return;
-    uintptr_t address = nvn_dirty_wb_cpu_address(e->watch), first = (uintptr_t)e->t.mem;
-    LOGV("[settledwb-tile-cpu] reason=%s frame=%llu sub=%llu storage=%p bytes=%llu ser=%llu gpu=%llu cpu_address=%p cpu_inside=%d watch_written=%d dirty_since=%d tracked=%d gpu_stamp=%llu now=%llu",
-        reason, (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)vk_submit_serial(),
-        (void *)first, (unsigned long long)e->t.L.size, (unsigned long long)e->t.serial,
-        (unsigned long long)e->tile_version, (void *)address, address >= first && address - first < e->t.L.size,
-        nvn_dirty_wb_written(e->watch), nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp), e->tracked,
-        (unsigned long long)e->stamp, (unsigned long long)nvn_dirty_now());
+    if (wb_tile_trace_on()) {
+        uintptr_t address = nvn_dirty_wb_cpu_address(e->watch), first = (uintptr_t)e->t.mem;
+        LOGV("[settledwb-tile-cpu] reason=%s frame=%llu sub=%llu storage=%p bytes=%llu ser=%llu gpu=%llu cpu_address=%p cpu_inside=%d watch_written=%d dirty_since=%d tracked=%d gpu_stamp=%llu now=%llu",
+            reason, (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)vk_submit_serial(),
+            (void *)first, (unsigned long long)e->t.L.size, (unsigned long long)e->t.serial,
+            (unsigned long long)e->tile_version, (void *)address, address >= first && address - first < e->t.L.size,
+            nvn_dirty_wb_written(e->watch), nvn_dirty_since(e->t.mem, e->t.L.size, e->stamp), e->tracked,
+            (unsigned long long)e->stamp, (unsigned long long)nvn_dirty_now());
+    }
     wb_tile_event(e->tile_version, reason, 0, 0);
 }
-static int wb_copy_inner(wb_ent *e) {
+enum wb_copy_result { WB_COPY_FAILED, WB_COPY_RECORDED, WB_COPY_DEFERRED };
+static int wb_staging_full(uint64_t limit, uint64_t bytes) {
+    return limit && g_set_staging &&
+        (g_set_staging >= limit || bytes > limit - g_set_staging);
+}
+static enum wb_copy_result wb_copy_inner(wb_ent *e, uint64_t staging_limit) {
     wb_shape s = wb_layout(e); size_t total = 0;
     for (unsigned l = 0; l < s.levels; l++) total += wb_level_size(e, s, l) * s.layers;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = total, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    if (vkCreateBuffer(V.dev, &bci, NULL, &e->buffer)) return 0;
+    if (vkCreateBuffer(V.dev, &bci, NULL, &e->buffer)) return WB_COPY_FAILED;
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, e->buffer, &req);
+    /* Let a single oversized copy progress once staging has drained. This buffer
+       has not been bound or mentioned by any command when admission is deferred. */
+    if (wb_staging_full(staging_limit, req.size)) {
+        e->auto_required_size = req.size;
+        vkDestroyBuffer(V.dev, e->buffer, NULL); e->buffer = VK_NULL_HANDLE;
+        return WB_COPY_DEFERRED;
+    }
     int type = vk_pick_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = (uint32_t)type};
     if (type < 0 || vk_memory_allocate(&mai, &e->memory, VK_MEMORY_READBACK)) {
-        vkDestroyBuffer(V.dev, e->buffer, NULL); e->buffer = VK_NULL_HANDLE; return 0;
+        vkDestroyBuffer(V.dev, e->buffer, NULL); e->buffer = VK_NULL_HANDLE; return WB_COPY_FAILED;
     }
     VKCHECK(vkBindBufferMemory(V.dev, e->buffer, e->memory, 0));
     VKCHECK(vkMapMemory(V.dev, e->memory, 0, VK_WHOLE_SIZE, 0, (void **)&e->bytes));
     e->allocation = req.size; g_set_staging += req.size;
+    if (g_set_staging > g_set_staging_peak) g_set_staging_peak = g_set_staging;
     vk_tex alias = {.im = e->im}; vk_tex_native_read(&alias);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
+    enum { COPY_BATCH = 16 };
+    VkBufferImageCopy regions[COPY_BATCH];
+    unsigned count = 0;
     size_t o = 0;
-    for (unsigned l = 0; l < s.levels; l++) for (unsigned y = 0; y < s.layers; y++) {
-        VkBufferImageCopy c = {.bufferOffset = o, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, y, 1},
-            .imageExtent = {MAXV(e->im->w >> l, 1u), MAXV(e->im->h >> l, 1u), 1}};
-        vkCmdCopyImageToBuffer(cb, e->im->img, VK_IMAGE_LAYOUT_GENERAL, e->buffer, 1, &c);
-        vk_pso_life_external_read(c.imageExtent.width, c.imageExtent.height, "writeback-read");
-        o += wb_level_size(e, s, l);
+    for (unsigned l = 0; l < s.levels; l++) {
+        VkExtent3D extent = {MAXV(e->im->w >> l, 1u), MAXV(e->im->h >> l, 1u), 1};
+        size_t stride = wb_level_size(e, s, l);
+        for (unsigned y = 0; y < s.layers; y++) {
+            regions[count++] = (VkBufferImageCopy){.bufferOffset = o, .imageExtent = extent,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, y, 1}};
+            vk_pso_life_external_read(extent.width, extent.height, "writeback-read");
+            o += stride;
+            /* Each region has its own mip/layer and non-overlapping staging span. */
+            if (count == COPY_BATCH) {
+                vkCmdCopyImageToBuffer(cb, e->im->img, VK_IMAGE_LAYOUT_GENERAL, e->buffer, count, regions);
+                g_wb_copy_commands++;
+                count = 0;
+            }
+        }
     }
+    if (count) {
+        vkCmdCopyImageToBuffer(cb, e->im->img, VK_IMAGE_LAYOUT_GENERAL, e->buffer, count, regions);
+        g_wb_copy_commands++;
+    }
+    g_wb_copy_regions += (uint64_t)s.levels * s.layers;
     vk_barrier_all(cb); e->fence = mtl_last_fence() + 1;
     if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
-    return 1;
+    return WB_COPY_RECORDED;
 }
-static int wb_copy(wb_ent *e) {
-    uint64_t start = host_now_ns(); int result = wb_copy_inner(e);
-    if (!result) wb_tile_event(e->tile_version, "copy-allocation-failed", 0, 0);
+static enum wb_copy_result wb_copy(wb_ent *e, uint64_t staging_limit) {
+    uint64_t start = host_now_ns();
+    enum wb_copy_result result = wb_copy_inner(e, staging_limit);
+    if (result == WB_COPY_FAILED) wb_tile_event(e->tile_version, "copy-allocation-failed", 0, 0);
     wb_diag_end(WB_D_COPY, start); return result;
+}
+static void wb_level_bounds(const tex_t *t, unsigned mip, unsigned levels, uint64_t *start, uint64_t *size) {
+    uint64_t end = t->L.layer_size;
+    nvn_tex_level_layout(&t->d, mip, &t->L, start, NULL);
+    if (mip + 1 < levels) nvn_tex_level_layout(&t->d, mip + 1, &t->L, &end, NULL);
+    *size = end - *start;
+}
+/* Pool lifetime is already pinned by vk_wb_pool_lock. Every destination pointer
+   denotes a real mapped owner span, never an artificial whole-texture base
+   before an alias allocation. The encoder leaves padding untouched. */
+static int wb_swizzle_alias(const tex_t *t, unsigned level, unsigned layer,
+                            const void *source, size_t pitch, uint64_t first, uint64_t bytes) {
+    uint64_t offset;
+    nvn_tex_level_layout(&t->d, level, &t->L, &offset, NULL);
+    uint64_t storage = (uint64_t)layer * t->L.layer_size + offset;
+    while (bytes) {
+        size_t available = 0;
+        void *destination = vk_wb_alias_span_locked((uintptr_t)t->mem + storage + first, (size_t)bytes, &available);
+        if (!destination || !available) return -1; /* prevalidated under the same lifetime lock */
+        if (nvn_swizzle_span_into(&t->d, level, layer, source, pitch, destination, first, available)) return -1;
+        first += available; bytes -= available;
+    }
+    return 0;
 }
 /* Returns 3 for partial progress, 2 to defer without waiting, 1 if complete, 0 if CPU-newer, -1 if invalid. */
 static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint64_t *advanced) {
     const tex_t *t = &e->t; int settled = mode != WB_SYNC; wb_shape s = wb_layout(e);
     uint64_t offset = 0, span = t->L.size;
+    uint64_t level = 0, level_size = 0;
+    unsigned bounds_level = s.levels;
     if (advanced) *advanced = 0;
     if (mode == WB_IDLE) {
-        uint64_t level = nvn_tex_level_offset(&t->d, e->land_level);
-        uint64_t end = e->land_level + 1 < s.levels ? nvn_tex_level_offset(&t->d, e->land_level + 1) : t->L.layer_size;
+        bounds_level = e->land_level;
+        wb_level_bounds(t, bounds_level, s.levels, &level, &level_size);
         offset = (uint64_t)e->land_layer * t->L.layer_size + level + e->land_pos;
-        span = MINV(end - level - e->land_pos, MINV(limit, WB_LAND_CHUNK));
+        span = MINV(level_size - e->land_pos, MINV(limit, WB_LAND_CHUNK));
     }
     if (!vk_wb_pool_lock(e->pool, t->mem, t->L.size)) {
         wb_tile_event(e->tile_version, "pool-not-live", 0, 0); return -1;
@@ -1288,10 +1878,25 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP);
 #endif
     void *token = NULL;
+    /* Mixed/unsupported backing and records without watch/ownership eligibility
+       retain the original protocol for this landing extent. Range registration
+       alone must not select a private destination for a no-token synchronous record. */
+    int alias_enabled = vk_wb_alias_enabled();
+    vk_wb_alias_reason alias_reason = VK_WB_ALIAS_PATH_OTHER;
+    if (alias_enabled) {
+        alias_reason = !e->tracked || !nvn_dirty_tracked(t->mem + offset, span) ?
+            VK_WB_ALIAS_PATH_OWNERSHIP :
+            vk_wb_alias_reason_locked((uintptr_t)t->mem + offset, (size_t)span);
+    }
+    int private_alias = alias_enabled && alias_reason == VK_WB_ALIAS_PATH_ALIAS;
     if (mode == WB_IDLE || mode == WB_INVALIDATE_TRY) {
-        if (!nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token)) { vk_wb_pool_unlock(); return 2; }
+        int ready = private_alias ?
+            nvn_dirty_gpu_write_alias_try_begin((void *)(t->mem + offset), span, &token) :
+            nvn_dirty_gpu_write_try_begin((void *)(t->mem + offset), span, &token);
+        if (!ready) { vk_wb_pool_unlock(); return 2; }
     } else if (e->tracked) {
-        token = nvn_dirty_gpu_write_begin(t->mem, t->L.size);
+        token = private_alias ? nvn_dirty_gpu_write_alias_begin(t->mem, t->L.size) :
+            nvn_dirty_gpu_write_begin(t->mem, t->L.size);
         if (!token) { vk_wb_pool_unlock(); wb_tile_event(e->tile_version, "ownership-untracked", 0, 0); return -1; }
     }
 #ifdef TOTK_VK_TESTS
@@ -1299,10 +1904,10 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
 #endif
     /* Check AFTER taking the existing dirty page/unit ownership: a writer already in the fault handler either wins
        first (and its newer stamp rejects us) or waits until restoration. Keep the pool lifetime locked through end.
-       CPU-visible physical pools have no private RW alias (totk_vpool_backing names the game's physical view), so this
-       uses the synchronous write-back's temporary-RW protocol. Residual window: a fresh direct game store while these
-       pages are temporarily RW can bypass the handler, including just BEFORE this freshness check. Only writers
-       which fault while RO participate in dirty ownership; this is not strict exclusion of arbitrary stores. */
+       The private-alias path leaves the guest mapping RO throughout ownership:
+       a fresh raw CPU store faults, waits on PG_BUSY, and is observed after end.
+       Unsupported backing keeps the old temporary-RW protocol and its documented
+       residual window; no stronger exclusion is claimed for that fallback. */
     int fresh = !(settled && !e->tracked) && !wb_cpu_newer(e);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_AFTER_FRESHNESS);
@@ -1311,25 +1916,35 @@ static int wb_land_inner(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint
         totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-freshness ser=%llu image=%#llx result=%s",
             (unsigned long long)t->serial, (unsigned long long)(uintptr_t)e->im->img, fresh ? "gpu-authoritative" : "skip-cpu-newer");
     int ok = 1;
+    uint64_t dispatched_bytes = 0;
     if (fresh) do {
         unsigned l = e->land_level;
-        uint64_t level = nvn_tex_level_offset(&t->d, l);
-        uint64_t end = l + 1 < s.levels ? nvn_tex_level_offset(&t->d, l + 1) : t->L.layer_size;
-        uint64_t n = mode == WB_IDLE ? span : end - level - e->land_pos;
+        if (l != bounds_level) {
+            wb_level_bounds(t, l, s.levels, &level, &level_size);
+            bounds_level = l;
+        }
+        uint64_t n = mode == WB_IDLE ? span : level_size - e->land_pos;
         size_t pitch = (size_t)((MAXV(e->im->w >> l, 1u) + s.bw - 1) / s.bw) * s.bpb;
-        if (nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n)) { ok = 0; break; }
+        if (alias_enabled) dispatched_bytes += n;
+        int encoded = private_alias ?
+            wb_swizzle_alias(t, l, e->land_layer, e->bytes + e->land_src, pitch, e->land_pos, n) :
+            nvn_swizzle_span(&t->d, l, e->land_layer, e->bytes + e->land_src, pitch, (void *)t->mem, e->land_pos, n);
+        if (encoded) { ok = 0; break; }
         e->land_pos += n; if (advanced) *advanced += n;
-        if (e->land_pos == end - level) {
+        if (e->land_pos == level_size) {
             e->land_pos = 0; e->land_src += wb_level_size(e, s, l);
             if (++e->land_layer == s.layers) { e->land_layer = 0; e->land_level++; }
         }
         if (mode == WB_IDLE) break;
     } while (e->land_level < s.levels);
+    if (alias_enabled && dispatched_bytes)
+        vk_wb_alias_account(VK_WB_ALIAS_LANDING, alias_reason, dispatched_bytes);
     nvn_dirty_gpu_write_end(token);
 #ifdef TOTK_VK_TESTS
     if (settled) nvn_dirty_test_wb_phase(t->mem, NVN_DIRTY_TEST_WB_RESTORED);
 #endif
     vk_wb_pool_unlock();
+    if (fresh && vk_upload_partial_on) vk_upload_guest_landed((uint64_t)(uintptr_t)t->mem + offset, span);
     if (!fresh) { wb_cpu_detail(e, "cpu-newer-land"); g_wb_skip_cpu++; if (settled) g_set_skip_cpu++; return 0; }
     if (!ok) { wb_tile_event(e->tile_version, "layout-error", 0, 0); if (++g_wb_skip_fmt <= 8) RED(4, "GPU write-back: unsupported layout ser=%llu format %#x", (unsigned long long)t->serial, t->d.format); return -1; }
     if (e->land_level < s.levels) return 3;
@@ -1353,32 +1968,106 @@ static int wb_land(wb_ent *e, enum wb_land_mode mode, uint64_t limit, uint64_t *
     uint64_t start = host_now_ns(); int result = wb_land_inner(e, mode, limit, advanced);
     wb_diag_end(WB_D_LAND, start); return result;
 }
+static int wb_auto_ready(const wb_ent *e, uint64_t sub) {
+    return !e->cancelled && !e->fence && sub - e->sub >= e->quiet && mtl_wait(e->producer, 0);
+}
+static enum wb_copy_result wb_auto_stage(wb_ent *e, uint64_t staging_limit) {
+    enum wb_copy_result result = wb_copy(e, staging_limit);
+    if (result == WB_COPY_RECORDED) {
+        g_wb_staged++;
+        g_set_copies++;
+        wb_tile_event(e->tile_version, "staged", 0, 1);
+    }
+    return result;
+}
+static void wb_record_limited(uint64_t sub) {
+    if (!g_nwb) { g_wb_auto.next = 0; return; }
+    unsigned attempts = 0;
+    int i = g_wb_auto.next % g_nwb;
+    /* All removals are done before this traversal. Rotate past attempts, but
+       reserve the next chance for a copy that has to wait for staging to drain. */
+    for (int scanned = 0; scanned < g_nwb; scanned++, i = (i + 1) % g_nwb) {
+        wb_ent *e = &g_wb[i];
+        if (!wb_auto_ready(e, sub) || !e->tracked || wb_cpu_newer(e)) continue;
+        if (g_wb_auto.attempts_per_seal && attempts >= g_wb_auto.attempts_per_seal) {
+            g_wb_auto.attempt_yields++;
+            break;
+        }
+        if (wb_staging_full(g_wb_auto.staging_limit, e->auto_required_size)) {
+            g_wb_auto.byte_yields++;
+            break;
+        }
+        attempts++;
+        enum wb_copy_result result = wb_auto_stage(e, g_wb_auto.staging_limit);
+        if (result == WB_COPY_DEFERRED) {
+            g_wb_auto.byte_yields++;
+            break;
+        }
+        if (result == WB_COPY_RECORDED) {
+            g_wb_auto.accepted++;
+            if (g_set_staging > g_wb_auto.staging_peak) g_wb_auto.staging_peak = g_set_staging;
+        }
+    }
+    g_wb_auto.next = i;
+}
 void vk_wb_record(void) {
     if (!settled_on()) return;
     uint64_t sub = vk_submit_serial();
     pthread_mutex_lock(&g_tex_mu);
+    if (!g_wb_auto.initialized) wb_auto_init();
+    if (!g_nwb) { g_wb_auto.next = 0; pthread_mutex_unlock(&g_tex_mu); return; }
+    int limited = g_wb_auto.attempts_per_seal || g_wb_auto.staging_limit;
+    int disarm = cpu_disarm_on();
+    uint64_t writes = 0, ranges = 0, watches = 0, next_scan = UINT64_MAX;
+    if (g_wb_auto.quiet_skip) {
+        if (disarm) {
+            watches = nvn_dirty_wb_write_revision();
+            ranges = nvn_dirty_lag_epoch();
+            writes = nvn_dirty_now();
+        }
+        if (sub < g_wb_auto.next_scan && watches == g_wb_auto.scanned_watches &&
+            ranges == g_wb_auto.scanned_ranges && writes == g_wb_auto.scanned_writes) {
+            g_wb_auto.seal_skips++;
+            pthread_mutex_unlock(&g_tex_mu);
+            return;
+        }
+    }
     for (int i = 0; i < g_nwb; ) {
         wb_ent *e = &g_wb[i];
         /* CPU ownership cancels immediately, not at the learned deadline. The fault has already disarmed the
            whole watch; only in-flight staging may remain until its fence. Learning itself retains no protection. */
-        if (cpu_disarm_on() && !e->cancelled && (wb_cpu_newer(e) || !e->tracked)) {
+        if (disarm && !e->cancelled && (wb_cpu_newer(e) || !e->tracked)) {
             wb_cpu_detail(e, e->tracked ? "cpu-newer-record" : "untracked");
             g_set_skip_cpu++; g_wb_skip_cpu++;
             int before = g_nwb; wb_cancel_locked(i); if (before == g_nwb) i++;
             continue;
         }
-        if (e->cancelled || e->fence || sub - e->sub < e->quiet || !mtl_wait(e->producer, 0)) { i++; continue; }
+        if (g_wb_auto.quiet_skip && !e->cancelled && !e->fence)
+            next_scan = MINV(next_scan, e->sub + e->quiet);
+        if (limited && disarm) { i++; continue; }
+        if (!wb_auto_ready(e, sub)) { i++; continue; }
         if (wb_cpu_newer(e) || !e->tracked) {
             wb_cpu_detail(e, e->tracked ? "cpu-newer-stage" : "untracked");
             g_set_skip_cpu++; wb_ent_drop_locked(i); continue;
         }
-        if (wb_copy(e)) { g_set_copies++; wb_tile_event(e->tile_version, "staged", 0, 1); }
+        if (!limited) wb_auto_stage(e, 0);
         i++;
     }
+    if (limited) wb_record_limited(sub);
+    /* Sample before walking, so an intervening fault or range change causes
+       another walk. The copy and explicit landing paths still check freshness. */
+    g_wb_auto.scanned_writes = writes;
+    g_wb_auto.scanned_ranges = ranges;
+    g_wb_auto.scanned_watches = watches;
+    g_wb_auto.next_scan = next_scan;
     pthread_mutex_unlock(&g_tex_mu);
 }
 static void wb_sweep_locked(void) {
     static int next;
+    if (!g_wb_staged) {
+        g_wb_unstaged_skips += g_nwb != 0;
+        return;
+    }
     uint64_t start = host_now_ns(), bytes = 0, chunks = 0; int yielded = 0, work = 0, scans = 0, count = g_nwb;
     int i = g_nwb ? next % g_nwb : 0;
     while (g_nwb && scans < count) {
@@ -1401,27 +2090,36 @@ static void wb_sweep_locked(void) {
     next = i; wb_diag_sweep(start, bytes, chunks, yielded);
 }
 static void wb_age_locked(void) {
-    uint64_t sub = vk_submit_serial();
-    for (int i = 0; i < g_nwb; )
-        if (!settled_on() && !g_wb[i].fence && sub - g_wb[i].sub > 3000) {
-            wb_tile_event(g_wb[i].tile_version, "aged-sync-only", 0, 0); wb_ent_drop_locked(i); g_wb_aged++;
-        } else i++;
-    uint64_t lo = UINT64_MAX, hi = 0;
-    for (int i = 0; i < g_nwb; i++) { uint64_t m = (uintptr_t)g_wb[i].t.mem; if (m < lo) lo = m; if (m + g_wb[i].t.L.size > hi) hi = m + g_wb[i].t.L.size; }
-    for (int i = 0; i < g_wb_landing_n; i++) {
-        uint64_t m = (uintptr_t)g_wb_landing[i].t.mem;
-        if (m < lo) lo = m;
-        if (m + g_wb_landing[i].t.L.size > hi) hi = m + g_wb_landing[i].t.L.size;
+    if (g_nwb && !settled_on()) {
+        uint64_t sub = vk_submit_serial();
+        for (int i = 0; i < g_nwb; )
+            if (!g_wb[i].fence && sub - g_wb[i].sub > 3000) {
+                wb_tile_event(g_wb[i].tile_version, "aged-sync-only", 0, 0); wb_ent_drop_locked(i); g_wb_aged++;
+            } else i++;
     }
-    g_wb_lo = lo; g_wb_hi = hi;
-    if (!g_nwb) { free(g_wb); g_wb = NULL; g_capwb = 0; }
+    if (g_wb_bounds_dirty) {
+        uint64_t lo = UINT64_MAX, hi = 0;
+        for (int i = 0; i < g_nwb; i++) {
+            uint64_t m = (uintptr_t)g_wb[i].t.mem;
+            lo = MINV(lo, m);
+            hi = MAXV(hi, m + g_wb[i].t.L.size);
+        }
+        for (int i = 0; i < g_wb_landing_n; i++) {
+            uint64_t m = (uintptr_t)g_wb_landing[i].t.mem;
+            lo = MINV(lo, m);
+            hi = MAXV(hi, m + g_wb_landing[i].t.L.size);
+        }
+        g_wb_lo = lo; g_wb_hi = hi;
+        g_wb_bounds_dirty = 0;
+        g_wb_bounds_rebuilds++;
+    }
+    if (!g_nwb && g_wb) { free(g_wb); g_wb = NULL; g_capwb = 0; }
 }
-static uint64_t wb_image_bytes(const vk_img *im) {
-    return im->mem.size + (im->native ? wb_image_bytes(im->native) : 0) +
-        (im->scene_scratch ? wb_image_bytes(im->scene_scratch) : 0) +
-        (im->scene_aa[0] ? wb_image_bytes(im->scene_aa[0]) : 0) +
-        (im->scene_aa[1] ? wb_image_bytes(im->scene_aa[1]) : 0) +
-        (im->scene_aa[2] ? wb_image_bytes(im->scene_aa[2]) : 0);
+static uint64_t image_tree_bytes(const vk_img *im) {
+    if (!im) return 0;
+    uint64_t bytes = im->mem.size + image_tree_bytes(im->native) + image_tree_bytes(im->scene_scratch);
+    for (unsigned i = 0; i < 3; i++) bytes += image_tree_bytes(im->scene_aa[i]);
+    return bytes;
 }
 static void wb_memory_locked(uint64_t v[5]) {
     v[0] = (uint64_t)g_capwb * sizeof *g_wb;
@@ -1433,9 +2131,11 @@ static void wb_memory_locked(uint64_t v[5]) {
     v[2] = v[3] = 0; v[4] = g_wb_history.n;
     for (int i = 0; i < g_nwb; i++) {
         vk_img *im = g_wb[i].im; int duplicate = 0;
-        for (int j = 0; j < i; j++) if (g_wb[j].im == im) { duplicate = 1; break; }
+        /* Every pending record holds a pin, so a sole pin cannot appear twice. */
+        if (im->wbrefs > 1)
+            for (int j = 0; j < i; j++) if (g_wb[j].im == im) { duplicate = 1; break; }
         if (duplicate) continue;
-        uint64_t bytes = wb_image_bytes(im); v[2] += bytes;
+        uint64_t bytes = image_tree_bytes(im); v[2] += bytes;
         if (im->shared ? !im->refs : im->orphan) v[3] += bytes;
     }
 }
@@ -1475,7 +2175,7 @@ void vk_wb_stats(void) {
     uint64_t faults, preps, dirty, dirty_preps;
     nvn_dirty_wb_stats(&faults, &preps); nvn_dirty_stats(&dirty, &dirty_preps);
     uint64_t frame = &g_frame_pub ? g_frame_pub : 0, frames = frame > previous_frame ? frame - previous_frame : 0;
-    if (g_nwb || g_set_staging || memcmp(previous, now, sizeof now)) {
+    if (g_nwb || g_set_staging_peak || memcmp(previous, now, sizeof now)) {
         LOGV("settled write-back: landed %llu (%.3f MiB), pending %d, skipped %llu (CPU wrote since), superseded %llu, staging %llu bytes, copies %llu, at invalidate %llu, WB faults %llu (%.3f/frame), dirty faults %llu (%.3f/frame)",
             (unsigned long long)g_set_done, g_set_bytes / 1048576.0, g_nwb, (unsigned long long)g_set_skip_cpu,
             (unsigned long long)g_set_superseded, (unsigned long long)g_set_staging, (unsigned long long)g_set_copies,
@@ -1483,13 +2183,38 @@ void vk_wb_stats(void) {
             frames ? (double)(faults - previous_faults) / frames : 0,
             (unsigned long long)dirty, frames ? (double)(dirty - previous_dirty) / frames : 0);
         uint64_t memory[5]; wb_memory_locked(memory);
-        LOGV("settled write-back memory: records %llu bytes, history %llu bytes/%llu storages, pinned %.3f MiB (WB-only %.3f MiB), staging %llu bytes",
+        LOGV("settled write-back memory: records %llu bytes, history %llu bytes/%llu storages, pinned %.3f MiB (WB-only %.3f MiB), staging %llu bytes, peak staging %llu bytes",
             (unsigned long long)memory[0], (unsigned long long)memory[1], (unsigned long long)memory[4],
-            memory[2] / 1048576.0, memory[3] / 1048576.0, (unsigned long long)g_set_staging);
+            memory[2] / 1048576.0, memory[3] / 1048576.0, (unsigned long long)g_set_staging,
+            (unsigned long long)g_set_staging_peak);
     }
+    g_set_staging_peak = g_set_staging;
     if (g_set_fresh || g_set_fresh_wait_ns)
         LOGV("settled write-back invalidate fresh landings: %llu (%llu bytes), copy-wait %.3f ms cumulative",
             (unsigned long long)g_set_fresh, (unsigned long long)g_set_fresh_bytes, g_set_fresh_wait_ns / 1e6);
+    if (g_wb_invalidate_batches)
+        LOGV("[wb-invalidate-batches] batches=%llu heap_batches=%llu max_records=%d",
+            (unsigned long long)g_wb_invalidate_batches, (unsigned long long)g_wb_invalidate_heap_batches,
+            g_wb_invalidate_max_batch);
+    if (g_wb_copy_commands)
+        LOGV("[wb-copy-regions] commands=%llu regions=%llu",
+            (unsigned long long)g_wb_copy_commands, (unsigned long long)g_wb_copy_regions);
+    if (g_wb_unstaged_skips || g_wb_bounds_rebuilds || g_wb_auto.seal_skips)
+        LOGV("[wb-queue] frame=%llu staged=%d unstaged_sweeps_skipped=%llu bounds_rebuilds=%llu quiet_seals_skipped=%llu",
+            (unsigned long long)frame, g_wb_staged, (unsigned long long)g_wb_unstaged_skips,
+            (unsigned long long)g_wb_bounds_rebuilds, (unsigned long long)g_wb_auto.seal_skips);
+    if (g_wb_auto.attempts_per_seal || g_wb_auto.staging_limit) {
+        uint64_t oldest = 0, sub = vk_submit_serial();
+        for (int i = 0; i < g_nwb; i++) {
+            const wb_ent *e = &g_wb[i];
+            if (!e->cancelled && !e->fence && sub - e->sub > oldest) oldest = sub - e->sub;
+        }
+        LOGV("[wb-auto] attempts_per_seal=%u staging_limit=%llu accepted=%llu attempt_yields=%llu byte_yields=%llu peak_at_admission=%llu oldest_unstaged_subs=%llu",
+            g_wb_auto.attempts_per_seal, (unsigned long long)g_wb_auto.staging_limit,
+            (unsigned long long)g_wb_auto.accepted, (unsigned long long)g_wb_auto.attempt_yields,
+            (unsigned long long)g_wb_auto.byte_yields, (unsigned long long)g_wb_auto.staging_peak,
+            (unsigned long long)oldest);
+    }
     pthread_mutex_lock(&g_wb_lookup_mu);
     uint64_t inflight = g_wb_inflight_hits, versions = g_wb_tile_version, invalidates = g_wb_tile_invalidates, stale = g_wb_tile_stale;
     unsigned tiles = g_wb_ntiles;
@@ -1537,6 +2262,16 @@ void vk_wb_test_history(const tex_t *t, uint64_t v[2]) {
 uint64_t vk_wb_test_invalidates(void) {
     pthread_mutex_lock(&g_tex_mu); uint64_t n = g_set_invalidate; pthread_mutex_unlock(&g_tex_mu); return n;
 }
+void vk_wb_test_invalidate_batches(uint64_t v[3]) {
+    pthread_mutex_lock(&g_tex_mu);
+    v[0] = g_wb_invalidate_batches; v[1] = g_wb_invalidate_heap_batches; v[2] = g_wb_invalidate_max_batch;
+    pthread_mutex_unlock(&g_tex_mu);
+}
+void vk_wb_test_copy_regions(uint64_t v[2]) {
+    pthread_mutex_lock(&g_tex_mu);
+    v[0] = g_wb_copy_commands; v[1] = g_wb_copy_regions;
+    pthread_mutex_unlock(&g_tex_mu);
+}
 void vk_wb_test_sync(uint64_t v[7]) {
     pthread_mutex_lock(&g_wb_lookup_mu); v[0] = g_wb_lookup_calls; v[1] = g_wb_lookup_hits; pthread_mutex_unlock(&g_wb_lookup_mu);
     for (int i = 0; i < WB_OP_COUNT; i++) v[2 + i] = atomic_load(&g_wb_ops[i]);
@@ -1549,6 +2284,13 @@ void vk_wb_test_sweep(uint64_t v[6]) {
     v[4] = g_wb_diag.land_yields; v[5] = g_wb_diag.land_calls;
     pthread_mutex_unlock(&g_wb_diag_mu);
 }
+void vk_wb_test_queue(uint64_t v[6]) {
+    pthread_mutex_lock(&g_tex_mu);
+    v[0] = g_wb_unstaged_skips; v[1] = g_wb_bounds_rebuilds; v[2] = (uint64_t)g_wb_staged;
+    v[3] = g_wb_lo; v[4] = g_wb_hi;
+    v[5] = g_wb_auto.seal_skips;
+    pthread_mutex_unlock(&g_tex_mu);
+}
 #endif
 static void wb_seal(int full) {
     uint64_t start = host_now_ns(), before = mtl_last_fence();
@@ -1558,6 +2300,9 @@ static void wb_seal(int full) {
     wb_diag_end(WB_D_SEAL, start);
 }
 typedef struct { uint64_t address, n; int full, count; } wb_invalidate_request;
+static int wb_invalidate_matches(const wb_ent *entry, const wb_invalidate_request *request) {
+    return !entry->cancelled && wb_overlap(entry, request->address, request->n);
+}
 static int wb_invalidate_owner(void *arg, int boundary) {
     wb_invalidate_request *request = arg;
     uint64_t address = request->address, n = request->n, phase; int full = request->full;
@@ -1568,26 +2313,42 @@ static int wb_invalidate_owner(void *arg, int boundary) {
             wb_ent *e = &g_wb[i];
             /* A note at pass begin covers ALL its draws. Do not snapshot an unfinished same-image producer
                merely to meet a latency target. An unrelated already-sealed producer can be serviced between ops. */
-            if (!e->cancelled && wb_overlap(e, address, n) && !e->fence && e->producer > sealed &&
+            if (wb_invalidate_matches(e, request) && !e->fence && e->producer > sealed &&
                 e->tracked && !wb_cpu_newer(e)) { pthread_mutex_unlock(&g_tex_mu); return 0; }
         }
     }
 
-    int nl = 0; wb_ent *list = NULL;
+    enum { INLINE_LANDINGS = 4 };
+    wb_ent inline_landings[INLINE_LANDINGS], *list = inline_landings;
+    int nl = 0;
     uint64_t fresh_before = g_set_fresh, fresh_bytes_before = g_set_fresh_bytes;
     for (int i = 0; i < g_nwb; i++) {
         wb_ent *e = &g_wb[i];
-        if (e->cancelled || !wb_overlap(e, address, n)) continue;
-        e->fresh_invalidate = !full && vk_submit_serial() - e->sub < settled_subs();
+        if (!wb_invalidate_matches(e, request)) continue;
+        if (nl == INLINE_LANDINGS) {
+            /* The recorder still holds g_tex_mu. Count the remainder once and
+               allocate exactly what this batch needs before publishing any rows. */
+            size_t capacity = nl + 1;
+            for (int j = i + 1; j < g_nwb; j++) capacity += wb_invalidate_matches(&g_wb[j], request);
+            list = VK_MALLOC(capacity * sizeof *list);
+            memcpy(list, inline_landings, sizeof inline_landings);
+            g_wb_invalidate_heap_batches++;
+        }
         if (totk_texcopy_match(&e->t))
             totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-select ser=%llu mem=%p image=%#llx producer_sub=%llu",
                 (unsigned long long)e->t.serial, (void *)e->t.mem, (unsigned long long)(uintptr_t)e->im->img, (unsigned long long)e->sub);
-        list = realloc(list, (size_t)(nl + 1) * sizeof *list); list[nl++] = *e;
+        list[nl] = *e;
+        list[nl].fresh_invalidate = !full && vk_submit_serial() - e->sub < settled_subs();
+        nl++;
     }
-    wb_landing_publish(list, nl);
+    if (nl) {
+        g_wb_invalidate_batches++;
+        if (nl > g_wb_invalidate_max_batch) g_wb_invalidate_max_batch = nl;
+    }
+    wb_landing_publish(nl ? list : NULL, nl);
     for (int i = 0; i < g_nwb; ) {
-        if (g_wb[i].cancelled || !wb_overlap(&g_wb[i], address, n)) { i++; continue; }
-        wb_lookup_remove(i);
+        if (!wb_invalidate_matches(&g_wb[i], request)) { i++; continue; }
+        wb_queue_unindex(i);
         g_wb[i] = g_wb[--g_nwb]; /* transfer reference/staging ownership after publishing the borrowed ranges */
     }
     uint64_t copy_fence = 0, fresh_wait_ns = 0; int fresh_copy = 0;
@@ -1598,7 +2359,7 @@ static int wb_invalidate_owner(void *arg, int boundary) {
             g_wb_skip_cpu++; if (!full) g_set_skip_cpu++; e->cancelled = 1;
         } else if (!e->fence) {
             vk_end_rendering_at(VK_PASS_END_CPU_WAIT, 1);
-            if (wb_copy(e)) { if (!full) g_set_copies++; wb_tile_event(e->tile_version, "staged-invalidate", 0, 1); }
+            if (wb_copy(e, 0) == WB_COPY_RECORDED) { if (!full) g_set_copies++; wb_tile_event(e->tile_version, "staged-invalidate", 0, 1); }
         }
         fresh_copy |= e->fresh_invalidate && !e->cancelled;
         if (e->fence > copy_fence) copy_fence = e->fence;
@@ -1626,6 +2387,7 @@ static int wb_invalidate_owner(void *arg, int boundary) {
                 wb_land(&list[i], WB_INVALIDATE, 0, NULL);
             }
         }
+        wb_bounds_removed(&list[i]);
         wb_staging_free(&list[i]); wb_unref(list[i].im);
         nvn_dirty_wb_unwatch(list[i].watch);
     }
@@ -1637,7 +2399,8 @@ static int wb_invalidate_owner(void *arg, int boundary) {
     wb_landing_publish(NULL, 0);
     wb_age_locked();
     request->count = nl;
-    pthread_mutex_unlock(&g_tex_mu); free(list);
+    pthread_mutex_unlock(&g_tex_mu);
+    if (list != inline_landings) free(list);
     return 1;
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
@@ -2346,20 +3109,32 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
     uint64_t address = (uint64_t)(uintptr_t)r->t.mem;
     int block_w, block_h, bytes_per_texel = nvn_fmt_bpb(r->t.d.format, &block_w, &block_h);
     if (address && bytes_per_texel > 0) vk_ub_touch(address, (uint64_t)r->t.d.width * bytes_per_texel);
-    vk_tex *x = vk_tex_get(&r->t);
     pthread_mutex_lock(&g_tex_mu);
-    if (!x) { x = nvn_hm_get(&g_by_serial, &r->t.serial); }
-    if (x && x->tbv && !vk_lag_capture_on()) { VkBufferView cached = x->tbv; pthread_mutex_unlock(&g_tex_mu); return cached; }
+    /* Buffer textures need only a host object here. Keep creation and view
+       linking in one lock scope so a detached texture cannot be linked again. */
+    vk_tex *x = nvn_hm_get(&g_by_serial, &r->t.serial);
+    if (!x) x = tex_get_inner(&r->t);
+    vk_tex_buffer *texture = x && x->t.d.target == 10 ? (vk_tex_buffer *)x : NULL;
+    uint64_t generation = vk_pool_mapping_generation();
+    int lag = vk_lag_capture_on();
+    if (texture && texture->view && !lag && texture->mapping_generation == generation) {
+        VkBufferView cached = texture->view;
+        pthread_mutex_unlock(&g_tex_mu);
+        return cached;
+    }
     VkBufferView bv = VK_NULL_HANDLE;
-    if (x) {
+    if (texture) {
         int bw, bh, bpb = nvn_fmt_bpb(r->t.d.format, &bw, &bh); VkFormat f; VkBuffer b; uint64_t off;
         uint64_t addr = (uint64_t)(uintptr_t)r->t.mem, size = (uint64_t)r->t.d.width * bpb;
         if (!vk_fmt(r->t.d.format, &f, NULL) || !f || !bpb) RED(4, "buffer texture format %#x has no Vulkan format", r->t.d.format);
-        else if (!vk_resolve(addr, size, &b, &off)) RED(4, "buffer texture storage is outside the memory pools");
+        else if (!vk_resolve(addr, size, &b, &off)) {
+            unlink_buffer_view(texture, 1);
+            RED(4, "buffer texture storage is outside the memory pools");
+        }
         else {
             size = MINV(size, (uint64_t)V.props.limits.maxTexelBufferElements * bpb);
             VkDescriptorBufferInfo frozen;
-            if (writable && vk_lag_capture_on()) {
+            if (writable && lag) {
                 if (live) { vk_gpu_write_record(addr, size); *reason = NVN_DIRTY_LAG_GPU | NVN_DIRTY_LAG_WRITABLE; }
                 else vk_gpu_write(addr, size);
             } else if (live ? vk_lag_read_record(addr, size, V.props.limits.minTexelBufferOffsetAlignment, &frozen, reason, VK_LAG_TEXEL) :
@@ -2367,12 +3142,25 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
             if (live && *reason) *live = (VkDescriptorBufferInfo){b, off, size};
             if (off % V.props.limits.minTexelBufferOffsetAlignment) RED(4, "buffer texture offset %#llx is not aligned", (unsigned long long)off);
             else {
-                if (x->tbv && (x->tb_buffer != b || x->tb_offset != off || x->tb_range != size)) { retire_bview(x->tbv, x->tb_buffer); x->tbv = VK_NULL_HANDLE; }
-                if (!x->tbv) {
+                if (texture->view && (texture->buffer != b || texture->offset != off || texture->range != size))
+                    unlink_buffer_view(texture, 1);
+                if (!texture->view) {
                     VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size};
-                    if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; }
+                    VkBufferView view;
+                    if (!vkCreateBufferView(V.dev, &ci, NULL, &view)) {
+                        texture->view = view;
+                        texture->buffer = b;
+                        texture->offset = off;
+                        texture->range = size;
+                        texture->next = g_tex_buffer_views;
+                        if (texture->next) texture->next->prev = texture;
+                        g_tex_buffer_views = texture;
+                    }
                 }
-                bv = x->tbv;
+                /* A mapping change racing resolution forces the next lookup
+                   to revalidate. Snapshots never become direct-cache hits. */
+                texture->mapping_generation = lag ? 0 : generation;
+                bv = texture->view;
             }
         }
     }
@@ -2713,6 +3501,24 @@ static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const 
     texel_flush(s);
 }
 void vk_res_counters(uint64_t v[7]) { v[0] = g_stat_images; v[1] = g_stat_shared_hits; v[2] = g_stat_uploads; v[3] = g_stat_reuploads; v[4] = g_stat_swept; v[5] = g_stat_published; v[6] = g_stat_switched; }
+
+/* Only the live owners are counted here. Shared images may have multiple serials,
+ * so their auxiliary allocations are visited through the storage map once. */
+static void image_ownership_locked(uint64_t v[5]) {
+    memset(v, 0, 5 * sizeof *v);
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) {
+        const vk_tex *x = g_by_serial.vals[i];
+        const vk_img *im = x ? x->im : NULL;
+        if (!im || im->shared) continue;
+        unsigned kind = im->gpu_written ? 1 : x->mirrored ? 0 : 2;
+        v[kind] += im->mem.size;
+        v[3] += image_tree_bytes(im) - im->mem.size;
+    }
+    for (uint32_t i = 0; i < g_by_storage.cap; i++) {
+        const vk_img *im = g_by_storage.vals[i];
+        if (im) v[4] += image_tree_bytes(im) - im->mem.size;
+    }
+}
 #ifdef TOTK_VK_TESTS
 void vk_res_test_shared_sweep(uint64_t stats[2]) {
     pthread_mutex_lock(&g_tex_mu);
@@ -2720,30 +3526,126 @@ void vk_res_test_shared_sweep(uint64_t stats[2]) {
     stats[1] = g_shared_skips;
     pthread_mutex_unlock(&g_tex_mu);
 }
+
+void vk_res_test_pool_images(uint64_t stats[3]) {
+    pthread_mutex_lock(&g_tex_mu);
+    stats[0] = g_pool_images_detached;
+    stats[1] = g_pool_images_retired;
+    stats[2] = g_pool_image_bytes_retired;
+    pthread_mutex_unlock(&g_tex_mu);
+}
+
+void vk_res_test_buffer_releases(uint64_t stats[4]) {
+    pthread_mutex_lock(&g_tex_mu);
+    stats[0] = g_buffer_release_live;
+    stats[1] = g_buffer_release_retired;
+    stats[2] = g_buffer_release_destroyed;
+    stats[3] = g_by_serial.cap;
+    pthread_mutex_unlock(&g_tex_mu);
+}
+int vk_res_test_texel_backing(uint64_t serial, VkBuffer buffer, VkDeviceSize offset) {
+    pthread_mutex_lock(&g_tex_mu);
+    const vk_tex *x = nvn_hm_get(&g_by_serial, &serial);
+    const vk_tex_buffer *texture = x && x->t.d.target == 10 ? (const vk_tex_buffer *)x : NULL;
+    int matches = texture && texture->view && texture->buffer == buffer && texture->offset == offset;
+    pthread_mutex_unlock(&g_tex_mu);
+    return matches;
+}
+void vk_res_test_image_ownership(uint64_t stats[5]) {
+    pthread_mutex_lock(&g_tex_mu);
+    image_ownership_locked(stats);
+    pthread_mutex_unlock(&g_tex_mu);
+}
 #endif
+
+static pthread_once_t g_ownership_trace_once = PTHREAD_ONCE_INIT;
+static int g_ownership_trace;
+static void image_ownership_trace_init(void) {
+    const char *value = getenv("TOTK_VK_IMAGE_OWNERSHIP_TRACE");
+    g_ownership_trace = value && !strcmp(value, "1");
+}
+
+/* csub records an ordinary lookup, not the last recorded use. These are
+   estimates of block coverage, never authorization to retire an image. */
+static void mirror_age_locked(uint64_t sub, uint64_t age_bytes[5], uint64_t *covered_bytes,
+                              uint64_t *old_dedicated_bytes) {
+    pthread_mutex_lock(&g_mem_mu);
+    VkDeviceSize *old_by_block = calloc(g_nblocks, sizeof *old_by_block);
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) {
+        const vk_tex *x = g_by_serial.vals[i];
+        const vk_img *im = x ? x->im : NULL;
+        if (!im || im->shared || im->gpu_written || !x->mirrored) continue;
+        if (!x->csub || x->csub > sub) {
+            age_bytes[0] += im->mem.size;
+            continue;
+        }
+        uint64_t age = sub - x->csub;
+        age_bytes[1 + (age >= 120) + (age >= 600) + (age >= 3600)] += im->mem.size;
+        if (age < 600) continue;
+        if (im->mem.block < 0) *old_dedicated_bytes += im->mem.size;
+        else if (old_by_block) old_by_block[im->mem.block] += im->mem.size;
+    }
+    if (old_by_block) {
+        for (int i = 0; i < g_nblocks; i++) {
+            if (old_by_block[i] && old_by_block[i] == g_blocks[i].used)
+                *covered_bytes += g_mem_block_size;
+        }
+    }
+    free(old_by_block);
+    pthread_mutex_unlock(&g_mem_mu);
+}
+
 void vk_res_mem(uint64_t v[8]) {
     pthread_once(&g_mem_policy_once, image_memory_policy);
-    int detail = g_mem_pack || g_mem_free_empty;
-    uint64_t largest = 0, allocs, releases;
+    pthread_once(&g_ownership_trace_once, image_ownership_trace_init);
+    int detail = g_mem_pack || g_mem_free_empty || g_ownership_trace;
+    uint64_t largest = 0, allocs, releases, reclaimed_reuses;
     unsigned sparse = 0, empty = 0;
-    pthread_mutex_lock(&g_mem_mu); v[0] = g_mem_block_bytes; v[1] = g_mem_dedicated_bytes; v[7] = 0;
-    for (int i = 0; i < g_nblocks; i++) {
+    pthread_mutex_lock(&g_mem_mu);
+    v[0] = g_mem_block_bytes; v[1] = g_mem_dedicated_bytes; v[7] = g_mem_block_used;
+    image_memory_peaks peaks = image_memory_take_peaks_locked();
+    for (int i = 0; detail && i < g_nblocks; i++) {
         const block_t *b = &g_blocks[i];
-        v[7] += b->used;
-        if (!detail || !b->mem) continue;
+        if (!b->mem) continue;
         empty += !b->used;
         sparse += b->used > 0 && b->used <= g_mem_block_size / 4;
         for (int s = 0; s < b->nfree; s++) if (b->free[s].size > largest) largest = b->free[s].size;
     }
-    allocs = g_mem_block_allocs; releases = g_mem_block_releases;
+    allocs = g_mem_block_allocs; releases = g_mem_block_releases; reclaimed_reuses = g_mem_reclaim_reuses;
+    uint64_t pressure_events = g_mem_pressure_events, pressure_recovered = g_mem_pressure_recovered;
     pthread_mutex_unlock(&g_mem_mu);
-    uint64_t retired = 0, pinned = 0, active = 0, idle[3] = {0}, gpu_written = 0, scans, skips;
+    uint64_t retired = 0, pinned = 0, active = 0, idle[3] = {0}, gpu_written = 0, scans, skips, ownership[5];
+    uint64_t age_bytes[5] = {0}, covered_bytes = 0, old_dedicated_bytes = 0;
+    uint64_t retired_dedicated = 0, ready_dedicated = 0, ready_spans = 0;
+    uint64_t reclaim_runs, reclaim_probes, reclaim_images, reclaim_span_bytes, reclaim_peak_ns;
+    uint64_t reclaim_dedicated_runs, reclaim_dedicated_bytes;
     pthread_mutex_lock(&g_tex_mu);
     scans = g_shared_scans; skips = g_shared_skips;
-    v[2] = (uint64_t)g_nretired; v[3] = g_by_serial.n; v[4] = g_by_storage.n; v[5] = (uint64_t)g_nwb; v[6] = (uint64_t)g_capretired;
+    reclaim_runs = g_reclaim_runs; reclaim_probes = g_reclaim_probes;
+    reclaim_images = g_reclaim_images; reclaim_span_bytes = g_reclaim_span_bytes;
+    reclaim_dedicated_runs = g_reclaim_dedicated_runs;
+    reclaim_dedicated_bytes = g_reclaim_dedicated_bytes;
+    reclaim_peak_ns = g_reclaim_peak_ns;
+    v[2] = (uint64_t)g_nretired + g_nretired_buffer_views;
+    v[3] = g_by_serial.n; v[4] = g_by_storage.n; v[5] = (uint64_t)g_nwb;
+    v[6] = (uint64_t)g_capretired + g_capretired_buffer_views;
+    uint64_t release_live = g_buffer_release_live, release_retired = g_buffer_release_retired;
+    uint64_t release_destroyed = g_buffer_release_destroyed;
+    uint64_t pool_detached = g_pool_images_detached, pool_retired = g_pool_images_retired;
+    uint64_t pool_retired_bytes = g_pool_image_bytes_retired;
+    uint64_t reclaim_single_fits = g_reclaim_single_fits;
+    uint64_t retry_attempts = g_tex_retry_attempts, retry_recovered = g_tex_retry_recovered;
     if (detail) {
         uint64_t sub = vk_submit_serial();
-        for (int i = 0; i < g_nretired; i++) retired += g_retired[i].mem.size;
+        for (int i = 0; i < g_nretired; i++) {
+            const retired_t *r = &g_retired[i];
+            if (!r->mem.mem) continue;
+            retired += r->mem.size;
+            if (r->mem.block < 0) {
+                retired_dedicated += r->mem.size;
+                if (mtl_wait(r->after, 0)) ready_dedicated += r->mem.size;
+            } else if (mtl_wait(r->after, 0)) ready_spans += r->mem.size;
+        }
         for (uint32_t i = 0; i < g_by_storage.cap; i++) {
             const vk_img *im = g_by_storage.vals[i];
             if (!im) continue;
@@ -2756,20 +3658,66 @@ void vk_res_mem(uint64_t v[8]) {
             }
         }
     }
+    if (g_ownership_trace) {
+        image_ownership_locked(ownership);
+        mirror_age_locked(vk_submit_serial(), age_bytes, &covered_bytes, &old_dedicated_bytes);
+    }
     pthread_mutex_unlock(&g_tex_mu);
     if (detail) LOGV("[image-memory] pack=%d allocs=%llu releases=%llu empty=%u sparse=%u largest_free_mib=%.3f retired_mib=%.3f "
-        "shared_active_mib=%.3f wb_only_mib=%.3f idle_under60_mib=%.3f idle_60_239_mib=%.3f idle_240_plus_mib=%.3f idle_gpu_written_mib=%.3f sweeps=%llu skipped_sweeps=%llu",
+        "shared_active_mib=%.3f wb_only_mib=%.3f idle_under60_mib=%.3f idle_60_239_mib=%.3f idle_240_plus_mib=%.3f idle_gpu_written_mib=%.3f sweeps=%llu skipped_sweeps=%llu "
+        "retired_dedicated_mib=%.3f ready_dedicated_mib=%.3f ready_spans_mib=%.3f",
         g_mem_pack, (unsigned long long)allocs, (unsigned long long)releases, empty, sparse, largest / 1048576.0,
         retired / 1048576.0, active / 1048576.0, pinned / 1048576.0, idle[0] / 1048576.0, idle[1] / 1048576.0,
-        idle[2] / 1048576.0, gpu_written / 1048576.0, (unsigned long long)scans, (unsigned long long)skips);
+        idle[2] / 1048576.0, gpu_written / 1048576.0, (unsigned long long)scans, (unsigned long long)skips,
+        retired_dedicated / 1048576.0, ready_dedicated / 1048576.0, ready_spans / 1048576.0);
+    if (g_ownership_trace)
+        LOGV("[image-ownership] frame=%llu private_mirror_bytes=%llu private_gpu_written_bytes=%llu private_other_bytes=%llu private_aux_bytes=%llu shared_aux_bytes=%llu",
+            (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)ownership[0],
+            (unsigned long long)ownership[1], (unsigned long long)ownership[2],
+            (unsigned long long)ownership[3], (unsigned long long)ownership[4]);
+    if (g_ownership_trace)
+        LOGV("[mirror-age] frame=%llu unknown=%llu under120=%llu age120_599=%llu age600_3599=%llu age3600_plus=%llu blocks_entirely_age600_plus=%llu dedicated_age600_plus=%llu",
+            (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)age_bytes[0],
+            (unsigned long long)age_bytes[1], (unsigned long long)age_bytes[2],
+            (unsigned long long)age_bytes[3], (unsigned long long)age_bytes[4],
+            (unsigned long long)covered_bytes, (unsigned long long)old_dedicated_bytes);
+    if (g_mem_peak_log || g_ownership_trace)
+        LOGV("[image-peaks] frame=%llu peak_committed=%llu at_peak_blocks=%llu at_peak_dedicated=%llu at_peak_block_used=%llu peak_occupied=%llu",
+            (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)(peaks.blocks + peaks.dedicated),
+            (unsigned long long)peaks.blocks, (unsigned long long)peaks.dedicated,
+            (unsigned long long)peaks.block_used_at_commit, (unsigned long long)peaks.occupied);
+    if (g_mem_reclaim)
+        LOGV("[image-reclaim-before-grow] runs=%llu probes=%llu images=%llu span_bytes=%llu fits_after_reclaim=%llu peak_us=%.3f dedicated_runs=%llu dedicated_bytes=%llu single_span_fits=%llu",
+            (unsigned long long)reclaim_runs, (unsigned long long)reclaim_probes, (unsigned long long)reclaim_images,
+            (unsigned long long)reclaim_span_bytes, (unsigned long long)reclaimed_reuses, reclaim_peak_ns / 1e3,
+            (unsigned long long)reclaim_dedicated_runs, (unsigned long long)reclaim_dedicated_bytes,
+            (unsigned long long)reclaim_single_fits);
+    if (release_live || release_retired)
+        LOGV("[texel-buffer-release] live_probes=%llu retired_probes=%llu views_destroyed=%llu",
+            (unsigned long long)release_live, (unsigned long long)release_retired, (unsigned long long)release_destroyed);
+    if (pressure_events)
+        LOGV("[image-allocation-pressure] frame=%llu memory_errors=%llu recovered=%llu",
+            (unsigned long long)(&g_frame_pub ? g_frame_pub : 0),
+            (unsigned long long)pressure_events, (unsigned long long)pressure_recovered);
+    if (retry_attempts)
+        LOGV("[image-realization-retry] frame=%llu attempts=%llu recovered=%llu",
+            (unsigned long long)(&g_frame_pub ? g_frame_pub : 0),
+            (unsigned long long)retry_attempts, (unsigned long long)retry_recovered);
+    if (pool_detached)
+        LOGV("[pool-images] detached=%llu awaiting_owners=%llu retired=%llu base_bytes_retired=%llu",
+            (unsigned long long)pool_detached, (unsigned long long)(pool_detached - pool_retired),
+            (unsigned long long)pool_retired, (unsigned long long)pool_retired_bytes);
 }
 void vk_res_stats(void) {
+    pthread_mutex_lock(&g_mem_mu);
+    uint64_t blocks = g_mem_block_bytes, dedicated = g_mem_dedicated_bytes;
+    pthread_mutex_unlock(&g_mem_mu);
     pthread_mutex_lock(&g_tex_mu);
     if (g_wb_done || g_nwb || g_wb_skip_cpu) LOGV("GPU write-back: %llu renderings written back (%llu MiB), %llu skipped (CPU wrote since), %llu superseded by GPU copies, %llu aged out, %llu unsupported; %d waiting",
         (unsigned long long)g_wb_done, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu, (unsigned long long)g_wb_superseded, (unsigned long long)g_wb_aged, (unsigned long long)g_wb_skip_fmt, g_nwb);
     LOGV("textures: %u live, %llu images made (%llu storage-shared reuses; %llu CPU-pool images the GPU rendered into shared, %llu serials switched to them; %llu compressible format splits, %llu cross-format shares), %llu uploads + %llu re-uploads (%llu MiB); GPU memory %llu MiB in blocks + %llu MiB dedicated",
          g_by_serial.n, (unsigned long long)g_stat_images, (unsigned long long)g_stat_shared_hits, (unsigned long long)g_stat_published, (unsigned long long)g_stat_switched, (unsigned long long)g_stat_compsplit, (unsigned long long)g_stat_xfmt, (unsigned long long)g_stat_uploads, (unsigned long long)g_stat_reuploads,
-         (unsigned long long)(g_stat_upload_bytes >> 20), (unsigned long long)(g_mem_block_bytes >> 20), (unsigned long long)(g_mem_dedicated_bytes >> 20));
+         (unsigned long long)(g_stat_upload_bytes >> 20), (unsigned long long)(blocks >> 20), (unsigned long long)(dedicated >> 20));
     pthread_mutex_unlock(&g_tex_mu);
 }
 

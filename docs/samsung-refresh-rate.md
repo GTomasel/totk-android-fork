@@ -89,6 +89,14 @@ this does not prove full memory stability. Refresh votes do not resolve the inde
 Samsung Standard60Hz and restoration to Adaptive120Hz were checked with the latest build. The original global
 setting was restored; app code writes no global refresh setting.
 
+Build 10052 recorded 60 Hz in all 83 live samples of a controller-driven
+Depths and surface trial with Standard selected at launch. Switching to
+Adaptive during that session left the active mode at 60 Hz. After reopening
+under Adaptive, ten samples across 51 seconds of controller-only surface
+play all reported 120 Hz. Build 10051 also held 120 Hz across all 169 live
+samples in the aged Akkala round trip. See the
+[device report](s23-device-validation.md#return-warp-validation-after-the-optimization-goal).
+
 On a Samsung device, use the same save, scene and graphics settings for the original and patched builds:
 
 1. With Adaptive/high refresh selected, record actual display refresh and delivered game frames for at least

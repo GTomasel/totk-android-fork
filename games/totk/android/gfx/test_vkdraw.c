@@ -1730,16 +1730,100 @@ static void settled_expected(const tex_t *t, uint8_t *expected) {
     }
     free(linear);
 }
+/* Lavapipe imports host memory rather than exporting dma-bufs. A test-only
+   backend attachment supplies a real shared fd's second CPU map so the actual
+   vk_res landing, not a replacement swizzler/store, exercises private aliases. */
+static uint8_t *settled_guest_memory(size_t bytes, int *fd) {
+    const char *setting = getenv("TOTK_WB_ALIAS");
+    *fd = -1;
+    if (setting && !strcmp(setting, "1")) {
+        *fd = memfd_create("totk-wb-alias-fixture", MFD_CLOEXEC);
+        if (*fd < 0 || ftruncate(*fd, bytes)) DIE("write-back alias fixture backing");
+    }
+    return mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+        MAP_SHARED | (*fd < 0 ? MAP_ANONYMOUS : 0), *fd, 0);
+}
+static void settled_guest_alias(uint8_t *memory, size_t bytes, int fd) {
+    if (fd < 0) return;
+    CHECK(vk_wb_test_alias_attach(memory, bytes, fd, 0), "real fd-backed private alias attaches to lavapipe owner");
+    close(fd);
+}
+/* Exhaust the real watch registry, not a substituted tracked flag. Full
+   synchronous invalidate still admits this record, but must keep the legacy
+   guest destination because no recorded watch/ownership eligibility exists. */
+static int wb_alias_watch_exhaustion(void) {
+    enum { POOL_BYTES = 2 << 20, WATCHES = 4096 };
+    setenv("TOTK_VK_WRITEBACK", "1", 1); setenv("TOTK_VK_OFF", "settledwb", 1);
+    int fd; uint8_t *memory = settled_guest_memory(POOL_BYTES, &fd);
+    if (memory == MAP_FAILED) DIE("watch exhaustion mapping");
+    pool_t pool = {.mem = memory, .size = POOL_BYTES,
+        .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    mtl_init(); mtl_pool_add(memory, pool.size); settled_guest_alias(memory, pool.size, fd);
+    nvn_dirty_add_range(memory, pool.size);
+    tex_t texture = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
+        .width = 8, .height = 8, .depth = 1, .levels = 1}, .mem = memory + 128, .pool = &pool, .serial = 75500};
+    nvn_tex_layout(&texture.d, &texture.L);
+    memset(memory, 0x39, pool.size);
+    uint8_t *expected = malloc(texture.L.size); settled_expected(&texture, expected);
+    void **watches = calloc(WATCHES, sizeof *watches); unsigned used = 0;
+    uint64_t stamp = nvn_dirty_now();
+    for (; used < WATCHES; used++) {
+        watches[used] = nvn_dirty_wb_watch(memory + (1 << 20), 1, stamp);
+        if (!watches[used]) break;
+    }
+    CHECK(used == WATCHES, "all 4096 real watch slots held");
+    void *extra = nvn_dirty_wb_watch(texture.mem, texture.L.size, stamp);
+    CHECK(!extra, "target cannot allocate a rendering watch when slots exhausted");
+    nvn_dirty_wb_unwatch(extra);
+    nvn_dirty_protect(texture.mem, texture.L.size);
+    settled_render(&texture);
+    CHECK(mtl_wait(run(), 5000000000ull), "watch-exhausted GPU producer completes");
+    uint64_t before[7], after[7], faults0, preps0, faults1, preps1;
+    vk_wb_test_stats(before); nvn_dirty_stats(&faults0, &preps0); stamp = nvn_dirty_now();
+    uint64_t paths_before[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    uint64_t paths_after[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    vk_wb_test_alias_counts(paths_before);
+    mtl_pool_invalidate(&pool, (uint64_t)(texture.mem - memory), texture.L.size);
+    nvn_dirty_stats(&faults1, &preps1); vk_wb_test_stats(after);
+    vk_wb_test_alias_counts(paths_after);
+    if (vk_wb_alias_enabled()) {
+        CHECK(paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0] + 1 &&
+              paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][1] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][1] + texture.L.size,
+            "actual no-watch landing counts one ownership fallback and its exact logical bytes");
+        CHECK(paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] ==
+                  paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0],
+            "no-watch fallback is not mislabeled as an alias operation");
+    } else CHECK(!paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_OWNERSHIP][0],
+        "disabled telemetry stays empty for the no-token legacy landing");
+    CHECK(before[2] == 1 && !after[2] && !after[5], "full synchronous invalidate consumes the no-watch record and staging");
+    CHECK(!memcmp(texture.mem, expected, texture.L.size), "no-watch legacy landing retains exact contents and padding");
+    CHECK(faults1 > faults0 && nvn_dirty_since(texture.mem, texture.L.size, stamp),
+        "no-token landing uses protected guest VA and ordinary fault/generation path, never unowned private alias");
+    CHECK(!nvn_dirty_wb_written(watches[0]), "unrelated exhausted-slot watch remains armed");
+    uint64_t latest = nvn_dirty_now(); lag_guest_store(texture.mem, texture.mem[0]);
+    CHECK(nvn_dirty_now() == latest, "legacy no-token landing leaves originally faulted destination writable");
+    for (unsigned i = 0; i < used; i++) nvn_dirty_wb_unwatch(watches[i]);
+    free(watches); free(expected); mtl_tex_release(&texture);
+    nvn_dirty_remove_range(memory); mtl_pool_del(memory); munmap(memory, pool.size);
+    printf("%s: watch-exhausted synchronous landing alias=%d slots=%u checks=%d failed=%d\n",
+        fails ? "FAILED" : "ok", vk_wb_alias_enabled(), used, checks, fails);
+    return fails != 0;
+}
+
 static int settled_child(int disabled) {
     const char *setting = getenv("TOTK_VK_SETTLED_WB_SUBS");
     unsigned quiet = setting ? (unsigned)strtoul(setting, NULL, 10) : 60;
     CHECK(getenv("TOTK_VK_WRITEBACK") == NULL, "settled fixture never enables synchronous write-back");
     enum { POOL_BYTES = 1 << 20 };
-    uint8_t *memory = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int alias_fd;
+    uint8_t *memory = settled_guest_memory(2 * POOL_BYTES, &alias_fd);
     if (memory == MAP_FAILED) { perror("settled mmap"); return 1; }
     pool_t pool = {.mem = memory, .size = POOL_BYTES,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     mtl_init(); mtl_pool_add(memory, 2 * POOL_BYTES); mtl_pool_add(pool.mem, pool.size);
+    settled_guest_alias(memory, 2 * POOL_BYTES, alias_fd);
     nvn_dirty_add_range(memory, 2 * POOL_BYTES);
     tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
         .width = 260, .height = 260, .depth = 1, .levels = 9}, .mem = memory, .pool = &pool, .serial = 73001};
@@ -1750,6 +1834,12 @@ static int settled_child(int disabled) {
     size_t untouched = 0; for (size_t i = 0; i < t.L.size; i++) untouched += memory[i] != 0x39;
     CHECK(!untouched, "GPU rendering initially leaves every guest backing byte untouched");
     mtl_tex_release(&t); /* the write-back reference must keep the image, not its temporary texture object */
+    uint64_t landing_stamp = nvn_dirty_now();
+    nvn_dirty_mp_count mp_before[NVN_DIRTY_MP_REASON_COUNT], mp_after[NVN_DIRTY_MP_REASON_COUNT];
+    nvn_dirty_mp_reason_stats(mp_before);
+    uint64_t paths_before[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    uint64_t paths_after[VK_WB_ALIAS_SITE_COUNT][VK_WB_ALIAS_PATH_COUNT][2];
+    vk_wb_test_alias_counts(paths_before);
     settled_idle(quiet + 2); vk_wb_test_stats(after);
     if (!disabled) { settled_wait_landed(before[0] + 1); vk_wb_test_stats(after); }
     if (disabled) {
@@ -1758,8 +1848,23 @@ static int settled_child(int disabled) {
             "TOTK_VK_OFF=settledwb preserves every uploaded byte and allocates no staging");
     } else {
         CHECK(!memcmp(memory, expected, t.L.size), "all nine levels and padding equal the rendered NVN-layout reference without invalidate");
+        vk_wb_test_alias_counts(paths_after);
+        if (vk_wb_alias_enabled()) CHECK(
+            paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] >
+                paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0] &&
+            paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][1] -
+                paths_before[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][1] == t.L.size,
+            "real nine-level landing reports alias path operations and exact logical span bytes");
+        else CHECK(!paths_after[VK_WB_ALIAS_LANDING][VK_WB_ALIAS_PATH_ALIAS][0],
+            "disabled telemetry records no alias landing operations");
         CHECK(after[0] == before[0] + 1 && after[1] == before[1] + t.L.size && !after[2] && !after[5],
             "exactly one settled rendering lands and releases staging/image record (%llu bytes)", (unsigned long long)t.L.size);
+        CHECK(!nvn_dirty_since(memory, t.L.size, landing_stamp), "GPU landing changes no CPU dirty generation");
+        nvn_dirty_mp_reason_stats(mp_after);
+        if (vk_wb_alias_enabled()) CHECK(
+            mp_after[NVN_DIRTY_MP_GPU_WRITE].calls == mp_before[NVN_DIRTY_MP_GPU_WRITE].calls &&
+            mp_after[NVN_DIRTY_MP_RESTORE].calls == mp_before[NVN_DIRTY_MP_RESTORE].calls,
+            "private-alias nine-level landing emits zero guest GPU unprotect/restore calls");
         uint64_t tile[6], tile_after[6], sync_before[7], sync_after[7]; vk_wb_test_tile(&t, tile);
         CHECK(tile[0] && tile[0] == tile[1] && tile[3] == t.serial,
             "tile evidence retains the exact landed GPU version/serial after the pending record is dropped");
@@ -1944,6 +2049,69 @@ static int settled_child(int disabled) {
         disabled ? "off" : "on", quiet, checks, fails);
     return fails != 0;
 }
+static int detached_write_back_checks(void) {
+    extern void vk_res_test_pool_images(uint64_t stats[3]);
+    unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF");
+    setenv("TOTK_VK_SETTLED_WB_SUBS", "4", 1);
+    enum { POOL_BYTES = 256 * 1024 };
+    uint8_t *memory = mmap(NULL, POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) DIE("detached writer memory");
+    pool_t pool = {.mem = memory, .size = POOL_BYTES,
+                   .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd, .width = 128, .height = 128,
+                     .depth = 1, .levels = 1}, .mem = memory, .pool = &pool, .serial = 73000};
+    nvn_tex_layout(&t.d, &t.L);
+    mtl_init(); mtl_pool_add(memory, POOL_BYTES); nvn_dirty_add_range(memory, POOL_BYTES);
+    memset(memory, 0x39, POOL_BYTES);
+    settled_render(&t);
+    CHECK(mtl_wait(run(), 5000000000ull), "the producer for the shared, CPU-backed image completes");
+    settled_idle(3);
+    VkEvent gate;
+    VkEventCreateInfo ci = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VKCHECK(vkCreateEvent(V.dev, &ci, NULL, &gate));
+    mtl_sub_begin();
+    vk_tex *old = vk_tex_get(&t);
+    CHECK(old, "old serial retains its shared image");
+    if (!old) return 1;
+    vkCmdWaitEvents(vk_cb(), 1, &gate, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, NULL, 0, NULL, 0, NULL);
+    uint64_t ticket = mtl_sub_commit();
+    uint64_t wb[7], stats[3], resources[8], queue[6];
+    vk_wb_test_stats(wb); vk_res_mem(resources);
+    CHECK(wb[2] == 1 && wb[5] && resources[4] == 1 && !mtl_wait(ticket, 0),
+          "a real gated staging copy pins the shared image");
+    vk_wb_test_queue(queue);
+    CHECK(queue[2] == 1, "the pending copy counts as one staged queue entry");
+    /* Exercise the lifetime notifications without destroying the physically
+       registered guest buffer, which itself must wait for submitted work. */
+    vk_wb_range_gone((uintptr_t)memory, (uintptr_t)memory + POOL_BYTES);
+    vk_tex_pool_gone((uintptr_t)memory, (uintptr_t)memory + POOL_BYTES);
+    vk_rec_lock();
+    vk_tex_mark_gpu_written(old);
+    vk_rec_unlock();
+    vk_wb_test_stats(wb);
+    CHECK(wb[2] == 1, "a write on a detached serial cannot re-arm guest stores");
+    mtl_tex_release(&t);
+    vk_res_test_pool_images(stats); vk_res_mem(resources);
+    CHECK(stats[0] == 1 && !stats[1] && !resources[4] && resources[7],
+          "the retired storage is unreachable by new serials while the copy still holds it");
+    VKCHECK(vkSetEvent(V.dev, gate));
+    CHECK(mtl_wait(ticket, 5000000000ull), "the cancelled copy completes");
+    settled_idle(3);
+    vk_wb_test_stats(wb); vk_res_test_pool_images(stats); vk_res_mem(resources);
+    CHECK(!wb[0] && !wb[2] && !wb[5] && stats[1] == 1 && stats[2] && !resources[7],
+          "completion drops the pin, staging and image without landing bytes");
+    vk_wb_test_queue(queue);
+    CHECK(!queue[2], "a cancelled copy leaves the staged queue after its fence");
+    size_t changed = 0;
+    for (size_t i = 0; i < t.L.size; i++) changed += memory[i] != 0x39;
+    CHECK(!changed, "the old GPU result does not write into the guest range");
+    vkDestroyEvent(V.dev, gate, NULL);
+    nvn_dirty_remove_range(memory); mtl_pool_del(memory); munmap(memory, POOL_BYTES);
+    printf("%s: detached write-back %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 static int settled_learning(void) {
     enum { POOL_BYTES = 32 << 20, TILES = 64, STRIDE = 0x60000, PERIOD = 100, ROUNDS = 40 };
     unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF"); unsetenv("TOTK_VK_SETTLED_WB_SUBS");
@@ -2114,9 +2282,11 @@ static int settled_cpu_writes(void) {
     CHECK(provenance && !nvn_dirty_wb_written(provenance) && !nvn_dirty_wb_cpu_address(provenance) &&
         !nvn_dirty_since(early + 128, 256, own_stamp),
         "our landing token/store/restoration publishes no CPU write address or dirty generation");
+    uint64_t watched_revision = nvn_dirty_wb_write_revision();
     lag_guest_store(early + 129, 0x58);
     CHECK(nvn_dirty_wb_written(provenance) && nvn_dirty_wb_cpu_address(provenance) == (uintptr_t)early + 129,
         "a genuine direct CPU write records its exact byte inside the watched range");
+    CHECK(nvn_dirty_wb_write_revision() > watched_revision, "CPU ownership revokes the recorder's quiet hint");
     nvn_dirty_wb_unwatch(provenance);
     provenance = nvn_dirty_wb_watch(early + 128, 256, nvn_dirty_now());
     lag_guest_store(early + 400, 0x59);
@@ -2127,6 +2297,12 @@ static int settled_cpu_writes(void) {
         target.serial++; settled_render(&target);
         CHECK(mtl_wait(run(), 5000000000ull), "CPU-write cycle %u GPU re-arm completes", cycle);
         mtl_tex_release(&target);
+        uint64_t queue_before[6], queue_after[6];
+        vk_wb_test_queue(queue_before);
+        settled_idle(1);
+        vk_wb_test_queue(queue_after);
+        CHECK(queue_after[5] == queue_before[5] + 1,
+            "cycle %u skips the scan before the CPU write and learned deadline", cycle);
         uint64_t faults0, preps0, wb0, wbp0, waits0, host0, ns0;
         nvn_dirty_stats(&faults0, &preps0); nvn_dirty_wb_stats(&wb0, &wbp0);
         nvn_dirty_lag_stats(&waits0, &host0, &ns0);
@@ -2301,6 +2477,179 @@ static int settled_budget(void) {
     free(expected); free(snapshot); munmap(memory, POOL_BYTES);
     printf("%s: settled budget %d checks, %d failed; 1-MiB/2-ms cooperative sweeps, partial CPU/GPU/pool cancellation, complete invalidate\n",
         fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
+static int settled_admission(const char *mode) {
+    int combined = !strcmp(mode, "both");
+    int count_limited = combined || !strcmp(mode, "count");
+    int bytes_limited = combined || !strcmp(mode, "bytes");
+    if (!count_limited && !bytes_limited && strcmp(mode, "unlimited")) return 2;
+    unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF");
+    setenv("TOTK_VK_SETTLED_WB_SUBS", "4", 1);
+    setenv("TOTK_VK_WB_AUTO_COPY_LIMIT", count_limited ? "1" : "0", 1);
+    setenv("TOTK_VK_WB_AUTO_STAGING_MB", bytes_limited ? "1" : "0", 1);
+    enum { TARGETS = 4, STRIDE = 4 << 20, BYTES = TARGETS * STRIDE };
+    uint8_t *memory = mmap(NULL, BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    uint8_t *expected = malloc(STRIDE);
+    if (memory == MAP_FAILED || !expected) DIE("write-back admission fixture backing");
+    pool_t pool = {.mem = memory, .size = BYTES, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    mtl_init(); mtl_pool_add(memory, BYTES); nvn_dirty_add_range(memory, BYTES);
+    tex_t target[TARGETS];
+    for (unsigned i = 0; i < TARGETS; i++) {
+        target[i] = (tex_t){.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd, .width = i == 2 ? 1024 : 768,
+                                .height = i == 2 ? 1024 : 512, .depth = 1, .levels = 1},
+                            .mem = memory + i * STRIDE, .pool = &pool, .serial = 84000 + i};
+        nvn_tex_layout(&target[i].d, &target[i].L);
+        CHECK(target[i].L.size <= STRIDE, "each admission target has independent backing");
+        memset(target[i].mem, 0x39, target[i].L.size);
+        settled_render(&target[i]);
+    }
+    CHECK(mtl_wait(run(), 5000000000ull), "all producers complete in the same submission");
+    for (unsigned i = 0; i < TARGETS; i++) mtl_tex_release(&target[i]);
+    lag_guest_store(target[3].mem, 0x71);
+    settled_idle(3);
+
+    VkEvent gate;
+    VkEventCreateInfo ci = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VKCHECK(vkCreateEvent(V.dev, &ci, NULL, &gate));
+    mtl_sub_begin();
+    vkCmdWaitEvents(vk_cb(), 1, &gate, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, NULL, 0, NULL, 0, NULL);
+    uint64_t copy = mtl_sub_commit(), stats[7];
+    vk_wb_test_stats(stats);
+    CHECK(!mtl_wait(copy, 0), "first eligible seal holds the real copies in flight");
+    CHECK(stats[2] == 3 && stats[3] == 1 && target[3].mem[0] == 0x71,
+          "stale CPU-owned target is cancelled while other textures remain pending");
+    CHECK(stats[6] == (count_limited || bytes_limited ? 1 : 3) && stats[5],
+          "the first eligible seal admits the expected number of background copies");
+    printf("admission %s first seal: %llu copies, %llu staging bytes\n",
+           mode, (unsigned long long)stats[6], (unsigned long long)stats[5]);
+    if (bytes_limited) CHECK(stats[5] <= (1 << 20), "the first in-flight staging allocation fits the byte limit");
+    VKCHECK(vkSetEvent(V.dev, gate));
+    CHECK(mtl_wait(copy, 5000000000ull), "admitted copies complete");
+    vkDestroyEvent(V.dev, gate, NULL);
+
+    if (count_limited || bytes_limited) {
+        vk_wb_test_stats(stats);
+        CHECK(stats[5] && stats[6] == 1 && target[1].mem[0] == 0x39,
+              "explicit invalidation begins while staging is live and its own copy is still deferred");
+    }
+    uint64_t invalidates = vk_wb_test_invalidates();
+    mtl_pool_invalidate(&pool, STRIDE, target[1].L.size);
+    settled_expected(&target[1], expected);
+    CHECK(!memcmp(target[1].mem, expected, target[1].L.size) && vk_wb_test_invalidates() == invalidates + 1,
+          "explicit invalidate lands matching full texture data even under the background limit");
+
+    settled_wait_landed(3);
+    vk_wb_test_stats(stats);
+    CHECK(stats[0] == 3 && !stats[2] && !stats[5] && stats[6] == 3,
+          "all targets land once and eventually release their staging, including the oversized target");
+    for (unsigned i = 0; i < 3; i++) {
+        settled_expected(&target[i], expected);
+        CHECK(!memcmp(target[i].mem, expected, target[i].L.size), "matching bytes for target %u", i);
+    }
+    CHECK(target[3].mem[0] == 0x71, "the cancelled target retains its newer CPU bytes");
+    vk_wb_stats(); nvn_dirty_remove_range(memory); mtl_pool_del(memory); settled_idle(2);
+    free(expected); munmap(memory, BYTES);
+    printf("%s: settled admission %s %d checks, %d failed\n", fails ? "FAILED" : "ok", mode, checks, fails);
+    return fails != 0;
+}
+
+static int settled_invalidate_batches(int skip_quiet) {
+    enum { MAX_BATCH = 64, STRIDE = 64 << 10, BYTES = (MAX_BATCH + 2) * STRIDE };
+    const unsigned batches[] = {1, 4, 5, MAX_BATCH};
+    unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF");
+    if (!skip_quiet) setenv("TOTK_VK_OFF", "settledquietscan", 1);
+    setenv("TOTK_VK_SETTLED_WB_SUBS", "4096", 1);
+    uint8_t *memory = mmap(NULL, BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) DIE("invalidate batch mmap");
+    pool_t pool = {.mem = memory, .size = BYTES, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    mtl_init(); mtl_pool_add(memory, BYTES); nvn_dirty_add_range(memory, BYTES);
+    uint64_t serial = 85000;
+    for (unsigned scenario = 0; scenario < sizeof batches / sizeof *batches; scenario++) {
+        const unsigned n = batches[scenario];
+        tex_t target[MAX_BATCH + 2];
+        /* The first recorded target and the final recorded target are both outside
+           the invalidated range. Removing the middle must keep both lookup rows. */
+        for (unsigned i = 0; i < n + 2; i++) {
+            unsigned slot = i == 0 ? n + 1 : i == n + 1 ? 0 : i;
+            target[slot] = (tex_t){.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
+                                           .width = 32, .height = 32, .depth = 1, .levels = 1},
+                                   .mem = memory + slot * STRIDE, .pool = &pool, .serial = serial++};
+            if (slot == n + 1 && n == MAX_BATCH) {
+                target[slot].d.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+                target[slot].d.depth = 7;
+                target[slot].d.levels = 3;
+            }
+            nvn_tex_layout(&target[slot].d, &target[slot].L);
+            CHECK(target[slot].L.size <= STRIDE, "target fits its independent slot");
+            lag_guest_store(target[slot].mem, 0x39);
+            memset(target[slot].mem, 0x39, target[slot].L.size);
+            settled_render(&target[slot]);
+        }
+        CHECK(mtl_wait(run(), 5000000000ull), "batch %u producers complete", n);
+        for (unsigned i = 0; i < n + 2; i++) mtl_tex_release(&target[i]);
+        uint8_t expected[STRIDE];
+        settled_expected(&target[0], expected);
+        uint64_t before[3], after[3], counters[7];
+        uint64_t queue_before[6], queue_after[6];
+        if (n == MAX_BATCH) {
+            vk_wb_test_queue(queue_before);
+            settled_idle(64);
+            vk_wb_test_stats(counters); vk_wb_test_queue(queue_after);
+            CHECK(counters[2] == n + 2 && !queue_after[2] && queue_after[0] == queue_before[0] + 65,
+                  "64 idle submissions and the final sweep all skip the 66 quiet records");
+            CHECK(queue_after[1] == queue_before[1] && queue_after[3] == (uintptr_t)target[0].mem &&
+                  queue_after[4] == (uintptr_t)target[n + 1].mem + target[n + 1].L.size,
+                  "an unchanged queue keeps its conservative range without rebuilding it");
+            CHECK(queue_after[5] - queue_before[5] == (skip_quiet ? 64 : 0),
+                  "quiet scan arm %d skips %llu of 64 work-free seal scans",
+                  skip_quiet, (unsigned long long)(queue_after[5] - queue_before[5]));
+            memcpy(queue_before, queue_after, sizeof queue_before);
+        }
+        vk_wb_test_invalidate_batches(before);
+        mtl_pool_invalidate(&pool, STRIDE, (uint64_t)n * STRIDE);
+        vk_wb_test_invalidate_batches(after); vk_wb_test_stats(counters);
+        CHECK(after[0] == before[0] + 1 && after[1] == before[1] + (n > 4) && after[2] == n,
+              "batch %u uses %d heap allocations and preserves the selected record count", n, n > 4);
+        CHECK(counters[2] == 2 && !counters[5], "batch %u leaves only the two unselected records", n);
+        int matches = 1;
+        for (unsigned i = 1; i <= n; i++) matches &= !memcmp(target[i].mem, expected, target[i].L.size);
+        CHECK(matches && target[0].mem[0] == 0x39 && target[n + 1].mem[0] == 0x39,
+              "batch %u lands all selected bytes and leaves both neighbors untouched", n);
+        if (n == MAX_BATCH) {
+            vk_wb_test_queue(queue_after);
+            CHECK(queue_after[1] == queue_before[1], "removing only interior ranges keeps both existing bounds");
+        }
+        mtl_pool_invalidate(&pool, 0, target[0].L.size);
+        CHECK(!memcmp(target[0].mem, expected, target[0].L.size), "first neighbor is still indexed");
+        if (n == MAX_BATCH) {
+            vk_wb_test_queue(queue_after);
+            CHECK(queue_after[1] == queue_before[1] + 1 && queue_after[3] == (uintptr_t)target[n + 1].mem,
+                  "removing the lower endpoint rebuilds the range once");
+        }
+        uint64_t copies_before[2], copies_after[2];
+        vk_wb_test_copy_regions(copies_before);
+        mtl_pool_invalidate(&pool, (uint64_t)(n + 1) * STRIDE, target[n + 1].L.size);
+        vk_wb_test_copy_regions(copies_after);
+        if (n == MAX_BATCH) {
+            CHECK(copies_after[0] - copies_before[0] == 2 && copies_after[1] - copies_before[1] == 21,
+                  "a 21-region array read-back emits one full batch and one tail command");
+            settled_expected(&target[n + 1], expected);
+        }
+        vk_wb_test_stats(counters);
+        CHECK(!memcmp(target[n + 1].mem, expected, target[n + 1].L.size) && !counters[2] && !counters[5],
+              "second neighbor lands every layer/mip and leaves no pending staging after batch %u", n);
+        if (n == MAX_BATCH) {
+            vk_wb_test_queue(queue_after);
+            CHECK(queue_after[1] == queue_before[1] + 2 && !queue_after[2] &&
+                  queue_after[3] == UINT64_MAX && !queue_after[4],
+                  "the final explicit landing clears both bounds and the staged count");
+        }
+        printf("invalidate batch %u: %llu heap allocations\n", n, (unsigned long long)(after[1] - before[1]));
+    }
+    vk_wb_stats(); nvn_dirty_remove_range(memory); mtl_pool_del(memory); settled_idle(2); munmap(memory, BYTES);
+    printf("%s: settled invalidate batches %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
     return fails != 0;
 }
 
@@ -2648,11 +2997,14 @@ static void settled_race_wait(_Atomic int *flag, const char *what) {
 static int settled_race(void) {
     enum { POOL_BYTES = 1 << 20, ITERATIONS = 128 };
     unsetenv("TOTK_VK_WRITEBACK"); unsetenv("TOTK_VK_OFF"); setenv("TOTK_VK_SETTLED_WB_SUBS", "2", 1);
-    uint8_t *memory = mmap(NULL, 2 * POOL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int alias_fd;
+    uint8_t *memory = settled_guest_memory(2 * POOL_BYTES, &alias_fd);
     if (memory == MAP_FAILED) { perror("settled race mmap"); return 1; }
     pool_t pool = {.mem = memory, .size = POOL_BYTES,
         .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     mtl_init(); mtl_pool_add(memory, 2 * pool.size); mtl_pool_add(memory, pool.size); nvn_dirty_add_range(memory, 2 * pool.size);
+    settled_guest_alias(memory, 2 * pool.size, alias_fd);
+    int private_alias = vk_wb_alias_enabled();
     tex_t t = {.d = {.target = NVN_TEXTURE_TARGET_2D, .format = 0xd,
         .width = 8, .height = 8, .depth = 1, .levels = 1}, .mem = memory + 128, .pool = &pool, .serial = 74000};
     nvn_tex_layout(&t.d, &t.L);
@@ -2685,7 +3037,8 @@ static int settled_race(void) {
                 .value = (uint8_t)(0x60 + iteration % 31), .before = (uint8_t)(0xa0 + iteration % 31),
                 .after = (uint8_t)(0x20 + iteration % 31)};
             if (pthread_create(&write_thread, NULL, settled_race_write, &writer)) DIE("settled race writer thread");
-            if (phase == NVN_DIRTY_TEST_WB_PROTECTED) {
+            if (phase == NVN_DIRTY_TEST_WB_PROTECTED || (private_alias &&
+                (phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS))) {
                 settled_race_wait(&handoff.faults, "writer actually faults on the still-read-only BUSY page");
                 CHECK(!atomic_load_explicit(&writer.done, memory_order_acquire), "already-faulted writer cannot pass BUSY ownership");
             } else {
@@ -2705,7 +3058,8 @@ static int settled_race(void) {
             }
             for (unsigned i = 0; i < 64; i++) adjacent_bad += memory[i] != 0x42;
             CHECK(!adjacent_bad, "landing never touches either adjacent same-page range or its outer guard");
-            int residual = phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS;
+            int residual = !private_alias &&
+                (phase == NVN_DIRTY_TEST_WB_BEFORE_FRESHNESS || phase == NVN_DIRTY_TEST_WB_AFTER_FRESHNESS);
             if (residual) {
                 /* Stores are deliberately ordered before resuming swizzle: this demonstrates the coherency hole
                    itself, without an undefined C data race or a TSan suppression masking it. */
@@ -2716,7 +3070,7 @@ static int settled_race(void) {
                 CHECK(!texture_bad, "CPU bytes survive the protocol's guaranteed interleaving");
                 CHECK(phase == NVN_DIRTY_TEST_WB_BEFORE_OWNERSHIP ?
                     after[0] == before[0] && after[3] == before[3] + 1 :
-                    phase == NVN_DIRTY_TEST_WB_PROTECTED ?
+                    phase != NVN_DIRTY_TEST_WB_RESTORED ?
                     after[0] - before[0] + after[3] - before[3] == 1 :
                     after[0] == before[0] + 1 && after[3] == before[3],
                     "CPU-before-ownership rejects; fault under RO may cancel before freshness or store last; restored writer stores last");
@@ -2807,15 +3161,106 @@ static int nativeui_geometry(void) {
     return fails ? 1 : 0;
 #endif
 }
+static int descriptor_idle_trim(int enabled) {
+    enum { SLOTS = 8, WINDOW = SLOTS * VK_DESC_IDLE_GENERATIONS };
+    mtl_init();
+    CHECK(vk_desc_trim_idle() == enabled, "descriptor idle launch mode");
+    CHECK(vk_record_test_descriptor_idle(enabled), "recorder preserves a busy window, trims a quiet window and regrows");
+    VkDescriptorSetLayoutBinding binding = {.binding = 0, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1, .pBindings = &binding};
+    VkDescriptorSetLayout layout;
+    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &ci, NULL, &layout));
+
+    mtl_sub_begin();
+    for (unsigned i = 0; i <= 2 * VK_DESC_PRIMARY_POOL_SETS; i++) (void)vk_alloc_set(layout);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "primary burst retires");
+    uint64_t retained[4], before[8] = {0}, after[8];
+    vk_record_test_descriptor_retained(retained);
+    CHECK(retained[1] == 3, "primary burst uses three pools");
+    for (unsigned i = 0; i < 2 * WINDOW; i++) {
+        mtl_sub_begin();
+        (void)vk_cb();
+        if (i != WINDOW - 1) (void)vk_alloc_set(layout);
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "primary quiet submission %u retires", i);
+        if (i == WINDOW - 1) {
+            vk_record_test_descriptor_retained(retained);
+            CHECK(retained[1] == SLOTS + 2, "busy window keeps the burst pools");
+            vk_record_test_descriptors(before);
+        }
+    }
+    vk_record_test_descriptor_retained(retained);
+    vk_record_test_descriptors(after);
+    uint64_t resets = after[2] - before[2];
+    CHECK(retained[1] == (enabled ? SLOTS : SLOTS + 2), "primary quiet window retention");
+    CHECK(resets == (enabled ? WINDOW - 1 : (SLOTS + 2) * VK_DESC_IDLE_GENERATIONS), "primary quiet window resets");
+    printf("descriptor-idle primary: retained=%llu quiet-resets=%llu\n",
+        (unsigned long long)retained[1], (unsigned long long)resets);
+    for (unsigned i = 1; i < SLOTS; i++) {
+        mtl_sub_begin();
+        (void)vk_cb();
+        CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "advance to the original burst slot");
+    }
+    mtl_sub_begin();
+    for (unsigned i = 0; i <= 2 * VK_DESC_PRIMARY_POOL_SETS; i++) (void)vk_alloc_set(layout);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "primary regrowth submission retires");
+    vk_record_test_descriptor_retained(retained);
+    CHECK(retained[1] == SLOTS + 2, "primary can regrow to the burst count");
+    uint64_t retire_checks, violations;
+    vk_test_descriptor_pools_stats(&retire_checks, &violations);
+    CHECK(retire_checks >= 2 * WINDOW && !violations, "all pool operations follow slot retirement");
+    vkDestroyDescriptorSetLayout(V.dev, layout, NULL);
+    printf("%s: descriptor idle trim %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+    return fails != 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--descriptor-batch")) {
+        int enabled = !strcmp(argv[2], "on");
+        if (!enabled && strcmp(argv[2], "off")) return 2;
+        mtl_init();
+        CHECK(vk_record_test_descriptor_batch(enabled), "descriptor batching bounds unused sets and resets the cache");
+        printf("%s: descriptor batch %d checks, %d failed\n", fails ? "FAILED" : "ok", checks, fails);
+        return fails != 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--descriptor-idle-trim")) {
+        if (!strcmp(argv[2], "on")) return descriptor_idle_trim(1);
+        if (!strcmp(argv[2], "off")) return descriptor_idle_trim(0);
+        return 2;
+    }
+#ifdef __linux__
+    if (argc == 3 && !strcmp(argv[1], "--rec-discard-free")) {
+        int enabled = !strcmp(argv[2], "on");
+        if (!enabled && strcmp(argv[2], "off")) return 2;
+        uint64_t outcome[8];
+        vk_record_test_discard_free(enabled, outcome);
+        CHECK(outcome[1] == outcome[0], "recently freed pages stay resident");
+        CHECK(outcome[2] + outcome[4] == outcome[0] && (!enabled || outcome[4] > 0),
+              "the kernel drops only the eligible resident payload");
+        CHECK(outcome[3] == (uint64_t)enabled && (enabled || !outcome[4]),
+              "repeated trimming avoids advising already discarded pages");
+        CHECK(outcome[5] && outcome[6], "neighbors stay intact and the released block is reused");
+        CHECK(outcome[7] == (1u << 20), "ordinary cleanup still releases the complete empty slab");
+        printf("%s: recorder free pages %s, %llu to %llu KiB resident, %d checks, %d failed\n",
+            fails ? "FAILED" : "ok", enabled ? "on" : "off",
+            (unsigned long long)(outcome[0] >> 10), (unsigned long long)(outcome[2] >> 10), checks, fails);
+        return fails != 0;
+    }
+#endif
+    if (argc == 2 && !strcmp(argv[1], "--wb-alias-watch-exhaustion")) return wb_alias_watch_exhaustion();
     if (argc == 2 && !strcmp(argv[1], "--nativeui-geometry")) return nativeui_geometry();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-service")) return settled_service();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-budget")) return settled_budget();
+    if (argc == 3 && !strcmp(argv[1], "--settled-wb-admission")) return settled_admission(argv[2]);
+    if (argc == 2 && !strcmp(argv[1], "--settled-wb-invalidate-batches")) return settled_invalidate_batches(1);
+    if (argc == 2 && !strcmp(argv[1], "--settled-wb-invalidate-batches-control")) return settled_invalidate_batches(0);
     if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--settled-wb-preflight")) return settled_preflight(argc == 3 ? argv[2] : NULL);
     if (argc == 3 && !strcmp(argv[1], "--settled-wb-cutout")) return settled_cutout(argv[2]);
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-cpu")) return settled_cpu_writes();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-learning")) return settled_learning();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb-race")) return settled_race();
+    if (argc == 2 && !strcmp(argv[1], "--detached-write-back")) return detached_write_back_checks();
     if (argc == 2 && !strcmp(argv[1], "--settled-wb")) return settled_suite();
     if (argc == 3 && !strcmp(argv[1], "--settled-wb-child")) return settled_child(!strcmp(argv[2], "off"));
     if (argc == 1 && settled_suite()) return 1;

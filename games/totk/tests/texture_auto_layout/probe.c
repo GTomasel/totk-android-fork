@@ -95,6 +95,14 @@ int main(void) {
             fprintf(stderr,"driver case %s: size %llu layer %llu level1 %llu align %u block %u/%u, driver %llu %llu %llu %u %u/%u\n",c->what,
                     (unsigned long long)l.size,(unsigned long long)l.layer_size,(unsigned long long)off1,l.align,l.tileH,l.tileD,
                     (unsigned long long)c->size,(unsigned long long)c->layer,(unsigned long long)c->off1,c->align,c->th,c->td);return 1;}
+        if (c->levels > 1) {
+            unsigned layer = l.layers - 1, th, td;
+            uint32_t row_bytes, rows, slices, bpb;
+            uint64_t base;
+            check(!nvn_deswizzle_geom(&d, 1, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb),
+                  "driver mip geometry can be decoded");
+            check(base == c->off1 + layer * c->layer, "deswizzle address matches the driver mip and layer offsets");
+        }
     }
     puts("PASS: 40 original-SDK layout goldens, 15 original-driver shapes, shrine BC3 block addresses, explicit-layout override.");
     return 0;

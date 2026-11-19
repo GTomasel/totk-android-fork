@@ -170,8 +170,8 @@ void vk_seed_io_test_before_read(const char *name) {
 extern unsigned vk_seed_io_test_waiters(const char *name);
 static void *warm_reader(void *unused) { (void)unused; expect("key00000.spv", 8, 'A'); return NULL; }
 static void demand_bypasses_warm(void) {
-    CHECK(!mkdir("bypass", 0700)); fixture("bypass/seed.vkpack", 3, 8);
-    text("bypass-used.txt", "TOTKSEED1\nkey00000.spv\nkey00001.spv\n");
+    CHECK(!mkdir("bypass", 0700)); fixture("bypass/seed.vkpack", 5, 8);
+    text("bypass-used.txt", "TOTKSEED1\nkey00000.spv\nkey00001.spv\nkey00002.spv\nkey00003.spv\n");
     pthread_mutex_lock(&hold_mu); hold_read = 1; read_entered = 0; pthread_mutex_unlock(&hold_mu);
     vk_seed_io_start("bypass", "bypass-used.txt"); CHECK(vk_seed_io_ready());
     pthread_mutex_lock(&hold_mu);
@@ -179,7 +179,7 @@ static void demand_bypasses_warm(void) {
     pthread_mutex_unlock(&hold_mu);
     /* The only worker is held on key0. Both a queued learned key and an unseen
        key must complete inline, without releasing it or reading either twice. */
-    expect("key00001.spv", 8, 'B'); expect("key00002.spv", 8, 'C');
+    expect("key00002.spv", 8, 'C'); expect("key00004.spv", 8, 'E');
     vk_seed_io_stats s; vk_seed_io_stats_get(&s);
     CHECK(s.demand_reads == 2 && s.warm_bypassed == 1 && !s.worker_reads);
     pthread_t threads[2];
@@ -190,7 +190,10 @@ static void demand_bypasses_warm(void) {
     pthread_mutex_lock(&hold_mu); hold_read = 0; pthread_cond_broadcast(&hold_cv); pthread_mutex_unlock(&hold_mu);
     for (i = 0; i < 2; i++) CHECK(!pthread_join(threads[i], NULL));
     wait_warm(); vk_seed_io_stats_get(&s);
-    CHECK(s.worker_reads == 1 && s.warm_joins == 2 && s.demand_reads == 2 && !s.cached_bytes);
+    CHECK(s.worker_reads == 3 && s.warm_joins == 2 && s.demand_reads == 2 && s.cached_bytes == 16);
+    expect("key00001.spv", 8, 'B'); expect("key00003.spv", 8, 'D');
+    vk_seed_io_stats_get(&s);
+    CHECK(s.warmed_hits == 2 && s.demand_reads == 2 && !s.cached_bytes);
     vk_seed_io_stop();
     CHECK(!unlink("bypass/seed.vkpack")); CHECK(!unlink("bypass-used.txt")); CHECK(!rmdir("bypass"));
 }
@@ -241,12 +244,59 @@ static void realistic_scale(void) {
         (unsigned long long)s.cached_bytes, (unsigned long long)s.warm_skipped);
     vk_seed_io_stop(); unlink("scale-used.txt"); unlink("scale/seed.vkpack"); CHECK(!rmdir("scale"));
 }
+#if defined(__linux__)
+static void check_pack_mapping(void) {
+    FILE *maps = fopen("/proc/self/smaps", "r");
+    CHECK(maps);
+    char line[1024];
+    unsigned mappings = 0;
+    size_t resident_kib = 0, kib;
+    int pack = 0;
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long lo, hi;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) {
+            pack = strstr(line, "/inventory/seed.vkpack") != NULL;
+            mappings += pack;
+        } else if (pack && sscanf(line, "Rss: %zu kB", &kib) == 1) {
+            resident_kib += kib;
+        }
+    }
+    CHECK(!fclose(maps));
+    printf("seed pack after indexing: %u mappings, %zu KiB resident\n", mappings, resident_kib);
+    fflush(stdout);
+    CHECK(mappings == 0);
+}
+#endif
+static void full_inventory(void) {
+    CHECK(!mkdir("inventory", 0700)); fixture("inventory/seed.vkpack", 71400, 8);
+    text("inventory/key13104.spv", "ZZZ");
+    vk_seed_io_start("inventory", NULL);
+    CHECK(vk_seed_io_ready());
+    vk_seed_io_stats s; vk_seed_io_stats_get(&s);
+    CHECK(s.entries == 71400 && s.pack_entries == 71400);
+    /* These pairs have identical low 32 bits of nvn_hm_hash. The exact name
+       must still select the matching pack entry or its loose override. */
+    expect("key13104.spv", 3, 'Z');
+    expect("key34301.spv", 8, 'A' + 34301 % 26);
+    expect("key05045.spv", 8, 'A' + 5045 % 26);
+    expect("key63138.spv", 8, 'A' + 63138 % 26);
+    CHECK(vk_seed_io_read("key71400.spv", NULL) == NULL);
+#if defined(__linux__)
+    check_pack_mapping();
+#endif
+    vk_seed_io_stop();
+    unlink("inventory/key13104.spv"); unlink("inventory/seed.vkpack"); CHECK(!rmdir("inventory"));
+    printf("seed inventory: %.3f MiB of heap metadata for 71400 entries, %.3f ms indexing\n",
+           s.index_heap_bytes / 1048576.0, s.index_ns / 1e6);
+    fflush(stdout);
+    CHECK(s.index_heap_bytes <= (18u << 20));
+}
 int main(void) {
     unsetenv("TOTK_VK_SEED_IO"); CHECK(vk_seed_io_enabled());
     setenv("TOTK_SEED_STATS", "1", 1); setenv("TOTK_SEED_WARM_MB", "1", 1); setenv("TOTK_XLATE_ONDEVICE", "0", 1);
     char scratch[] = "./.vk_seed_io_test.XXXXXX"; CHECK(mkdtemp(scratch));
     int cwd = open(".", O_RDONLY | O_DIRECTORY); CHECK(cwd >= 0); CHECK(!chdir(scratch));
-    fallback_cases(); warm_and_replace(); concurrency(0); concurrency(1); bounded_history(); publication(); demand_bypasses_warm(); realistic_scale(); adaptive_ceiling();
+    fallback_cases(); warm_and_replace(); concurrency(0); concurrency(1); bounded_history(); publication(); demand_bypasses_warm(); realistic_scale(); adaptive_ceiling(); full_inventory();
     CHECK(!fchdir(cwd)); CHECK(!close(cwd)); CHECK(!rmdir(scratch));
     printf("seed IO: %u checks passed (fallback x6, MRU/override/adaptive cap, zero-storage warm, replacement, lookup/warm/shutdown races, bounded history, publication, immediate queued/cold demand, in-flight joins)\n", atomic_load(&checks));
     return 0;

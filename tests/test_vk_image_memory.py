@@ -1,7 +1,7 @@
 """Exercise production Vulkan image suballocation against counted device-memory allocations.
 
-No real GPU or Android memory pressure is simulated. This catches retention of completely
-free image blocks and stale block-index corruption while other allocations remain live.
+No real GPU or Android memory pressure is simulated. This exercises block reclamation,
+stable handles, allocation failure recovery, and inter-sample peaks.
 """
 from pathlib import Path
 import os
@@ -31,13 +31,30 @@ class ImageMemoryTests(unittest.TestCase):
 #include <string.h>
 typedef uint64_t VkDeviceSize, VkDeviceMemory;
 typedef uint32_t VkMemoryPropertyFlags;
+typedef int VkResult;
 typedef struct { VkDeviceSize size, alignment; uint32_t memoryTypeBits; } VkMemoryRequirements;
 typedef struct { unsigned sType; VkDeviceSize allocationSize; uint32_t memoryTypeIndex; } VkMemoryAllocateInfo;
 typedef struct { VkDeviceMemory mem; VkDeviceSize off, size; int block; } vk_alloc;
 static struct { struct { struct { VkDeviceSize bufferImageGranularity; } limits; } props; } V = {{{256}}};
 enum { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 1, VK_MEMORY_IMAGE_BLOCK, VK_MEMORY_IMAGE_DEDICATED };
+enum { VK_NULL_HANDLE = 0, VK_SUCCESS = 0, VK_ERROR_OUT_OF_HOST_MEMORY = -1,
+       VK_ERROR_OUT_OF_DEVICE_MEMORY = -2, VK_ERROR_FEATURE_NOT_PRESENT = -8, VK_ERROR_UNKNOWN = -13 };
 static uint64_t sizes[4096], allocated, next_memory, releases;
 static int fail_next;
+static unsigned fail_metadata_at;
+static size_t moved_span_bytes;
+static void *resize_metadata(void *ptr, size_t bytes) {
+    if (fail_metadata_at && --fail_metadata_at == 0) return NULL;
+    return realloc(ptr, bytes);
+}
+static void *move_spans(void *to, const void *from, size_t bytes) {
+    moved_span_bytes += bytes;
+    return memmove(to, from, bytes);
+}
+#define realloc resize_metadata
+#define memmove move_spans
+#define LOGV(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
+#define vk_submit_serial() UINT64_C(123)
 static int vk_pick_type(uint32_t bits, uint32_t want) { (void)want; return bits & 1 ? 0 : bits & 2 ? 1 : -1; }
 static int vk_memory_allocate(const VkMemoryAllocateInfo *info, VkDeviceMemory *memory, int purpose) {
     (void)purpose;
@@ -52,8 +69,117 @@ static void vk_memory_release(VkDeviceMemory memory, int purpose) {
 }
 '''
         probe = r'''
+static int reclaim_completed_images(enum image_reclaim_kind kind, VkDeviceSize target, const image_span_request *fit) {
+    (void)kind; (void)target; (void)fit; assert(0); return 0;
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
+    assert(!unsetenv("TOTK_VK_IMAGE_PEAK_LOG"));
+    assert(!unsetenv("TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW"));
+    if (!strcmp(argv[1], "metadata-failure")) {
+        assert(!setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1));
+        VkMemoryRequirements req = {256, 256, 1};
+        vk_alloc failed;
+        for (unsigned failure = 1; failure <= 2; failure++) {
+            fail_metadata_at = failure;
+            assert(!vk_mem_alloc(&req, 0, &failed) && !failed.mem);
+            assert(!fail_metadata_at && !next_memory && !g_mem_block_allocs && !g_nblocks);
+        }
+        fail_next = 1;
+        assert(!vk_mem_alloc(&req, 0, &failed) && !failed.mem);
+        assert(!fail_next && !next_memory && !g_mem_block_allocs && !g_nblocks);
+
+        vk_alloc valid[16];
+        for (int i = 0; i < 15; i++) {
+            assert(vk_mem_alloc(&req, 0, &valid[i]) && valid[i].off == (uint64_t)i * 256);
+        }
+        assert(g_blocks[0].nfree == 1 && g_blocks[0].capfree == 16);
+        fail_metadata_at = 1;
+        assert(!vk_mem_alloc(&req, 0, &failed) && !failed.mem);
+        assert(!fail_metadata_at && allocated == g_mem_block_size && next_memory == 1);
+        assert(g_blocks[0].live_allocations == 15 && g_blocks[0].nfree == 1 && g_mem_block_used == 15 * 256);
+        assert(vk_mem_alloc(&req, 0, &valid[15]) && valid[15].off == 15 * 256);
+        assert(g_blocks[0].capfree == 32);
+        fail_metadata_at = 1;
+        for (int i = 0; i < 16; i += 2) vk_mem_free(&valid[i]);
+        assert(fail_metadata_at == 1 && g_blocks[0].nfree == 9 && g_blocks[0].live_allocations == 8);
+        for (int i = 1; i < 16; i += 2) {
+            assert(valid[i].mem == 1 && valid[i].off == (uint64_t)i * 256);
+            vk_mem_free(&valid[i]);
+        }
+        assert(fail_metadata_at == 1 && !allocated && !g_mem_block_used && releases == 1);
+        assert(!g_mem_pressure_events && !g_mem_pressure_recovered); // non-texture allocations never run reclaim
+        return 0;
+    }
+    if (!strcmp(argv[1], "peaks")) {
+        assert(!setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1));
+        assert(!setenv("TOTK_VK_IMAGE_BLOCK_MB", "32", 1));
+        assert(!setenv("TOTK_VK_IMAGE_PEAK_LOG", "1", 1));
+        const uint64_t MiB = 1u << 20;
+        VkMemoryRequirements req = {4 * MiB, 256, 1};
+        vk_alloc small, dedicated, rest[2];
+        assert(vk_mem_alloc(&req, 0, &small));
+        req.size = 17 * MiB;
+        assert(vk_mem_alloc(&req, 0, &dedicated));
+        vk_mem_free(&dedicated);
+        req.size = 12 * MiB;
+        assert(vk_mem_alloc(&req, 0, &rest[0]));
+        req.size = 16 * MiB;
+        assert(vk_mem_alloc(&req, 0, &rest[1]));
+        vk_mem_free(&small);
+        vk_mem_free(&rest[0]);
+        assert(g_mem_block_used == 16 * MiB && allocated == 32 * MiB);
+        image_memory_peaks peak = image_memory_take_peaks_locked();
+        assert(peak.blocks == 32 * MiB && peak.dedicated == 17 * MiB);
+        assert(peak.block_used_at_commit == 4 * MiB && peak.occupied == 32 * MiB);
+        assert(!g_mem_reclaim_reuses);
+        vk_mem_free(&rest[1]);
+        req.size = 48 * MiB;
+        fail_next = 1;
+        assert(!vk_mem_alloc(&req, 0, &dedicated) && !dedicated.mem);
+        peak = image_memory_take_peaks_locked();
+        assert(peak.blocks == 32 * MiB && !peak.dedicated);
+        assert(peak.block_used_at_commit == 16 * MiB && peak.occupied == 16 * MiB);
+        peak = image_memory_take_peaks_locked();
+        assert(!peak.blocks && !peak.dedicated && !peak.block_used_at_commit && !peak.occupied);
+        return 0;
+    }
+    if (!strcmp(argv[1], "fragmented")) {
+        assert(!unsetenv("TOTK_VK_IMAGE_FREE_EMPTY"));
+        assert(!unsetenv("TOTK_VK_IMAGE_PACK"));
+        assert(!setenv("TOTK_VK_IMAGE_BLOCK_MB", "32", 1));
+        VkMemoryRequirements req = {768, 256, 1};
+        vk_alloc first, aligned, gap;
+        assert(vk_mem_alloc(&req, 0, &first) && first.off == 0);
+        req.size = 512; req.alignment = 1024;
+        assert(vk_mem_alloc(&req, 0, &aligned) && aligned.off == 1024);
+        assert(g_blocks[0].nfree == 2 && g_blocks[0].free[0].size == 256);
+        req.size = 256; req.alignment = 256;
+        assert(vk_mem_alloc(&req, 0, &gap) && gap.off == 768);
+        vk_mem_free(&gap); vk_mem_free(&aligned); vk_mem_free(&first);
+        assert(g_blocks[0].nfree == 1 && g_blocks[0].free[0].off == 0);
+        assert(g_blocks[0].free[0].size == (32u << 20));
+
+        vk_alloc adjacent[16];
+        for (int i = 0; i < 16; i++) {
+            req.size = i == 0 ? 4u << 20 : 1u << 20;
+            assert(vk_mem_alloc(&req, 0, &adjacent[i]) && adjacent[i].block == 0);
+        }
+        for (int i = 0; i < 16; i += 2) vk_mem_free(&adjacent[i]);
+        assert(g_blocks[0].nfree == 9);
+        moved_span_bytes = 0;
+        req.size = 1u << 20;
+        for (int i = 0; i < 512; i++) {
+            vk_alloc cycle;
+            assert(vk_mem_alloc(&req, 0, &cycle) && cycle.off == 0);
+            vk_mem_free(&cycle);
+        }
+        assert(g_blocks[0].nfree == 9 && moved_span_bytes == 0);
+        for (int i = 1; i < 16; i += 2) vk_mem_free(&adjacent[i]);
+        assert(g_blocks[0].nfree == 1 && !g_blocks[0].used && g_blocks[0].free[0].size == (32u << 20));
+        return 0;
+    }
     if (!strcmp(argv[1], "16MiB")) {
         assert(!setenv("TOTK_VK_IMAGE_FREE_EMPTY", "1", 1));
         assert(!setenv("TOTK_VK_IMAGE_BLOCK_MB", "16", 1));
@@ -148,11 +274,19 @@ int main(int argc, char **argv) {
             build = subprocess.run([compiler, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
                                     str(source), '-o', str(binary)], capture_output=True, text=True, timeout=60)
             self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
-            for mode in ('default', 'trim', 'small', 'packed', '16MiB'):
+            for mode in ('default', 'trim', 'small', 'packed', '16MiB', 'fragmented',
+                         'metadata-failure', 'peaks'):
                 with self.subTest(mode=mode):
                     result = subprocess.run([str(binary), mode], env=dict(os.environ), capture_output=True,
                                             text=True, timeout=30)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    if mode == 'peaks':
+                        self.assertEqual(result.stderr.splitlines(), [
+                            '[image-allocation-high] sub=123 blocks=33554432 dedicated=0 occupied=4194304',
+                            '[image-allocation-high] sub=123 blocks=33554432 dedicated=17825792 occupied=22020096',
+                        ])
+                    else:
+                        self.assertNotIn('[image-allocation-high]', result.stderr)
 
 
 if __name__ == '__main__':

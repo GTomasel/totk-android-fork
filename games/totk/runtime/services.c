@@ -17,6 +17,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include "mprotect_stats.h"
+#if defined(__linux__)
+#include "guest_shmem.h"
+#endif
 
 #include <time.h>
 #include <unistd.h>
@@ -95,13 +98,77 @@ static void release_reserved(uint8_t *p,uint64_t size){mach_vm_deallocate(mach_t
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#if defined(__linux__)
+enum { GUEST_SHMEM_MEASURE = 1, GUEST_SHMEM_COPY, GUEST_SHMEM_DISCARD };
+enum { GUEST_SHMEM_RESERVATIONS = 2 };
+static int guest_shmem_mode;
+static guest_shmem_range guest_shmem_reservations[GUEST_SHMEM_RESERVATIONS];
+
+/* Reservations are fixed before gameplay starts. Vulkan holds its pool
+   lock across source selection, the new mapping and this notification. */
+int runtime_guest_shmem_copy(void *dst, uintptr_t src, size_t size) {
+    if (guest_shmem_mode != GUEST_SHMEM_COPY) return 0;
+    for (size_t i = 0; i < GUEST_SHMEM_RESERVATIONS; i++)
+        if (guest_shmem_copy(&guest_shmem_reservations[i], dst, src, size)) return 1;
+    return 0;
+}
+void runtime_guest_shmem_replaced(uintptr_t base, size_t size, uint64_t counters[3]) {
+    if (guest_shmem_mode == GUEST_SHMEM_COPY) {
+        for (size_t i = 0; i < GUEST_SHMEM_RESERVATIONS; i++)
+            guest_shmem_note(&guest_shmem_reservations[i], base, size, GUEST_SHMEM_REPLACED);
+    } else if (guest_shmem_mode == GUEST_SHMEM_DISCARD && counters) {
+        guest_shmem_discard_stats stats = {0};
+        for (size_t i = 0; i < GUEST_SHMEM_RESERVATIONS; i++)
+            guest_shmem_discard(&guest_shmem_reservations[i], base, size, &stats);
+        counters[0] += stats.punched;
+        counters[1] += stats.preserved;
+        counters[2] += stats.errors;
+    }
+}
+int runtime_guest_shmem_alias_source(uintptr_t base, size_t size) {
+    if (guest_shmem_mode != GUEST_SHMEM_DISCARD) return 1;
+    return guest_shmem_protect_alias(guest_shmem_reservations, GUEST_SHMEM_RESERVATIONS, base, size);
+}
+int runtime_guest_shmem_allocated(uint64_t *bytes) {
+    if (!guest_shmem_mode) return 0;
+    *bytes = 0;
+    int count = 0;
+    for (size_t i = 0; i < GUEST_SHMEM_RESERVATIONS; i++) {
+        const guest_shmem_range *range = &guest_shmem_reservations[i];
+        if (!range->size) continue;
+        *bytes += guest_shmem_backing_bytes(range);
+        count++;
+    }
+    return count;
+}
+int runtime_guest_shmem_occupied(uintptr_t base, size_t size, uint64_t totals[2]) {
+    for (size_t i = 0; i < GUEST_SHMEM_RESERVATIONS; i++)
+        if (!guest_shmem_occupied(&guest_shmem_reservations[i], base, size, totals)) return 0;
+    return 1;
+}
+#endif
 static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
+#if defined(__linux__)
+ if(guest_shmem_mode)for(size_t i=0;i<GUEST_SHMEM_RESERVATIONS;i++){
+  guest_shmem_range *range=&guest_shmem_reservations[i];
+  if(range->size)continue;
+  void *p=guest_shmem_reserve(range,at,size,MAP_SHARED|MAP_NORESERVE|MAP_FIXED_NOREPLACE);
+  if(p!=MAP_FAILED)return p;
+  break;
+ }
+#endif
  void *p=mmap((void *)(uintptr_t)at,size,PROT_NONE,MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED_NOREPLACE,-1,0);
  if(p==MAP_FAILED)return NULL;
  if((uintptr_t)p!=at){munmap(p,size);return NULL;}
  return p;
 }
-static void release_reserved(uint8_t *p,uint64_t size){munmap(p,size);}
+static void release_reserved(uint8_t *p,uint64_t size){
+ munmap(p,size);
+#if defined(__linux__)
+ for(size_t i=0;i<GUEST_SHMEM_RESERVATIONS;i++)
+  if(guest_shmem_reservations[i].base==(uintptr_t)p)guest_shmem_release(&guest_shmem_reservations[i]);
+#endif
+}
 #endif
 /* Hand a 16 KiB unit of the alias region back to the system: its next use reads zeros. */
 static int decommit_unit(uint64_t page){
@@ -138,6 +205,12 @@ static uint8_t *reserve_in_gap(uint64_t size,int log){
 #endif
 static void memory_init(void) {
  if(alias_space)return;
+#if defined(__linux__)
+ const char *shmem=getenv("TOTK_VK_GUEST_SHMEM");
+ if(shmem&&!strcmp(shmem,"measure"))guest_shmem_mode=GUEST_SHMEM_MEASURE;
+ if(shmem&&!strcmp(shmem,"copy"))guest_shmem_mode=GUEST_SHMEM_COPY;
+ if(shmem&&!strcmp(shmem,"discard"))guest_shmem_mode=GUEST_SHMEM_DISCARD;
+#endif
 #if TARGET_OS_IPHONE
  /* iOS: stack+heap and the alias region go side by side in one reservation (ASLR_SIZE spans both), placed in the lowest
     free gap that holds them. The free space depends on the device, so the alias region shrinks from the requested size
@@ -165,6 +238,13 @@ static void memory_init(void) {
  }
 #endif
  heap=low_space+HEAP_OFF;
+#if defined(__linux__)
+ if(guest_shmem_mode){
+  uint64_t bytes;
+  int count=runtime_guest_shmem_allocated(&bytes);
+  fprintf(stderr,"[totk-mem] guest shmem mode=%s reservations=%d\n",shmem,count);
+ }
+#endif
  fprintf(stderr,"[totk] guest layout: alias %#llx+%#llx stack %#llx+%#llx heap %#llx (cap %#llx)\n",(unsigned long long)ALIAS_START,ALIAS_SIZE,(unsigned long long)STACK_START,STACK_SIZE,(unsigned long long)(uintptr_t)heap,HEAP_CAP);
 }
 /* Scoped stack moves: independent host backing, copy back on unmap.

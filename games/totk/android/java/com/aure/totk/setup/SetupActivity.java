@@ -1591,7 +1591,6 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         gameControl(driverRow, "Changing the driver", this::pickDriver);
         gameControl(reset, "Changing the driver", this::resetDriver);
         // Mods live in the app's private files (ModImport), so they do not depend on where the game data is.
-        if (!modsBusy) ModImport.recover(getFilesDir());   // an import that died between its two renames
         ModImport.Summary mods = ModImport.read(getFilesDir());
         Widgets.Row modsRow = dataRow(list, "mods", Strings.MODS_ROW, Strings.MODS_HINT,
                 modsBusy ? Strings.MODS_IMPORTING : mods == null ? Strings.MODS_NONE : Strings.modsState(mods.files, mods.bytes, mods.modules.size()),

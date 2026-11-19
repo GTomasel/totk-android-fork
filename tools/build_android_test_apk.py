@@ -13,12 +13,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path[:0] = [str(ROOT / 'games/totk/android'), str(ROOT / 'games/totk/android/apk')]
+sys.path.insert(0, str(ROOT / 'games/totk/android'))
 import build_release as release
-import build_apk
-import audit_apk
 
 
 def main(argv=None):
@@ -51,32 +50,17 @@ def main(argv=None):
         number = max(10003, int(counter.read_text()) + 1 if counter.exists() else 10003)
         counter.write_text(str(number) + '\n')
         version = release.APP_VERSION + '-dev.' + str(number)
-        libs = release.build_native(work, ndk, logs, release=False, jobs=args.jobs)
-        libs = release.strip_debug(libs, work, ndk, logs)
-        translator = release.release_translator(args.translator, work, ndk, logs)
-        dex = release.build_classes(sdk, work / 'classes.dex', logs)
-        assets = release.stage_assets(work / 'apk-stage/assets', release.licence_texts(work, ndk),
-                                      commit=release.source_commit())
-        driver = work / 'libtotk_turnip.so'
-        driver.write_bytes(release.check_turnip(args.turnip).read_bytes())
-        arguments = ['--dex', str(dex), '--ondevice-xlate', str(translator), '--assets', str(assets),
-                     '--launcher-mipmaps', str(ROOT / 'games/totk/android/apk/launcher'),
-                     '--out', str(out), '--key', str(key), '--make-key',
-                     '--package', 'com.gtomasel.totk.dev', '--label', 'TotK Test',
-                     '--version-name', version, '--version-code', str(number),
-                     '--min-sdk', '33', '--target-sdk', '36']
-        for lib in [*libs, driver]:
-            arguments += ['--lib', str(lib)]
-        build_apk.main(arguments)
-        release.verify_signatures(out, logs, sdk)
-        problems = audit_apk.audit(out)
-        if problems:
-            out.unlink()
-            raise RuntimeError('APK audit failed: ' + '; '.join(problems))
-        receipt = {'package': 'com.gtomasel.totk.dev', 'version': version, 'version_code': number,
-                   'target_sdk': 36, 'source': release.source_commit(),
-                   'sha256': hashlib.sha256(out.read_bytes()).hexdigest(),
-                   'translator_sha256': hashlib.sha256(translator.read_bytes()).hexdigest(),
+        package = 'com.gtomasel.totk.dev'
+        target_sdk = 36
+        release.app(work=work, ndk=ndk, logs=logs, out=out, key=key, make_key=True, release=False,
+                    turnip=args.turnip, translator=args.translator, android_sdk=sdk, version_code=number,
+                    version_name=version, jobs=args.jobs, application_id=package, label='TotK Test', target_sdk=target_sdk)
+        with zipfile.ZipFile(out) as apk, apk.open('lib/arm64-v8a/libtotk_xlate.so') as translator:
+            source = apk.read('assets/build.txt').decode('ascii').strip().removeprefix('commit ')
+            translator_sha256 = hashlib.file_digest(translator, 'sha256').hexdigest()
+        receipt = {'package': package, 'version': version, 'version_code': number,
+                   'target_sdk': target_sdk, 'source': source, 'sha256': release.sha256(out),
+                   'translator_sha256': translator_sha256,
                    'qualification': 'Signed development build; gameplay qualification is separate.'}
         out.with_suffix('.build.json').write_text(json.dumps(receipt, indent=2) + '\n')
         Path(str(out) + '.sha256').write_text(receipt['sha256'] + '  ' + out.name + '\n')

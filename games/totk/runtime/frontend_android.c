@@ -41,6 +41,7 @@
 #include "build_kind.h"
 #include "android_perf.h"
 #include "android_memory.h"
+#include "romfs_scan.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
 #include <android/asset_manager.h>
@@ -58,6 +59,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <limits.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -82,6 +84,7 @@ void runtime_android_game_pause_wait(void) {
 }
 uint64_t vk_window_set(ANativeWindow *window, ANativeWindow *surface_parent, int display_id);   /* android/gfx/vk_draw.c */
 void vk_window_resized(ANativeWindow *window, uint64_t epoch);   /* android/gfx/vk_draw.c */
+void vk_wb_alias_report(const char *phase) __attribute__((weak)); /* normal-thread diagnostic snapshot */
 void vk_window_transform_hint(ANativeWindow *window, uint64_t epoch, int hint);   /* android/gfx/vk_draw.c */
 void vk_shader_seed_startup(const char *game_dir);   /* android/gfx/vk_shader.c */
 int vk_overlay_cycle(void);   /* android/gfx/vk_overlay.c */
@@ -1657,6 +1660,7 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
     totk_android_memory_defaults();
+    totk_android_memory_configure_allocator();
     gpu_profile_identity(a);
     log_mirror_start();   /* TOTK_LOGCAT is final now */
     live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
@@ -1714,6 +1718,10 @@ static int start_game(const ANativeActivity *a) {
         for (size_t i = 0; i < sizeof roots / sizeof *roots && !found; i++) {
             if (!roots[i]) continue;
             snprintf(p, sizeof p, "%s/mods/%s", roots[i], version);
+            if (i == 1 && romfs_import_recover(p) < 0) {
+                fprintf(stderr, "[totk-app] could not recover imported mods: %s\n", strerror(errno));
+                return start_refused();
+            }
             found = is_dir(p);
         }
         if (found) { setenv("TOTK_ROMFS_MODS", p, 1); fprintf(stderr, "[totk-app] mods folder %s\n", p); }
@@ -2140,6 +2148,27 @@ static jmethodID surface_parent_method(JNIEnv *env, jobject obj, const char *nam
     (*env)->DeleteLocalRef(env, cls);
     return method;
 }
+
+/* The activity stays live until on_destroy exits the process. Only the optional overlay sampler calls this. */
+int runtime_android_battery_temperature_mc(void) {
+    ANativeActivity *a = g_activity;
+    if (!a) return INT_MIN;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if ((*a->vm)->GetEnv(a->vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*a->vm)->AttachCurrentThread(a->vm, &env, NULL) != JNI_OK) return INT_MIN;
+        attached = 1;
+    }
+    jmethodID method = surface_parent_method(env, a->clazz, "batteryTemperatureDeciC", "()I");
+    jint raw = method ? (*env)->CallIntMethod(env, a->clazz, method) : INT_MIN;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        raw = INT_MIN;
+    }
+    if (attached) (*a->vm)->DetachCurrentThread(a->vm);
+    return raw >= -500 && raw <= 1500 ? raw * 100 : INT_MIN;
+}
+
 /* Validate before publishing a new window, and again on existing window/display lifecycle notifications.
  * A previous window's accepted override must never authorize a rate on a different display. */
 static void frame_rate_hint_update(ANativeActivity *a) {
@@ -2431,6 +2460,7 @@ static void android_game_pause_update(void) {
     if (paused == runtime_android_game_paused()) return;
     game_input_after_ns = (int64_t)mono_ns();
     android_game_pause_set(&game_pause, paused);
+    if (paused && vk_wb_alias_report) vk_wb_alias_report("pause");
     runtime_audio_output_pause(paused);
     runtime_input_clear();
     present_timeline_lifecycle(-1, paused);

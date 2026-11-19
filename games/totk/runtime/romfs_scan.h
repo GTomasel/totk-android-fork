@@ -16,6 +16,25 @@
 #define ROMFS_SCAN_PATH 4096   /* longest relative path, with its terminator */
 #define ROMFS_SCAN_DEPTH 32    /* folders below the root; the game's RomFS nests 6 deep */
 
+/* The Android importer swaps two directories under the same game lock.
+ * A cold start holding that lock restores the old directory before resolving overlays. */
+static inline int romfs_import_recover(const char *active) {
+    struct stat st;
+    if (lstat(active, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (errno != ENOENT) return -1;
+
+    char old[ROMFS_SCAN_PATH];
+    int length = snprintf(old, sizeof old, "%s.old", active);
+    if (length < 0 || (size_t)length >= sizeof old) { errno = ENAMETOOLONG; return -1; }
+    if (lstat(old, &st) < 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+    return rename(old, active);
+}
+
 typedef struct {
     unsigned long files;     /* visited */
     unsigned long junk;      /* desktop leftovers, files or folders (romfs_scan_junk) */

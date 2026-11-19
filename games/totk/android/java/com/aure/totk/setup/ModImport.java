@@ -62,6 +62,7 @@ final class ModImport {
         private final File target, incoming, old;
         private final Summary summary = new Summary();
         private final Set<String> seen = new HashSet<>();
+        private final byte[] copyBuffer = new byte[1 << 16];
         private String prefix;
         private boolean committed;
         private long entries, skipped;
@@ -127,11 +128,10 @@ final class ModImport {
             long size = 0;
             // CREATE_NEW: two names the filesystem takes for one (case, normalization) are refused, not written over each other
             try (OutputStream out = Files.newOutputStream(file.toPath(), java.nio.file.StandardOpenOption.CREATE_NEW, java.nio.file.StandardOpenOption.WRITE)) {
-                byte[] block = new byte[1 << 16];
-                for (int n; (n = in.read(block)) > 0; size += n) {
+                for (int n; (n = in.read(copyBuffer)) > 0; size += n) {
                     if (summary.bytes + skipped + size + n > MAX_BYTES) throw new Invalid("too_big", "more than " + (MAX_BYTES >> 30) + " GB");
                     if ((size + n) >> 26 != size >> 26 && incoming.getUsableSpace() < MIN_FREE) throw new Invalid("no_space", null);   // every 64 MB
-                    out.write(block, 0, n);
+                    out.write(copyBuffer, 0, n);
                 }
             } catch (java.nio.file.FileAlreadyExistsException alias) {
                 throw new Invalid("duplicate", rel);
@@ -148,8 +148,7 @@ final class ModImport {
 
         /** Read an entry that was left out to its end (a zip stream has to inflate it anyway), against the same size budget. */
         void skip(InputStream in) throws IOException {
-            byte[] block = new byte[1 << 16];
-            for (int n; (n = in.read(block)) > 0; ) {
+            for (int n; (n = in.read(copyBuffer)) > 0; ) {
                 skipped += n;
                 if (summary.bytes + skipped > MAX_BYTES) throw new Invalid("too_big", "more than " + (MAX_BYTES >> 30) + " GB");
             }
@@ -201,7 +200,7 @@ final class ModImport {
         try (ZipInputStream zip = new ZipInputStream(new BufferedInputStream(archive))) {
             for (ZipEntry entry; (entry = zip.getNextEntry()) != null; ) {
                 if (++entries > 8L * MAX_FILES) throw new Invalid("too_many", "more than " + 8L * MAX_FILES + " entries");
-                if (!entry.isDirectory() && !session.add(entry.getName(), zip)) session.skip(zip);
+                if (entry.isDirectory() || !session.add(entry.getName(), zip)) session.skip(zip);
             }
         } catch (java.util.zip.ZipException | IllegalArgumentException bad) {
             throw new Invalid("bad_zip", bad.getMessage());
@@ -211,7 +210,8 @@ final class ModImport {
 
     /** The mods that are installed, from the record the import wrote; null when there are none. */
     static Summary read(File privateFiles) {
-        File record = new File(folder(privateFiles), RECORD);
+        File target = folder(privateFiles);
+        File record = new File(target.exists() ? target : new File(target.getPath() + ".old"), RECORD);
         if (!record.isFile()) return null;
         if (record.length() > 1 << 16) return new Summary();
         Summary s = new Summary();
@@ -234,8 +234,7 @@ final class ModImport {
         return s;
     }
 
-    /** After an import that died between its two renames only <version>.old is left: put those earlier mods back.
-     * Call it with the game lock held or while no import can run (the menu does, before it reads the record). */
+    /** Restore an interrupted swap before starting another import. The caller holds the game lock. */
     static void recover(File privateFiles) {
         File target = folder(privateFiles), old = new File(target.getPath() + ".old");
         if (old.exists() && !target.exists()) old.renameTo(target);

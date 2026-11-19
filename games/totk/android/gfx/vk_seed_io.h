@@ -16,7 +16,7 @@ typedef struct {
     uint64_t lookups, pack_hits, warmed_hits, demand_reads, demand_bytes, warmed_storage_reads;
     uint64_t blocking_ns, blocking_max_ns, worker_reads, worker_bytes, warm_joins, index_ns, warm_ns;
     uint64_t entries, pack_entries, cached_bytes, warm_keys, warm_ready, warm_failed, warm_skipped, warm_bytes;
-    uint64_t learned_bytes, warm_cap, warm_bypassed;
+    uint64_t learned_bytes, warm_cap, warm_bypassed, index_heap_bytes;
 } vk_seed_io_stats;
 void vk_seed_io_stats_get(vk_seed_io_stats *out);
 void vk_seed_io_report(void); /* default off: TOTK_SEED_STATS=1, delta per 300-present report */

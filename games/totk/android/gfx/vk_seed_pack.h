@@ -32,6 +32,37 @@ static inline int vk_seed_pack_range_compare(const void *a, const void *b) {
     return 0;
 }
 
+static inline int vk_seed_pack_read_range(const unsigned char *record, uint64_t index_end,
+                                          uint64_t file_size, vk_seed_pack_range *range) {
+    uint64_t offset = vk_seed_pack_le64(record + 88);
+    uint64_t length = vk_seed_pack_le64(record + 96);
+    if (vk_seed_pack_le32(record + 84) || (offset & 7) || offset < index_end ||
+        offset > file_size || length > file_size - offset) return 0;
+    *range = (vk_seed_pack_range){offset, offset + length};
+    return 1;
+}
+
+static inline int vk_seed_pack_check_unordered(const unsigned char *records, uint64_t count,
+                                               uint64_t index_end, uint64_t file_size) {
+    if (count > SIZE_MAX / sizeof(vk_seed_pack_range)) return -2;
+    vk_seed_pack_range *ranges = malloc((size_t)count * sizeof *ranges);
+    if (!ranges) return -1;
+    size_t used = 0;
+    int result = -2;
+    for (uint64_t i = 0; i < count; i++) {
+        vk_seed_pack_range range;
+        if (!vk_seed_pack_read_range(records + (size_t)i * 104, index_end, file_size, &range)) goto done;
+        if (range.begin != range.end) ranges[used++] = range;
+    }
+    qsort(ranges, used, sizeof *ranges, vk_seed_pack_range_compare);
+    for (size_t i = 1; i < used; i++)
+        if (ranges[i].begin < ranges[i - 1].end) goto done;
+    result = 0;
+done:
+    free(ranges);
+    return result;
+}
+
 static inline int vk_seed_pack_valid_name(const unsigned char *name, size_t *length) {
     size_t n = 0;
     while (n < 84 && name[n]) {
@@ -56,7 +87,6 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
     struct stat st;
     int fd = -1, result = -1;
     void *mapping = MAP_FAILED;
-    vk_seed_pack_range *ranges = NULL;
     uint64_t count = 0;
     size_t file_size = 0;
 
@@ -85,18 +115,13 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
         }
         uint64_t index_end64 = 32 + count * 104;
         if (index_end64 > SIZE_MAX || index_end64 > file_size) { result = -2; goto done; }
-        if (count > SIZE_MAX / sizeof *ranges) { result = -2; goto done; }
-        if (count) {
-            ranges = (vk_seed_pack_range *)malloc((size_t)count * sizeof *ranges);
-            if (!ranges) goto done;
-        }
         const unsigned char *previous = NULL;
         size_t previous_length = 0;
-        uint64_t range_count = 0;
+        uint64_t previous_end = index_end64;
+        int ordered = 1;
         for (uint64_t i = 0; i < count; i++) {
             const unsigned char *record = b + 32 + (size_t)i * 104;
             size_t name_length;
-            uint64_t offset, length, end;
             if (!vk_seed_pack_valid_name(record, &name_length)) { result = -2; goto done; }
             if (previous) {
                 size_t common = previous_length < name_length ? previous_length : name_length;
@@ -105,21 +130,21 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
             }
             previous = record;
             previous_length = name_length;
-            uint32_t reserved = vk_seed_pack_le32(record + 84);
-            offset = vk_seed_pack_le64(record + 88);
-            length = vk_seed_pack_le64(record + 96);
-            if (reserved || (offset & 7) || offset < index_end64 ||
-                offset > (uint64_t)file_size || length > UINT64_MAX - offset) {
+            vk_seed_pack_range range;
+            if (!vk_seed_pack_read_range(record, index_end64, file_size, &range)) {
                 result = -2; goto done;
             }
-            end = offset + length;
-            if (end > (uint64_t)file_size) { result = -2; goto done; }
-            if (length) ranges[range_count++] = (vk_seed_pack_range){offset, end};
+            if (range.begin != range.end) {
+                if (range.begin < previous_end) ordered = 0;
+                previous_end = range.end;
+            }
         }
-        if (range_count > 1)
-            qsort(ranges, (size_t)range_count, sizeof *ranges, vk_seed_pack_range_compare);
-        for (uint64_t i = 1; i < range_count; i++)
-            if (ranges[i].begin < ranges[i - 1].end) { result = -2; goto done; }
+        /* Writers emit payloads in index order. Allow valid out-of-order
+           payloads too, sorting only when the linear check cannot prove disjointness. */
+        if (!ordered) {
+            result = vk_seed_pack_check_unordered(b + 32, count, index_end64, file_size);
+            if (result) goto done;
+        }
     }
     pack->mapping = mapping;
     pack->size = file_size;
@@ -128,7 +153,6 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
     mapping = MAP_FAILED;
     result = 0;
 done:
-    free(ranges);
     if (mapping != MAP_FAILED) munmap(mapping, file_size);
     if (fd >= 0) close(fd);
     if (result) memset(pack, 0, sizeof *pack);

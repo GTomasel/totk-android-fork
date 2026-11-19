@@ -168,24 +168,25 @@ static void *saver(void *unused) {
         int finish = stop, flush = finish || ticket != completed, bg = background;
         uint64_t present = atomic_load_explicit(&last_present, memory_order_relaxed);
         uint64_t low = atomic_load_explicit(&quiet_since, memory_order_relaxed);
-        int idle = present && now - present >= 2 * PCACHE_SECOND;
-        int low_draw = low && now - low >= 2 * PCACHE_SECOND;
+        int idle = present && now >= present && now - present >= 2 * PCACHE_SECOND;
+        int low_draw = low && now >= low && now - low >= 2 * PCACHE_SECOND;
         const char *quiet_reason = bg ? "background" : idle ? "no-present-idle" : low_draw ? "low-draw-screen-heuristic" : "none";
         pthread_mutex_unlock(&mu);
         uint64_t start = host_now_ns(), cpu = stats ? cpu_ns() : 0, before_bytes = store.bytes_written;
         size_t size = policy.saved_size, old_size = policy.saved_size;
         uint64_t pipelines = gen - policy.saved_generation;
         /* gen was sampled before the probe: an unchanged-size acknowledgement must not consume later creates. */
-        int probed = pipelines && (flush || now - policy.last_save >= PCACHE_MIN_NS);
+        int quiet = bg || idle || low_draw;
+        int probed = pcache_should_probe(&policy, now, gen, quiet, flush);
         int query_failed = probed && query(NULL, &size, NULL) != 0;
-        int decision = pcache_decide(&policy, now, gen, size, probed && !query_failed, bg || idle || low_draw, flush);
+        int decision = pcache_decide(&policy, now, gen, size, probed && !query_failed, quiet, flush);
         uint64_t dirty_age = policy.dirty_since ? now - policy.dirty_since : 0;
         if (cache_path && identity && vk_pipeline_keys_dirty() && (flush || ((bg || idle || low_draw) && now-policy.last_save >= PCACHE_MIN_NS)))
             decision = PCACHE_FLUSH; /* Progress needs a real extraction even when cache-hit creates did not grow it. */
         int save = decision >= PCACHE_QUIET, ok = 0;
         if (save && !query_failed) {
             void *key_snapshot = vk_pipeline_keys_snapshot();
-            ok = pcache_snapshot(&store, cache_path, query, NULL, &size);
+            ok = pcache_snapshot(&store, cache_path, query, NULL, probed ? size : 0, &size);
             if (ok) {
                 pcache_saved(&policy, now, gen, size); saves++;
                 if (atomic_load_explicit(&generation, memory_order_acquire) != gen) policy.dirty_since = now;
@@ -212,7 +213,7 @@ static void *saver(void *unused) {
             pthread_cond_timedwait(&cv, &mu, &wake);
         }
     }
-    free(store.data); store.data = NULL; store.capacity = 0;
+    pcache_release(&store);
     pthread_mutex_unlock(&mu); return NULL;
 }
 void vk_pcache_start(const char *path, size_t loaded_size) {

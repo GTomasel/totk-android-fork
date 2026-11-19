@@ -284,8 +284,11 @@ static int overlay_order(const void *a,const void *b) {uint64_t x=((const Overla
 static int added_order(const void *a,const void *b) {const Overlay *x=*(Overlay *const *)a,*y=*(Overlay *const *)b;return strcmp(x->name,y->name);}
 /* Number the added files in path order after the RomFS's own (file_count + k); two overlays adding one path stop the start. */
 static void added_init(void) {
- Overlay **list=NULL;for(size_t k=0;k<noverlay;k++)if(overlays[k].index==ADDED){list=realloc(list,(nadded+1)*sizeof(*list));need(list!=NULL,"RomFS added files");list[nadded++]=&overlays[k];}
+ for(size_t k=0;k<noverlay;k++)if(overlays[k].index==ADDED)nadded++;
  if(!nadded)return;
+ Overlay **list=malloc(nadded*sizeof(*list));need(list!=NULL,"RomFS added files");
+ size_t next=0;
+ for(size_t k=0;k<noverlay;k++)if(overlays[k].index==ADDED)list[next++]=&overlays[k];
  qsort(list,nadded,sizeof(*list),added_order);added=malloc(nadded*sizeof(*added));need(added!=NULL,"RomFS added files");
  for(size_t k=0;k<nadded;k++){
   if(k&&!strcmp(list[k]->name,list[k-1]->name)){fprintf(stderr,"[totk] RomFS overlay: %s and %s both add %s\n",list[k-1]->path,list[k]->path,list[k]->name);runtime_fail("RomFS overlay: two overlays add the same file (see the log; remove it from one of the manifests)");}

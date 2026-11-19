@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #define PCACHE_SECOND 1000000000ull
@@ -16,6 +17,13 @@
 /* All fields are saver-owned. generation is sampled before extraction: concurrent creates stay dirty. */
 typedef struct { uint64_t saved_generation, dirty_since, last_save; size_t saved_size; } pcache_policy;
 enum { PCACHE_CLEAN, PCACHE_UNCHANGED, PCACHE_INTERVAL, PCACHE_GROW_SMALL, PCACHE_BUSY, PCACHE_QUIET, PCACHE_DEADLINE, PCACHE_FLUSH };
+/* A Vulkan size probe can lock and walk the driver cache just like an extraction.
+ * Probe when this iteration could save, plus the explicit lifecycle flush. */
+static inline int pcache_should_probe(const pcache_policy *p, uint64_t now, uint64_t generation, int quiet, int flush) {
+    return generation != p->saved_generation && (flush ||
+        (quiet && now - p->last_save >= PCACHE_MIN_NS) ||
+        (p->dirty_since && now - p->dirty_since >= PCACHE_MAX_NS));
+}
 /* size_probed is true only after a successful size-only query. Cache-hit creates need no payload snapshot.
  * Treat non-growing append-style caches as unchanged, retaining the actual file-size/time baseline. */
 static inline int pcache_decide(pcache_policy *p, uint64_t now, uint64_t generation, size_t size, int size_probed, int quiet, int flush) {
@@ -49,12 +57,20 @@ static inline int pcache_fault(pcache_store *s, int step) {
 #endif
     return 0;
 }
-/* Retain geometric headroom: no allocation or page disposal on subsequent small growth. */
+static inline void pcache_release(pcache_store *s) {
+    if (s->data) munmap(s->data, s->capacity);
+    s->data = NULL;
+    s->capacity = 0;
+}
+/* Retain address-space headroom. Extraction always writes a new blob, so growth
+ * does not need any of the old buffer's contents. */
 static inline int pcache_reserve(pcache_store *s, size_t size) {
     if (size <= s->capacity) return 1;
     if (pcache_fault(s, PCACHE_FAIL_ALLOC) || size > SIZE_MAX - size / 8 - (1u << 20)) return 0;
     size_t capacity = size + size / 8 + (1u << 20);
-    void *data = realloc(s->data, capacity); if (!data) return 0;
+    void *data = mmap(NULL, capacity, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) return 0;
+    pcache_release(s);
     s->data = data; s->capacity = capacity; s->allocations++; return 1;
 }
 static inline int pcache_replace(pcache_store *s, const char *path, size_t size) {
@@ -83,10 +99,20 @@ static inline int pcache_replace(pcache_store *s, const char *path, size_t size)
     close(dfd); if (!ok) unlink(tmp); errno = error; return ok;
 }
 typedef int (*pcache_query)(void *context, size_t *size, void *data);
-static inline int pcache_snapshot(pcache_store *s, const char *path, pcache_query query, void *context, size_t *size) {
-    *size = 0;
-    if (pcache_fault(s, PCACHE_FAIL_QUERY) || query(context, size, NULL) || !*size || !pcache_reserve(s, *size)) return 0;
+static inline int pcache_snapshot(pcache_store *s, const char *path, pcache_query query, void *context,
+                                  size_t probed_size, size_t *size) {
+    *size = probed_size;
+    if (!*size && (pcache_fault(s, PCACHE_FAIL_QUERY) || query(context, size, NULL) || !*size)) return 0;
+    if (!pcache_reserve(s, *size)) return 0;
     *size = s->capacity;
-    if (pcache_fault(s, PCACHE_FAIL_DATA) || query(context, size, s->data)) return 0; /* Includes VK_INCOMPLETE: retry later. */
-    return pcache_replace(s, path, *size);
+    /* Includes VK_INCOMPLETE. Leave the previous file intact and retry later. */
+    int ok = !pcache_fault(s, PCACHE_FAIL_DATA) && !query(context, size, s->data) && pcache_replace(s, path, *size);
+#if defined(__linux__)
+    int error = errno;
+    /* POSIX write has consumed the buffer. On Linux, discard the private pages
+     * even after a partial extraction or failed write. Keep the mapping reusable. */
+    if (madvise(s->data, s->capacity, MADV_DONTNEED)) pcache_release(s);
+    errno = error;
+#endif
+    return ok;
 }

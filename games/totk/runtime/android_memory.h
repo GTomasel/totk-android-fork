@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __BIONIC__
+#include <malloc.h>
+#endif
 
 static inline void totk_android_memory_defaults(void) {
     const char *enabled = getenv("TOTK_LOW_MEMORY");
@@ -23,4 +26,15 @@ static inline void totk_android_memory_defaults(void) {
             getenv("TOTK_VK_STAGING_RETAIN_MB"), getenv("TOTK_VK_REC_MEMORY_MB"), getenv("TOTK_VK_IMAGE_FREE_EMPTY"),
             getenv("TOTK_VK_DESC_COMPACT"), getenv("TOTK_PSO_PREWARM"), getenv("TOTK_SEED_WARM_MB"),
             getenv("TOTK_VK_IMAGE_BLOCK_MB"), getenv("TOTK_VK_IMAGE_PACK"));
+}
+
+static inline void totk_android_memory_configure_allocator(void) {
+#ifdef __BIONIC__
+    const char *value = getenv("TOTK_ANDROID_SHORT_MALLOC_DECAY");
+    if (value && !strcmp(value, "1")) {
+        /* Bionic chooses the allocator's minimum release interval for freed pages. */
+        int applied = mallopt(M_DECAY_TIME, 0);
+        fprintf(stderr, "[totk-memory] short malloc decay: applied=%d\n", applied);
+    }
+#endif
 }

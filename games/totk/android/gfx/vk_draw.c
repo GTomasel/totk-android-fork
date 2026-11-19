@@ -4322,10 +4322,12 @@ void vk_pipeline_prewarm(void) {
     g_pw_started = host_now_ns();
     pso_restore();
     pipe_ent *head = NULL, *tail = NULL;
-    if (records && g_pw_total > g_pw_completed && compile_threads()) {
+    int recreate_captures = pso_recreate_captures(getenv("TOTK_PSO_RECREATE_CAPTURES"), g_pw_total);
+    unsigned recreated = 0;
+    if (records && (g_pw_total > g_pw_completed || recreate_captures) && compile_threads()) {
         for (int priority = 1; priority >= 0; priority--) for (uint32_t i = 0; i < g_pw_total; i++) {
             if (records[i].capture != (uint32_t)priority) continue;
-            if (g_pw_done[i/8] >> (i%8) & 1) continue;
+            if (!pso_prewarms_key(i, priority, recreate_captures)) continue;
             pso_record *r = records+i; pipe_key k; pso_decode(r, &k);
             k.vs = vk_shader_seed((const char *)r->key, 0, 0);
             k.fs = r->key[80] ? vk_shader_seed((const char *)r->key+80, 1, pso_u32(r->key+160)) : NULL;
@@ -4337,10 +4339,12 @@ void vk_pipeline_prewarm(void) {
             e->capture = r->capture; e->predicted = 1; /* first demand must build/join, never skip a formerly cached draw */
             nvn_hm_put(&g_pipes, &k, e);
             if (tail) tail->next = e; else head = e; tail = e;
+            recreated += pso_key_is_done(i);
         }
     }
     free(records);
-    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first", path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6);
+    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first, replay_queued=%u",
+                   path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6, recreated);
     pthread_mutex_lock(&g_pq_mu);
     g_pw_head = head; g_pw_tail = tail;
     atomic_store_explicit(&g_pso_warming, head != NULL, memory_order_relaxed);
@@ -4509,7 +4513,89 @@ static void support_fill(uint8_t *d, uint32_t w, uint32_t h) {   /* Ryujinx Supp
     memcpy(d + 144, vi, 16); memcpy(d + 160, vs, 16);
     for (int i = 0; i < 73; i++) { float one = 1; memcpy(d + 192 + 16 * i, &one, 4); }
 }
-typedef struct { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; VkBufferView t; } dinfo;
+typedef union { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; VkBufferView t; } dinfo;
+
+/* Descriptor writes have no stride field. Single bindings can point directly into
+   selection scratch, but each array needs contiguous entries of its Vulkan type. */
+static VkWriteDescriptorSet *direct_descriptor_writes(const vk_shader *sh, const dinfo *info,
+                                                       size_t array_elements, VkDescriptorSet set) {
+    static VkWriteDescriptorSet *writes;
+    static uint8_t *packed;
+    static size_t write_capacity, packed_capacity;
+    if ((size_t)sh->nb > write_capacity) {
+        write_capacity = (size_t)sh->nb + 16;
+        writes = VK_REALLOC(writes, write_capacity * sizeof *writes);
+    }
+    if (array_elements > packed_capacity) {
+        packed_capacity = array_elements + 16;
+        packed = VK_REALLOC(packed, packed_capacity * sizeof(dinfo));
+    }
+    size_t first = 0, used = 0;
+    for (int i = 0; i < sh->nb; i++) {
+        const vk_bind *binding = &sh->b[i];
+        const dinfo *in = &info[first];
+        first += binding->count;
+        VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = binding->binding, .descriptorCount = binding->count,
+            .descriptorType = (VkDescriptorType)binding->dtype};
+        void *array = NULL;
+        if (binding->count > 1) {
+            array = packed + used * sizeof(dinfo);
+            used += binding->count;
+        }
+        switch (write.descriptorType) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (array) {
+                VkDescriptorBufferInfo *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].b;
+            }
+            write.pBufferInfo = array ? array : &in->b;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            if (array) {
+                VkBufferView *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].t;
+            }
+            write.pTexelBufferView = array ? array : &in->t;
+            break;
+        default:
+            if (array) {
+                VkDescriptorImageInfo *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].i;
+            }
+            write.pImageInfo = array ? array : &in->i;
+            break;
+        }
+        writes[i] = write;
+    }
+    return writes;
+}
+#ifdef TOTK_VK_TESTS
+int vk_draw_test_descriptor_arrays(VkDescriptorSet set, const vk_record_descriptor input[6]) {
+    vk_bind bindings[] = {
+        {.binding = 0, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+        {.binding = 2, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+        {.binding = 4, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},
+    };
+    vk_shader shader = {.nb = 3, .b = bindings};
+    const dinfo info[] = {{.b = input[0].b}, {.b = input[1].b}, {.i = input[2].i},
+                          {.i = input[3].i}, {.t = input[4].t}, {.t = input[5].t}};
+    const VkWriteDescriptorSet *writes = direct_descriptor_writes(&shader, info, 6, set);
+    for (unsigned i = 0; i < 2; i++) {
+        const VkDescriptorBufferInfo *buffer = &writes[0].pBufferInfo[i];
+        const VkDescriptorImageInfo *image = &writes[1].pImageInfo[i];
+        if (buffer->buffer != input[i].b.buffer || buffer->offset != input[i].b.offset ||
+            buffer->range != input[i].b.range || image->imageView != input[2 + i].i.imageView ||
+            image->sampler != input[2 + i].i.sampler || image->imageLayout != input[2 + i].i.imageLayout ||
+            writes[2].pTexelBufferView[i] != input[4 + i].t) return 0;
+    }
+    vkUpdateDescriptorSets(V.dev, 3, writes, 0, NULL);
+    return 1;
+}
+#endif
+
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out, int storage, int rw, uint64_t extent, vk_record_descriptor *record) {
     VkBuffer b; uint64_t off, avail; uint32_t reason = 0;
     if (!addr || !vk_resolve_for(addr, 1, &b, &off, &avail, VK_LOOKUP_UBO)) return 0;
@@ -4964,7 +5050,12 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
     (void)feedback_cut_refresh();   /* a live TOTK_VK_FEEDBACK_CUT takes effect at this descriptor build */
     if (__builtin_expect(PL.enabled, 0)) pso_life_reads(sh, (unsigned)stage);
     if (g_record_draw) return R.open ? record_stage_impl(sh, stage, set_index, stats) : 0;
-    size_t total = 0; for (int i = 0; i < sh->nb; i++) total += sh->b[i].count;
+    size_t total = 0, array_elements = 0;
+    for (int i = 0; i < sh->nb; i++) {
+        unsigned count = sh->b[i].count;
+        total += count;
+        if (count > 1) array_elements += count;
+    }
     VkImageView replay_source = VK_NULL_HANDLE;
     static dinfo *info; static size_t capi;
     if (total > capi) { capi = total + 64; info = realloc(info, capi * sizeof *info); }
@@ -5061,20 +5152,14 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
     hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h);
     unsigned slot = (unsigned)(h[0] % DS_CACHE);
     VkDescriptorSet set;
+    VkWriteDescriptorSet *writes = NULL;
     static int dsoff = -1; if (dsoff < 0) dsoff = vk_off("ds");
     if (!dsoff && g_dsc[slot].sub == sub && g_dsc[slot].hash[0] == h[0] && g_dsc[slot].hash[1] == h[1] && g_dsc[slot].dsl == sh->dsl && g_dsc[slot].n == total) {
         set = g_dsc[slot].set; g_stat_sets_reused++;
     } else {
         set = vk_alloc_set(sh->dsl);
-        /* Writes are only consumed on a cache miss; hits need only the resolved infos (also used by pass dumps). */
-        static VkWriteDescriptorSet *w; static size_t capw;
-        if ((size_t)sh->nb > capw) { capw = (size_t)sh->nb + 16; w = realloc(w, capw * sizeof *w); }
-        for (int i = 0, kk = 0; i < sh->nb; i++) {
-            const vk_bind *b = &sh->b[i]; dinfo *in = &info[kk]; kk += b->count;
-            w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = b->count, .descriptorType = (VkDescriptorType)b->dtype,
-                .pBufferInfo = &in->b, .pImageInfo = &in->i, .pTexelBufferView = &in->t};
-        }
-        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, w, 0, NULL);
+        writes = direct_descriptor_writes(sh, info, array_elements, set);
+        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, writes, 0, NULL);
         g_dsc[slot].sub = sub; g_dsc[slot].hash[0] = h[0]; g_dsc[slot].hash[1] = h[1]; g_dsc[slot].dsl = sh->dsl; g_dsc[slot].n = total; g_dsc[slot].set = set;
         g_stat_sets_new++;
     }
@@ -5087,23 +5172,16 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
                 if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->dtype == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
                     for (int e = 0; e < b->count; e++)
                         if (in[e].i.imageView == replay_source) in[e].i.imageView = vk_fg_canvas_view();
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet=replay_set, .dstBinding=b->binding, .descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype, .pBufferInfo=&in->b,
-                    .pImageInfo=&in->i, .pTexelBufferView=&in->t};
-                vkUpdateDescriptorSets(V.dev,1,&write,0,NULL);
             }
+            writes = direct_descriptor_writes(sh, info, array_elements, replay_set);
+            vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, writes, 0, NULL);
             FGX.record->final = 2; /* exact canvas input was replaced, not a shader-name-only guess */
         }
         if (FGX.record->final &&
                 atomic_load_explicit(&vk_fg_terminal_owned_active,memory_order_relaxed)) {
-            for (int i=0,first=0;i<sh->nb;i++) {
-                const vk_bind *b=&sh->b[i]; dinfo *in=&info[first]; first+=b->count;
-                VkWriteDescriptorSet write={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstBinding=b->binding,.descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype,.pBufferInfo=&in->b,
-                    .pImageInfo=&in->i,.pTexelBufferView=&in->t};
-                if (!vk_fg_terminal_owned_binding(set_index,sh->dsl,&write,b->rw))
+            if (!writes) writes = direct_descriptor_writes(sh, info, array_elements, replay_set);
+            for (int i = 0; i < sh->nb; i++) {
+                if (!vk_fg_terminal_owned_binding(set_index, sh->dsl, &writes[i], sh->b[i].rw))
                     vk_fg_terminal_owned_fail();
             }
         }
