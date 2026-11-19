@@ -2,13 +2,16 @@ package com.aure.totk;
 
 import android.app.NativeActivity;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.AttachedSurfaceControl;
 import android.view.Display;
 import android.view.View;
+import android.view.WindowManager;
 import com.aure.totk.companion.AssetStore;
 import com.aure.totk.companion.CompanionNative;
 import com.aure.totk.companion.DisplayClass;
@@ -54,6 +57,15 @@ public final class TotkActivity extends NativeActivity {
     private static native void nativeGameFocus(boolean focused, boolean singleDisplay);
     private static native void nativeGameInputFocus(boolean top);
 
+    /** The overlay's background sampler uses the sticky system snapshot when battery sysfs is unreadable. */
+    private int batteryTemperatureDeciC() {
+        Intent battery = getApplicationContext().registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (battery == null || !battery.getBooleanExtra(BatteryManager.EXTRA_PRESENT, false)) {
+            return Integer.MIN_VALUE;
+        }
+        return battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+    }
+
     /** runtime/frontend_android.c, on this (the UI) thread: the game asks for text (nn::swkbd). TextEntry answers exactly
      * once: the UTF-8 text, or null when the player cancelled. */
     public void showTextInput(long serial, String prompt, String initial, int maxUnits, int minUnits, boolean secure,
@@ -87,10 +99,20 @@ public final class TotkActivity extends NativeActivity {
         if (f != null) f.rumble(left, right);
     }
 
-    /** Native UI thread, on each window/display lifecycle update. This is an app-local content-rate request,
-     * not a preferred mode or Android setting. -1 selects the highest advertised rate, including fractional Hz.
+    private float frameRateHint;
+    /** Native UI thread, on each window/display lifecycle update. This is an app-local refresh request,
+     * not a display-mode or Android setting change. -1 selects the highest advertised rate, including fractional Hz.
      * Integer requests retain the 0.01 Hz matching tolerance; 0 means no validated override. */
     public float selectFrameRateHint(int hz) {
+        try {
+            return rememberFrameRateHint(queryFrameRateHint(hz));
+        } catch (RuntimeException unavailable) {
+            // JNI withdraws the native vote too; do not retain authority from the previous display.
+            rememberFrameRateHint(0);
+            throw unavailable;
+        }
+    }
+    private float queryFrameRateHint(int hz) {
         Display display = getWindow().getDecorView().getDisplay();
         float highest = 0;
         if ((hz > 0 || hz == -1) && display != null) {
@@ -106,6 +128,20 @@ public final class TotkActivity extends NativeActivity {
                 + (display == null ? "window has no display" : "not advertised by window display " + display.getDisplayId())
                 + "; retaining existing policy");
         return 0;
+    }
+    private float rememberFrameRateHint(float hz) {
+        frameRateHint = hz;
+        applyFrameRateHint();
+        return hz;
+    }
+    private void applyFrameRateHint() {
+        // NativeActivity's window and the native window/AHB child need consistent, persistent votes.
+        // Do not sample the current (possibly idle-throttled) refresh rate or manufacture touch events.
+        float hz = resumed ? frameRateHint : 0;
+        WindowManager.LayoutParams attributes = getWindow().getAttributes();
+        if (attributes.preferredRefreshRate == hz) return;
+        attributes.preferredRefreshRate = hz;
+        getWindow().setAttributes(attributes);
     }
 
     /** Native UI thread only, after its explicit parent transaction succeeded.
@@ -144,6 +180,7 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
+        registerGameMenuBack();
         // NativeActivity synchronously loads totk.env in ANativeActivity_onCreate.
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
@@ -157,6 +194,24 @@ public final class TotkActivity extends NativeActivity {
         }
     }
     private boolean settingsRequested;
+    private boolean gameMenuOpen;
+    /** Android Back opens the existing menu over the live game task; it never destroys NativeActivity. */
+    private void registerGameMenuBack() {
+        // Android 16 ignores onBackPressed for target 36 apps. All supported
+        // devices are API 33+, where the predictive-back dispatcher is available.
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::showGameMenu);
+    }
+    public void showGameMenu() {
+        if (!resumed || gameMenuOpen || isFinishing()) return;
+        gameMenuOpen = true;
+        try { SetupActivity.openOnGame(this); }
+        catch (RuntimeException unavailable) {
+            gameMenuOpen = false;
+            Log.w("TotkGame", "Could not open the in-game menu", unavailable);
+        }
+    }
+    @Override public void onBackPressed() { showGameMenu(); }
     /** Reuse/reparent the singleTask game, never finish it: NativeActivity.onDestroy exits the game process. */
     private void ensureMainDisplay() {
         if (GameLaunch.onMainScreen(this)) {
@@ -190,6 +245,8 @@ public final class TotkActivity extends NativeActivity {
     @Override protected void onResume() {
         super.onResume();
         resumed = true;
+        gameMenuOpen = false;
+        applyFrameRateHint();
         ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
@@ -215,6 +272,7 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onPause() {
         resumed = false;
+        applyFrameRateHint();
         GameFeedback f = feedback;
         if (f != null) f.pause();   // no motion in the background, and no motor left running
         super.onPause();

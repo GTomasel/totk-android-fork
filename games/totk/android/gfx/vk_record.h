@@ -33,11 +33,13 @@ typedef struct {
     uint32_t cmask[2], wmask[2], ref[2], cull, front, topo, dt, dw, dc, st, sop[2][4], restart;
 } vk_record_dynamic;
 typedef struct {
+    /* Vulkan consumes exactly one of these payloads, selected by type. */
     union {
         VkDescriptorBufferInfo b;
         struct { VkBuffer unresolved; uint64_t address, size; } raw; /* null buffer: worker resolves this range */
+        VkDescriptorImageInfo i;
+        VkBufferView t;
     };
-    VkDescriptorImageInfo i; VkBufferView t;
     VkDescriptorBufferInfo lag_range; uint32_t lag_reason;
     uint32_t binding, element; VkDescriptorType type;
 } vk_record_descriptor;
@@ -54,6 +56,7 @@ typedef struct {
     const vk_record_spans *spans;
     uint32_t vertex_mask;
     VkBuffer index; VkDeviceSize index_offset; VkIndexType index_type;
+    VkBuffer indirect; VkDeviceSize indirect_offset; /* GPU-generated quad count; zero for ordinary draws */
     uint64_t index_address; /* optional unresolved index range; walk-selected handles need no worker lookup */
     uint64_t lag_ticket, index_bytes; uint32_t index_lag_reason;
     uint32_t count, instances, first, base_instance; int32_t vertex_offset;
@@ -136,6 +139,8 @@ void vk_record_primary_pools(int64_t delta); /* primary slots' retained descript
    vk_desc_layout_fits refuses such a layout where it is created instead, naming the type. */
 enum { VK_DESC_POOL_TYPES = 8 };
 extern const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES];
+int vk_desc_compact_pools(void);
+VkResult vk_desc_pool_create(uint32_t max_sets, int full_size, VkDescriptorPool *out);
 int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size);
 /* Descriptor-set stock (TOTK_VK_DESC_STOCK=1, read once with the recorder controls). One stock per owner that
    used to reset its pools each slot generation: take only checks out sets not yet issued this generation (the
@@ -157,17 +162,28 @@ VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout 
 int vk_desc_stock_retire(vk_desc_stock *stock, uint32_t ceiling, uint32_t pools, uint32_t pool_sets); /* 0: keep */
 void vk_desc_stock_free(vk_desc_stock **stock);   /* the owner switched the stock off: its bookkeeping, not its pools */
 void vk_record_descriptor_stock_event(unsigned reason, uint64_t pools_destroyed); /* serialized primary owner */
+enum { VK_DESC_IDLE_GENERATIONS = 32 };
+typedef struct { uint32_t generations, peak; } vk_desc_idle;
+int vk_desc_trim_idle(void);
+uint32_t vk_desc_idle_keep(vk_desc_idle *idle, uint32_t used, uint32_t retained);
+void vk_record_descriptor_idle_free(int primary, uint32_t pools);
 int vk_record_counter_timestamp(VkQueryPool pool, uint32_t query, VkPipelineStageFlags2 stage);
 #ifdef TOTK_VK_TESTS
+int vk_draw_test_descriptor_arrays(VkDescriptorSet set, const vk_record_descriptor input[6]);
 void vk_record_test_descriptor_retained(uint64_t out[4]); /* recorder pools, primary pools, stock sets, bytes per pool */
 void vk_record_test_descriptors(uint64_t out[8]); /* sets, allocate calls, resets, walk ns, list ns/count, template ns/count */
 void vk_record_test_wakes(uint64_t out[4]); /* TOTK_VK_REC_WAKE_BATCH: walker signals, worker-chained signals, polled hits, parks */
 int vk_record_test_descriptor_stock(void); /* isolated real-driver checkout/recycle/batch/pressure fixture */
+int vk_record_test_descriptor_batch(int enabled);
 int vk_record_test_descriptor_ceiling(void); /* the stock ceiling on one recorder context, set live at its handoffs */
+int vk_record_test_descriptor_idle(int enabled);
 void vk_test_descriptor_pools_check(unsigned slot); /* nvn_vk.c: slot's pools may be reset/destroyed now (counted) */
 void vk_test_descriptor_pools_stats(uint64_t *checks, uint64_t *violations);
 void vk_record_test_stock_events(uint64_t out[VK_DESC_STOCK_REASONS + 1]); /* published resets per reason, pools destroyed */
 void vk_record_test_storage(uint64_t values[4]); /* retention budget, reclaimed slots/bytes/secondary CBs */
+#ifdef __linux__
+void vk_record_test_discard_free(int enabled, uint64_t out[8]);
+#endif
 void vk_record_test_primary_memory(uint64_t values[2]); /* retained primary CBs, reclaimed primary CBs */
 void vk_record_test_leases(uint64_t values[4]); /* published active leases, summed worker peak, returned leases, cold resets */
 typedef struct {

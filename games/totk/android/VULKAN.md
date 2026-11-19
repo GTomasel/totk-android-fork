@@ -1054,9 +1054,11 @@ The growth contract below applies after that one-time metadata migration. See AP
 limitations and the bounded Duo cache-reload evidence, not a claim to repair arbitrary opaque driver entries.
 
 
-The new single saver checks every **5 s**. It tracks successful graphics/compute creations (including cache hits
-and library links), plus startup imports. **Every snapshot requires positive growth in the cheap size-only
-query versus the last saved size**, including deadline and lifecycle/shutdown snapshots. An unchanged (or smaller)
+The single saver checks every **5 s**. It tracks successful graphics/compute creations (including cache hits
+and library links), plus startup imports. The size query can lock and traverse the driver cache. The saver does
+it on eligible quiet polls, at the dirty deadline or on a lifecycle flush. A snapshot reuses the size measured
+on the same poll. **Ordinary snapshots require positive size growth versus the last saved size**. A pending
+prewarm progress marker can also require extraction to bind that marker to the persisted cache. An unchanged (or smaller)
 size acknowledges exactly the generation sampled **before** that size probe and clears dirty age, without payload
 extraction, allocation or IO; creates completing between sampling/probing/acknowledgement remain dirty for another
 probe. It logs `skipped reason=unchanged-size change_detection=size-growth-heuristic` (other fields intervene).
@@ -1087,8 +1089,10 @@ One saver owns scratch, policy and file replacement. Lifecycle callers only chan
 requests; they never touch scratch or Vulkan. Creation generation and present hints are atomic. The generation
 is sampled **before extraction**, not after it; concurrent creations cannot be acknowledged by an older snapshot.
 No backend cache or recorder lock is held by the saver; compile workers and recorder remain concurrent.
-The saver is joinable; scratch is released only after its final attempt, with concurrent shutdown callers serialized.
-The retained buffer grows geometrically (`size + size/8 + 1 MiB`) only when capacity is insufficient.
+The saver is joinable, with concurrent shutdown callers serialized. The private staging mapping grows geometrically
+(`size + size/8 + 1 MiB`) only when capacity is insufficient. On Android and Linux, completed and failed
+snapshots release resident staging pages while retaining the address range for reuse. Growth starts with a fresh
+mapping because Vulkan overwrites the snapshot.
 Each file transaction handles short writes/EINTR, fsyncs the temp file, closes it, renames atomically, then fsyncs
 the parent directory. Pre-rename failure preserves the old file. Directory-sync failure after rename leaves the
 complete new file visible but does **not** advance the durable baseline. No opaque blobs are concatenated.
@@ -1107,7 +1111,7 @@ overlap and must not be added into a frame budget.
 
 Host coverage: `vkpcachetest` runs synthetic policy/time tests, unchanged-size quiet/deadline/lifecycle skips,
 actual-size growth and failed-size-probe retention, all snapshot failure stages, concurrent atomic-file readers,
-incomplete extraction, scratch reuse, two real Vulkan creators with concurrent extraction/lifecycle/shutdown,
+incomplete extraction, scratch reuse and page residency, two real Vulkan creators with concurrent extraction/lifecycle/shutdown,
 and an exec'd fresh-process reload using the production loader. Controlled test-only padding around real Vulkan
 data supplies deterministic size-growth stimuli; no such padding or alternate cache format exists in production.
 TSan checks host races, not Vulkan spec compliance.
@@ -1248,7 +1252,11 @@ later completions remain dirty. Dirty list progress is the one explicit exceptio
 same-size-cache save suppression: lifecycle flush or a quiet >=60 s opportunity extracts even a
 same-size cache, so a cache-hit-only list can acquire a durable marker. Interrupted publication
 can lose progress, never falsely acknowledge an unsaved cache. Partial bitmaps resume next boot;
-fully completed matching lists do no speculative work next boot.
+fully completed matching lists skip speculative work on the next boot by default.
+The optional `TOTK_PSO_RECREATE_CAPTURES=1` also queues previously completed capture entries in
+an enabled list of at most 32 total keys. Each process owns its Vulkan handles, and a disk cache
+hit can still take time to create a handle. This arm uses the existing capture priority,
+pressure checks and cache-only probe. Replay leaves the persisted bitmap format unchanged.
 
 `[pso-prewarm] list=... resumed=N/T missing=M startup_ms=...` reports resolver/startup cost;
 `progress N/T ... build_ms=... wall_ms=...` reports compilation progress. `vk_pipeline_keys_stats`
@@ -1984,14 +1992,40 @@ submission while pinned slots are skipped. Both pass at 0/2/3 recorder workers, 
 under ThreadSanitizer (`LP_NUM_THREADS=0`, no suppressions) with zero violations; no Khronos validation layer is
 installed on the host.
 
+`TOTK_VK_DESC_TRIM_IDLE=1` is a startup experiment for owners with descriptor
+stock off. At the existing retirement handoff it resets only the prefix that
+allocated sets. Every 32 recycled generations it keeps the peak number of pools
+used in that window, with a floor of one once an owner has allocated a pool.
+An owner that does not recycle again keeps its capacity. A later burst can grow
+the pools again. The `[descriptor-idle-trim]` log counts actual destroyed pools
+for recorder and primary owners. The retained MiB calculation on the
+`descriptors` line remains an estimate of declared capacity.
+
+`TOTK_VK_DESC_BATCH=1` batches fresh sets within a recorder owner's
+current generation, with stock off. The first eight requests to an
+exact layout allocate individually. Later requests fill batches of
+up to eight through the existing capacity-aware allocator. Each
+owner tracks up to four layouts and can finish a generation with at
+most 28 unused allocations. The retired generation's pool reset
+invalidates all cached handles. Every issued set still takes its
+normal descriptor writes and bindings. This is off by default.
+[Vulkan descriptor allocation and pool lifetime](https://docs.vulkan.org/spec/latest/chapters/descriptorsets.html)
+
 `TOTK_VK_STAGING_RETAIN_MB=N` (default unset = no cap; logs `staging retention: N MiB per slot` or `staging retention:
 no cap`) caps what each of the 8 slot arenas keeps after its reset. Texture-upload staging comes from the slot arena,
 and a reset keeps what the submission needed (compacted into one high-water chunk), so an upload burst stays allocated
-in that slot for the session; with N (8…4096) a slot keeps whole chunks up to N MiB and clips the high-water hint to N,
+in that slot for the session. With N (1…4096) a slot keeps whole chunks up to N MiB and clips the high-water hint to N,
 and a later submission that needs more allocates it again. Live (`totk.ctl`) at each slot open, after its fence. The
 per-300 `memory staging retention: cap N MiB per slot, trims T, M MiB not retained` line counts it; compare
 `memory recording: slot/... arenas retained`. Host `vktest --staging-retain` (a 45 MiB burst, then 16 quiet
 submissions): the slot arenas keep 101 MiB uncapped, 72 MiB with N=16 (the burst slot 45 → 16 MiB).
+
+A cap below 8 MiB allows the first allocation in an empty slot to start at that smaller size.
+Additional buffers use the usual 8 MiB floor. `TOTK_VK_STAGING_EARLY_TRIM=1` enables a separate
+startup experiment with a finite cap. Before a new texture staging allocation, the recorder can
+release at most four extra upload-only chunks from one other completed and unpinned slot.
+Chunks that served general callers keep their ordinary lifetime until their slot reopens.
+Use the `[arena-early-trim]` counter alongside actual staging peaks and allocation counts.
 
 `recorder overhead ...` additionally separates synchronous secondary recording, batched ExecuteCommands, walking
 and worker pool-reset time, and job setup. Reset is a subset of inline/worker busy time, not another additive cost.
@@ -3320,6 +3354,7 @@ eligible consumers below50ms without weakening an unfinished producer's completi
 | `TOTK_VK_SETTLED_WB_DETAIL=1` | At most 64 `[settledwb]` lines per 300-frame window: shape/format/levels, serial/storage/pool, guest/image bytes, storage landing count, old/next quiet interval, idle/invalidate cause. |
 | `TOTK_VK_WB_SERVICE_STATS=1` | Default OFF. Every300presents: recording-lock hold max/peak and owner-service delay p50/p99 upper bounds/max (100µs histogram bins, overflow uses max); no idle opcode clocks/locks. |
 | `TOTK_VK_WRITEBACK=1` | Select full legacy invalidate flush/authority behavior, default off; not required for fresh default explicit consumers. `TOTK_VK_OFF=writeback` disables only this legacy path. |
+| `TOTK_WB_ALIAS=1` | Experimental, launch-only, default OFF; only exact `1` enables it. Retain one backend-private RW mapping per dma-buf-backed owner and land supported dirty-tracked extents through it without temporarily making protected guest pages writable. Unset/other values preserve the original path and logs. |
 | `TOTK_VK_OFF=settledbackoff` | Disable learned history; use the base quiet interval for every rendering. |
 | `TOTK_VK_OFF=settledinval` | Disable default explicit-consumer landing at all ages; keep ordinary automatic settled copies. |
 | `TOTK_VK_OFF=settleddrain` | Diagnostic only: omit frontend drain for a matched default consumer; may weaken queued-command ordering. |
@@ -3359,9 +3394,10 @@ the later eight-run qualification includes the resumable1MiB/~2ms landing budget
 or its hybrid/native-interpolation interaction. See `DEBUGGING.md`; host coverage alone does not qualify that combination.
 Run `vkdrawtest --settled-wb-race` for the concurrent landing boundary test: 128 trials each before ownership,
 faulted under still-RO BUSY ownership, temporary RW before/after freshness, and after RO restoration; every writer
-stores 256 rounds into texture bytes and both adjacent same-page guards. The three protected/stamped cases must
-preserve CPU bytes; the two temporary-RW cases intentionally demonstrate residual overwrite without dirty publication.
-All adjacent guards must stay intact. Test-only handoffs do not exist in shipping code.
+stores 256 rounds into texture bytes and both adjacent same-page guards. With aliases off or unsupported backing,
+the three protected/stamped cases must preserve CPU bytes; the two temporary-RW cases intentionally demonstrate
+residual overwrite without dirty publication. All adjacent guards must stay intact. Test-only handoffs do not
+exist in shipping code. The opt-in alias path below removes that temporary-RW window only for protected guest pages.
 
 Run `vkdrawtest --settled-wb-learning` for 64 prompt RG8 tiles, 40 intermittent refreshes/new serials without recurring
 automatic copies, default invalidate before learned deadlines/reuse of staged data, CPU overwrite, fresh rendering,
@@ -3384,6 +3420,106 @@ one unbounded draw-free jump stream, proving no draw/return/submit is needed. Ru
 `TOTK_VK_TEST_OWNER_PENDING=1` adds real no-op owner requests and reports their completed count.
 Run `--settled-wb-budget` for partial >10MiB landings, byte/yield accounting, complete invalidate and CPU/GPU/pool
 cancellation between chunks, plus a point-address swizzle oracle covering2D/array/3D/linear layouts and padding.
+
+### Private write-back aliases (`TOTK_WB_ALIAS=1`, experimental)
+
+Launch-only and **default off**; only the exact value `1` enables it.
+This does not enable write-back or frame lag; their existing policies remain in force. It retains the original
+temporary `MAP_SHARED`, `PROT_READ | PROT_WRITE` mapping made when each `K_OWN` dma-buf is populated, instead of
+unmapping it. Guest and private mappings use the same fd, offsets and exporter-selected memory attributes.
+`K_VIEW` and mapped `K_VIRT` ranges resolve to that owner plus the real backing offset. The pool registry lock
+pins backing through the last store and dirty-token end; deletion/remapping cannot recycle an alias mid-landing.
+Cross-owner landings split at every backing transition. The span encoder receives pointers inside each real
+mapping, handles arbitrary byte-clipped splits and leaves padding untouched, without another staging allocation.
+Enabled production MapVirtual replacements (including anonymous unmap and mremap fallback) retire old
+destination authority under the same registry lock as the actual mapping syscall. Only a proved successful
+fd mapping installs a private-writer translation; anonymous/unproved pages use the current guest destination.
+Failed potentially partial replacements never revive stale donor metadata. Host-owned final release uses the
+same serialized retirement; deleting only a VIEW registration does not invalidate its unchanged owner mapping.
+
+For a texture landing extent, **all** bytes must have supported backing and dirty tracking, and the record must
+have its existing tracked-watch/ownership eligibility before selecting aliases. Watch-slot exhaustion and other
+no-token synchronous records retain the legacy guest destination; range registration alone grants no ownership.
+Mixed, untracked, host-import or CPU-only extents likewise retain the whole extent's original protocol. Report, event and
+uniform publications attempt the same backing pin with a nonblocking registry trylock, then use per-owner spans
+and the old store path for unsupported segments. On registry contention they immediately use the exact original
+whole-operation store without borrowing an alias pointer; that fallback may still change guest protections.
+This avoids a pool-deletion/completion lock cycle without changing the original lifetime/order protocol.
+An event's 32-bit assignment/addition is not split between owners; this adds no atomicity to the original operation.
+
+Alias ownership retains the existing reader tickets/unit gates, `PG_BUSY`, watch and generation checks, including
+freshness **after** ownership. A protected guest page stays RO throughout: a fresh direct CPU store faults and
+waits, then publishes the normal CPU dirty generation after alias ownership ends, preserving that CPU write.
+Alias stores themselves publish no CPU dirty generation; end restores `PG_PROT` state without `mprotect`.
+Alias gate acquisition also avoids the lag-only VMA-pressure drain that could otherwise open a guest RW window.
+This closes the documented temporary-RW race for those protected guest pages, **not** every already-writable page
+or unwatched writable alias of the same backing. Unsupported/contended fallback retains its old residual window.
+Runtime commit/decommit, zero-on-recommit and ordinary CPU-write/fault behavior are unchanged; the private pointer
+is not guest commitment authority and is never registered as a guest dirty range.
+
+Cost: one additional live VMA and owner-sized virtual-address extent per retained mapping, plus mapping/page-table
+overhead, not another pool-sized physical/RSS backing allocation. Procfs RSS accounting may count the same resident
+pages through multiple mappings; the reported alias byte count is mapped VA, not extra physical memory.
+This avoids these write-back permission flips, not all dirty-tracker/runtime `mprotect` calls, existing fragments
+or every source of VMA growth. It is not a replacement for mapping-pressure safeguards.
+Retention does not add an alias-creation recovery path: the original mandatory population/fixed mmap failures
+remain fatal. Extra live VA/VMA pressure therefore needs explicit device headroom/failure qualification.
+
+**Cache/coherency:** on arm64, two CPU mappings of the same physical pages with identical memory type, cacheability
+and shareability need no additional CPU-alias cache maintenance. RO versus RW access permission is independent.
+Cached versus write-combined attributes must match; same-fd shared mappings preserve the exporter's selection.
+[AOSP system heap](https://android.googlesource.com/kernel/common/+/refs/heads/android14-6.1/drivers/dma-buf/heaps/system_heap.c)
+uses `pgprot_writecombine` only for its `uncached` buffers; published
+[QCOM mapping](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550/blob/c462ef8ffab7a58e035ee04705b16cdfced494b1/drivers/dma-buf/heaps/qcom_sg_ops.c)
+does likewise. Both inspected implementations select cached `system` heaps separately from their uncached heaps.
+The bundled Turnip KGSL shared-allocation path uses the system-heap fd, not its separate native-KGSL cachemode flags.
+These are source facts, **not proof of the actual Odin vendor exporter/kernel identity**.
+[Arm's alias-attribute requirements](https://documentation-service.arm.com/static/63a43e333f28e5456434e18b)
+do not eliminate CPU/GPU coherency, fences, barriers or cache synchronization: all existing device synchronization
+remains required and unchanged. See `.scratch/perf/map-limit/wb-alias/design.md` for the source-selection analysis.
+
+Enabled startup adds `[nvn-vk] write-back alias: enabled (TOTK_WB_ALIAS=1); backend-private RW dma-buf mapping per owned pool; host-import/CPU ranges use existing path`.
+The existing memory report additionally emits `[nvn-vk] memory write-back aliases: mappings N, bytes B (backend-private RW dma-buf; not guest pools)`,
+where N/B are current live retained mappings/page-rounded owner bytes. These are not guest-pool counts.
+Off adds neither line and leaves existing logs unchanged. The earlier eight-run settled-write-back qualification
+above predates this switch; it is not alias-path device evidence or a frame-rate/VMA-reduction guarantee.
+
+**First alias-enabled device evidence (AYN Thor):** fix `7129293`, attribution integration `8945e9f`,
+same APK with attribution enabled in both arms, alias first then legacy. Across five common completed loads,
+texture GPU-unprotect new boundaries were **0 versus 17,214** and mean whole-process row growth was
+**+1,025 versus +4,535/load** (legacy +4,534.8 before rounding). Enabled completed a sixth load; legacy
+stopped input during load six at the planned mapping-pressure safety threshold, then closed normally.
+Sampled pictures showed no switch-attributable corruption; this is not exhaustive rendering/cache-coherency proof.
+All pooled metrics for thirteen admitted standing window pairs, including frame tails, were SAME. Some
+individual Hateno phases had tool-WORSE tails, and no pan pairs were admitted: the ordered pair is not a
+causal speed proof or grounds to enable by default. Odin and Duo have **not** been tested with this switch.
+Other watch/fault/host and non-pool mapping growth remains. Full controls, limitations and picture evidence:
+`.scratch/perf/map-limit/wb-alias/thor/report.md`. Earlier settled-write-back evidence above remains distinct.
+
+With the switch enabled, one additional cumulative path-coverage line is emitted at the existing periodic
+memory-report cadence, on each effective Android pause edge, and at normal `atexit`:
+```
+[nvn-vk] memory write-back alias paths: phase=PHASE cumulative=1 landing=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B store=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B publication=alias:O/B,registry:O/B,ownership:O/B,mixed:O/B,non-dmabuf:O/B,retired:O/B,other:O/B
+```
+`PHASE` is `periodic`, `pause` or `exit`; each decimal `O/B` is operation incidences / requested bytes.
+`landing` covers dispatched texture encoders (including padding in their logical span), `store` covers report/event
+stores, and `publication` covers uniform-buffer publications. Freshness-rejected/deferred work without a writer
+dispatch is not counted. Multiple supported owners count once per logical operation, not once per owner.
+A split store can contribute one `alias` incidence plus one `mixed` fallback incidence, with bytes partitioned
+between those paths; therefore summing incidences is not a unique-call count. Bytes describe attempted spans,
+not the number of texels changed or completed writes.
+
+Reasons are `registry` (nonblocking pin contention), `ownership` (landing lacks its existing tracked-watch/token
+eligibility or dirty containment), `mixed` (unsupported/mixed backing classes, or an unsplittable event word
+crossing owners), `non-dmabuf` (known HOST/CPU backing without a retained private mapping), `retired`
+(known virtual hole or invalidated guest-translation proof), and `other` (unregistered/invalid extent or no
+more specific proof). Classification uses current registry authority, not a kernel/exporter query. Entirely
+unregistered retired ranges are consequently `other`; landing's blocking lifetime pin never reports `registry`.
+Counters are lock-free relaxed atomics; snapshots are nontransactional and never reset. Reporting runs only
+in ordinary thread context, not the fault handler. Off adds no counters or new log lines. Abrupt `_exit`,
+abort, fatal signals and process kills do not promise an exit snapshot.
+An independent relaxed atomic reporting latch permits an early UI pause during Vulkan startup without reading
+the game-thread-only switch flag or waiting for/initializing Vulkan; reporting needs no other published state.
 
 ## Finding rendering errors: the frame dump
 

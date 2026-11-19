@@ -29,7 +29,7 @@ samples-<d>.txt, settings-<d>.env, facts-<d>.txt, totk-env-<d>.txt (only when a 
 pans.txt lines with the same device and scene (a trailing repeat number is ignored: hateno2 = hateno) form one run.
 --meta: a JSON object deep-merged over the generated document (curated device names / profiles, build fields);
 its "caveats" are appended to the generated ones. Never writes a baseline file (benchlib.guard_output)."""
-import argparse, collections, datetime, json, os, re, statistics, sys
+import argparse, collections, datetime, json, math, os, re, statistics, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchlib import SCHEMA, caps_of_limits, device_signature, guard_output, parse_freq_tokens, sig_caps_text  # noqa: E402
@@ -64,6 +64,60 @@ AB_METRICS = ('fps_steady', 'dip_time_fraction', 'throughput_fps', 'fps_mean', '
               'gpu_ms_mean', 'over33_total', 'over50_total', 'long_ge45_total')
 PRESENT_BIN_LABELS = ('<12.5', '12.5-20.9', '20.9-29', '29-37.5', '37.5-45.8', '>=45.8')
 
+MEMORY_TAG_RE = re.compile(r'\[nvn-vk\] \[(image-memory|image-ownership|mirror-age|guest-shmem|guest-shmem-displaced|image-peaks|arena-peaks|'
+                           r'image-allocation-high|image-allocation-pressure|arena-allocation-high|image-reclaim-before-grow|'
+                           r'arena-tail-reuse|texel-buffer-release|pool-images|wb-queue|upload-prep|upload-partial|'
+                           r'image-realization-retry|recorder-free-pages|arena-early-trim|descriptor-idle-trim|image-block-classes)\] (.*)')
+MEMORY_FIELDS_RE = re.compile(r'\b(\w+)=(\d+(?:\.\d+)?)(?=\s|$)')
+MEMORY_PUBLISHED_FRAME_TAGS = {'image-ownership', 'mirror-age', 'guest-shmem-displaced', 'image-peaks', 'image-block-classes',
+                               'image-allocation-pressure', 'image-realization-retry'}
+MEMORY_SUMMARY_RE = re.compile(
+    r'\[nvn-vk\] memory: malloc (?P<malloc_mib>\d+) MiB in use; image blocks (?P<blocks_mib>\d+) MiB '
+    r'\+ dedicated (?P<dedicated_mib>\d+) MiB, (?P<retired_records>\d+) images retired waiting, '
+    r'(?P<textures>\d+) texture objects, (?P<shared_images>\d+) shared images, (?P<write_back_records>\d+) '
+    r'write-back records, \d+ retired list capacity; pools (?P<guest_pools>\d+) \((?P<guest_pool_mib>\d+) MiB\)')
+MEMORY_BLOCKS_RE = re.compile(r'\[nvn-vk\] memory image blocks: used/free ([\d.]+)/([\d.]+) MiB')
+MEMORY_RECORDING_RE = re.compile(
+    r'\[nvn-vk\] memory recording: slot/snapshot arenas retained ([\d.]+)/([\d.]+) MiB; '
+    r'draw packet slabs ([\d.]+) MiB, descriptor input slabs ([\d.]+) MiB')
+MEMORY_WB_RE = re.compile(r'\[nvn-vk\] settled write-back memory:.*?\bstaging (\d+) bytes(?:, peak staging (\d+) bytes)?')
+UPLOAD_RE = re.compile(r'\[nvn-vk\] frame (\d+), texture uploads: (\d+) \(([\d.]+) MiB\) in ([\d.]+) ms')
+PIPELINE_IN_STUTTER_RE = re.compile(r'; (\d+) new pipelines took ([\d.]+) ms \(longest ([\d.]+) ms\)')
+RENDERER_LONG_FRAME_RE = re.compile(
+    r'\[nvn-vk\] long frame (?P<frame>\d+): (?P<present_ms>\d+) ms since the last present; '
+    r'recording (?P<recording_ms>\d+\.\d+) ms \(pipelines made at the draw '
+    r'(?P<graphics_pipeline_ms>\d+\.\d+), compute pipelines (?P<compute_pipeline_ms>\d+\.\d+), '
+    r'seed files (?P<seed_read_ms>\d+\.\d+)\), GPU waits while recording '
+    r'(?P<gpu_wait_ms>\d+\.\d+) ms, the game\'s sync waits (?P<game_sync_wait_ms>\d+\.\d+) ms')
+TIMELINE_LATE_RE = re.compile(r'\[frame-tl late\] frame=(\d+) (.*)')
+TIMELINE_MS_FIELDS = ('target', 'game_iv', 'apply_iv', 'display_iv', 'growth', 'wake_gap', 'dispatch',
+                      'walk', 'offcpu', 'join', 'submit_latency', 'queue_cpu', 'acquire', 'present_delay',
+                      'acquire_pacing', 'acquire_texture')
+TIMELINE_GPU_MS_FIELDS = ('gpu', 'gpu_tail', 'gpu_backlog_or_observe')
+
+
+def late_timeline_frame(match):
+    fields = dict(re.findall(r'(?:^|\s)([a-z_]+)=(\S+)', match[2]))
+    row = {'timeline_frame': int(match[1])}
+    if 'dominant' in fields:
+        row['dominant'] = fields['dominant']
+    gpu_complete = fields.get('gpu_complete')
+    if gpu_complete in ('0', '1'):
+        row['gpu_complete'] = gpu_complete == '1'
+    for key in ('lost_walks', 'lost_slots'):
+        if fields.get(key, '').isdigit():
+            row[key] = int(fields[key])
+    timing = {}
+    keys = TIMELINE_MS_FIELDS + (TIMELINE_GPU_MS_FIELDS if row.get('gpu_complete') else ())
+    for key in keys:
+        try:
+            value = float(fields[key])
+        except (KeyError, ValueError):
+            continue
+        if math.isfinite(value):
+            timing[key] = value
+    row['timings_ms'] = timing
+    return row
 
 def parse_log(path):
     timing, gpu, fps, stut, longf, info = {}, {}, {}, {}, [], {}
@@ -72,56 +126,109 @@ def parse_log(path):
     last_window = None
     recording, present_stats, present_bins, traces = {}, {}, {}, {}
     frame_p99 = {}
-    for line in open(path, encoding='utf-8', errors='replace'):
-        if record := compile_record(line):
-            compilations[record[0]] = record[1]
-        if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
-            timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
-        if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
-            frame_p99[int(m[1])] = (float(m[3]), int(m[2]))
-        if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
-            gpu[int(m[1])] = float(m[4])
-            recording[int(m[1])] = float(m[2])
-        if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
-            fps[int(m[1])] = float(m[2])
-            last_window = int(m[1])
-            if d := re.search(r'over the last 300, (\d+) draws\b', line):
-                draw_samples.append((last_window, int(d[1])))
-        if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
-            stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
-        if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
-            longf.append((int(m[1]), float(m[3])))
-            frame_ms[int(m[1])] = float(m[3])
-        if m := re.search(r'\[frame-tl late\] frame=(\d+).*?\bgame_iv=([\d.]+)', line):
-            frame_ms.setdefault(int(m[1]), float(m[2]))
-        if last_window is not None and 'window present-fence cadence,' in line:
-            if m := re.search(r'p50/p95/p99=([\d.]+)/([\d.]+)/([\d.]+)ms', line):
-                present_stats[last_window] = {'present_p95_ms': float(m[2]), 'present_p99_ms': float(m[3])}
-        if last_window is not None and (m := re.search(
-                r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
-            bins = [int(x) for x in m.groups()]
-            present_bins[last_window] = bins
-            if sum(bins) == 300:
-                near33[last_window] = bins[3]
-        if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
-            info['game_version'] = m[1]
-        if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
-            info['turnip'] = m[1]
-        if 'settings' not in info and (m := re.search(r'^\[totk-app\] settings\.env \([^)]*\): (.*)$', line)):
-            info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
-        if 'device lost' in line.lower():
-            info['device_lost'] = info.get('device_lost', 0) + 1
-        if '[present-trace]' in line:
-            fields = dict(re.findall(r'(\w+)=(\S+)', line))
-            keys = ('id', 'generation', 'source_frame', 'display_ns')
-            if all(fields.get(k, '').isdigit() for k in keys):
-                row = {k: int(fields[k]) for k in keys}
-                key = row['generation'], row['id']
-                # Identical duplicate delivery is harmless; conflicting identities cannot establish an interval.
-                traces[key] = row if key not in traces or traces[key] == row else None
+    renderer_memory = collections.defaultdict(dict)
+    allocation_events, pending_write_back = [], None
+    upload_windows, pipeline_windows, walker_windows = {}, {}, {}
+    renderer_long_frames, timeline_late_frames = [], []
+    with open(path, encoding='utf-8', errors='replace') as log:
+        for line in log:
+            if record := compile_record(line):
+                compilations[record[0]] = record[1]
+            if m := re.search(r'计时 至帧 (\d+)： 帧时间 p50 ([\d.]+) / p95 ([\d.]+) / 最大 ([\d.]+) ms', line):
+                timing[int(m[1])] = tuple(float(x) for x in m.groups()[1:])
+            if m := re.search(r'帧间隔 至帧 (\d+)：>16\.7ms \d+ / (\d+) 帧，p99 ([\d.]+) ms', line):
+                frame_p99[int(m[1])] = (float(m[3]), int(m[2]))
+            if m := re.search(r'\[nvn-vk\] frame (\d+), per frame: recording ([\d.]+) ms, waiting for the GPU ([\d.]+) ms, GPU ([\d.]+) ms', line):
+                gpu[int(m[1])] = float(m[4])
+                recording[int(m[1])] = float(m[2])
+            if m := re.search(r'\[nvn-vk\] frame (\d+): ([\d.]+) fps over the last 300', line):
+                previous_window, last_window = last_window, int(m[1])
+                fps[last_window] = float(m[2])
+                # vk_slot_stats prints write-back just before this window header.
+                if pending_write_back is not None:
+                    if previous_window is None or last_window == previous_window + 300:
+                        renderer_memory[last_window]['write_back'] = pending_write_back
+                    pending_write_back = None
+                if d := re.search(r'over the last 300, (\d+) draws\b', line):
+                    draw_samples.append((last_window, int(d[1])))
+            if m := re.search(r'\[nvn-vk\] frame (\d+), stutter: longest frame ([\d.]+) ms, (\d+) frames over (\d+) ms, (\d+) over (\d+) ms', line):
+                stut[int(m[1])] = (int(m[3]), int(m[4]), int(m[5]), int(m[6]))
+                if builds := PIPELINE_IN_STUTTER_RE.search(line):
+                    pipeline_windows[int(m[1])] = dict(count=int(builds[1]), total_ms=float(builds[2]),
+                                                      longest_ms=float(builds[3]))
+            if m := UPLOAD_RE.search(line):
+                upload_windows[int(m[1])] = dict(count=int(m[2]), mib=float(m[3]), total_ms=float(m[4]))
+            if m := RENDERER_LONG_FRAME_RE.search(line):
+                fields = m.groupdict()
+                renderer_long_frames.append({'frame': int(fields.pop('frame')),
+                                             **{key: float(value) for key, value in fields.items()}})
+            if m := re.search(r'\[nvn-vk\] walker cpu frame (\d+): cpu ([\d.]+) ms/frame, '
+                              r'wall ([\d.]+) ms/frame, .* offcpu ([\d.]+) ms/frame', line):
+                walker_windows[int(m[1])] = dict(cpu_ms=float(m[2]), wall_ms=float(m[3]), off_cpu_ms=float(m[4]))
+            if m := MEMORY_WB_RE.search(line):
+                pending_write_back = {'staging_bytes': int(m[1])}
+                if m[2] is not None:
+                    pending_write_back['peak_staging_bytes'] = int(m[2])
+            if m := MEMORY_TAG_RE.search(line):
+                tag, detail = m.groups()
+                values = {key: float(value) if '.' in value else int(value)
+                          for key, value in MEMORY_FIELDS_RE.findall(detail)}
+                if tag.endswith('-allocation-high') and 'sub' in values:
+                    allocation_events.append({'tag': tag, 'after_window_frame': last_window, **values})
+                elif not tag.endswith('-allocation-high') and values:
+                    frame = values.get('frame', last_window)
+                    # The image report follows the window header, before the presented frame counter advances.
+                    if last_window is not None and frame == last_window - 1 and tag in MEMORY_PUBLISHED_FRAME_TAGS:
+                        frame = last_window
+                    if frame is not None and frame > 0:
+                        renderer_memory[frame][tag] = values
+            if last_window is not None and '[nvn-vk] memory' in line:
+                if m := MEMORY_SUMMARY_RE.search(line):
+                    renderer_memory[last_window]['totals'] = {k: int(v) for k, v in m.groupdict().items()}
+                if m := MEMORY_BLOCKS_RE.search(line):
+                    renderer_memory[last_window]['block_spans'] = {'used_mib': float(m[1]), 'free_mib': float(m[2])}
+                if m := MEMORY_RECORDING_RE.search(line):
+                    renderer_memory[last_window]['recording'] = dict(zip(
+                        ('slot_mib', 'snapshot_mib', 'packet_mib', 'descriptor_mib'), map(float, m.groups())))
+            if m := re.search(r'\[长帧\] 帧 (\d+)（([\d.]+) s）整帧 ([\d.]+) ms', line):
+                longf.append((int(m[1]), float(m[3])))
+                frame_ms[int(m[1])] = float(m[3])
+            if m := TIMELINE_LATE_RE.search(line):
+                late = late_timeline_frame(m)
+                timeline_late_frames.append(late)
+                if 'game_iv' in late['timings_ms']:
+                    frame_ms.setdefault(late['timeline_frame'], late['timings_ms']['game_iv'])
+            if last_window is not None and 'window present-fence cadence,' in line:
+                if m := re.search(r'p50/p95/p99=([\d.]+)/([\d.]+)/([\d.]+)ms', line):
+                    present_stats[last_window] = {'present_p95_ms': float(m[2]), 'present_p99_ms': float(m[3])}
+            if last_window is not None and (m := re.search(
+                    r'window present-fence interval bins ms \[<12.5,12.5-20.9,20.9-29,29-37.5,37.5-45.8,>=45.8\]: all=(\d+)/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)', line)):
+                bins = [int(x) for x in m.groups()]
+                present_bins[last_window] = bins
+                if sum(bins) == 300:
+                    near33[last_window] = bins[3]
+            if 'game_version' not in info and (m := re.search(r'^\[totk\] game version (\S+)', line)):
+                info['game_version'] = m[1]
+            if 'turnip' not in info and (m := re.search(r'driver sha256=([0-9a-f]{64})', line)):
+                info['turnip'] = m[1]
+            if 'settings' not in info and (m := re.search(r'^\[totk-app\] settings\.env \([^)]*\): (.*)$', line)):
+                info['settings'] = dict(kv.split('=', 1) for kv in m[1].split() if '=' in kv)
+            if 'device lost' in line.lower():
+                info['device_lost'] = info.get('device_lost', 0) + 1
+            if '[present-trace]' in line:
+                fields = dict(re.findall(r'(\w+)=(\S+)', line))
+                keys = ('id', 'generation', 'source_frame', 'display_ns')
+                if all(fields.get(k, '').isdigit() for k in keys):
+                    row = {k: int(fields[k]) for k in keys}
+                    key = row['generation'], row['id']
+                    # Identical duplicate delivery is harmless; conflicting identities cannot establish an interval.
+                    traces[key] = row if key not in traces or traces[key] == row else None
     info['frame_ms'], info['near33'] = frame_ms, near33
     info['draw_rates'] = cumulative_draw_rates(draw_samples)
     info['compilations'] = compilations
+    info.update(renderer_memory=dict(renderer_memory), allocation_events=allocation_events,
+                upload_windows=upload_windows, pipeline_windows=pipeline_windows, walker_windows=walker_windows,
+                renderer_long_frames=renderer_long_frames, timeline_late_frames=timeline_late_frames)
     info.update(recording=recording, present_stats=present_stats, present_bins=present_bins, frame_p99=frame_p99,
                 present_intervals=present_trace_intervals(traces))
     return timing, gpu, fps, stut, longf, info

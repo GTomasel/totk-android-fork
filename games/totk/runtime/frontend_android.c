@@ -40,6 +40,8 @@
 #include "thread_sampler.h"
 #include "build_kind.h"
 #include "android_perf.h"
+#include "android_memory.h"
+#include "romfs_scan.h"
 #include <android/api-level.h>
 #include <android/choreographer.h>
 #include <android/asset_manager.h>
@@ -57,6 +59,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <limits.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -81,6 +84,7 @@ void runtime_android_game_pause_wait(void) {
 }
 uint64_t vk_window_set(ANativeWindow *window, ANativeWindow *surface_parent, int display_id);   /* android/gfx/vk_draw.c */
 void vk_window_resized(ANativeWindow *window, uint64_t epoch);   /* android/gfx/vk_draw.c */
+void vk_wb_alias_report(const char *phase) __attribute__((weak)); /* normal-thread diagnostic snapshot */
 void vk_window_transform_hint(ANativeWindow *window, uint64_t epoch, int hint);   /* android/gfx/vk_draw.c */
 void vk_shader_seed_startup(const char *game_dir);   /* android/gfx/vk_shader.c */
 int vk_overlay_cycle(void);   /* android/gfx/vk_overlay.c */
@@ -1254,10 +1258,11 @@ static int start_refused(void) { if (g_game_lock >= 0) { close(g_game_lock); g_g
    ignored; a developer's options belong in <game>/totk.env, which is read after it and wins. */
 static const char *const settings_keys[] = {
     "TOTK_FPS60", "TOTK_GPU_TIME", "TOTK_FRAMEGEN", "TOTK_RENDER_RES", "TOTK_ACQUIRE_SLACK", "TOTK_POST_SCALE", "TOTK_POST_SHARPNESS",
-    "TOTK_POST_SGSR_SHARPNESS", "TOTK_FXAA", "TOTK_POST_AA", "TOTK_SHADOW_RES", "TOTK_OPERATION_MODE", "TOTK_NATIVE_UI",
+    "TOTK_POST_SGSR_SHARPNESS", "TOTK_FXAA", "TOTK_POST_AA", "TOTK_SHADOW_RES", "TOTK_OPERATION_MODE", "TOTK_NATIVE_UI", "TOTK_ASPECT",
+    "TOTK_PRESENT_STRETCH",
     "TOTK_OVERLAY", "TOTK_OVERLAY_POS", "TOTK_COMPANION", "TOTK_FACE_BUTTONS", "TOTK_AUDIO_PREFILL_MS", "TOTK_LOCALE",
     "TOTK_LANG", "TOTK_RUMBLE", "TOTK_RUMBLE_GAIN", "TOTK_GYRO", "TOTK_AUTOLOAD",
-    "TOTK_VK_SPLIT_PASS_DRAWS", "TOTK_ADPF_GPU",
+    "TOTK_VK_SPLIT_PASS_DRAWS", "TOTK_ADPF_GPU", "TOTK_LOW_MEMORY",
     "TOTK_FPS60_HYSTERESIS",
     /* frame generation timing block */
     "TOTK_REALTIME", "TOTK_FRAME_LAG", "TOTK_FPS_AUTO", "DM_PRESENT_HZ", "DM_PRESENT_INTERVAL", "TOTK_PRESENT_SLOTS",
@@ -1654,6 +1659,8 @@ static int start_game(const ANativeActivity *a) {
     snprintf(p, sizeof p, "%s/settings.env", a->internalDataPath); settings_file(p);
     snprintf(p, sizeof p, "%s/totk.env", g_data); env_file(p);
     android_driver_env_policy(); /* freeze driver options before any app worker or driver call */
+    totk_android_memory_defaults();
+    totk_android_memory_configure_allocator();
     gpu_profile_identity(a);
     log_mirror_start();   /* TOTK_LOGCAT is final now */
     live_ctl_start();     /* after totk.env: its values are the launch values a live "unset" returns to */
@@ -1700,6 +1707,26 @@ static int start_game(const ANativeActivity *a) {
     env_default("TOTK_VK_PIPELINE_CACHE_IMPORT", "%s/vk-pipeline-cache.bin", g_data);   /* install_app.sh cache-import */
     env_default("TOTK_SHARED_FONTS", "%s/extracted/firmware/shared-fonts", g_data);
     snprintf(p, sizeof p, "%s/game-data/%s", g_data, version); env_default("TOTK_GAME_DATA", "%s", p);   /* runtime/game_data.h */
+    /* Player mods (runtime/romfs.c; docs/mods.md). TOTK_ROMFS_MODS from totk.env wins (0 = none). Otherwise the first
+       mods/<version> folder that exists, in this order: the game folder (placed there by hand); the app's private
+       files, where the menu's import puts them (Game data > Mods, ModImport.java); the app's own shared folder
+       (Android/data/<package>/files), which needs no permission and is the one a PC can fill (adb) while the game data
+       is in private storage. The choice is logged; what is in it, by the RomFS start. */
+    if (!getenv("TOTK_ROMFS_MODS")) {
+        const char *const roots[] = {g_data, a->internalDataPath, a->externalDataPath};
+        int found = 0;
+        for (size_t i = 0; i < sizeof roots / sizeof *roots && !found; i++) {
+            if (!roots[i]) continue;
+            snprintf(p, sizeof p, "%s/mods/%s", roots[i], version);
+            if (i == 1 && romfs_import_recover(p) < 0) {
+                fprintf(stderr, "[totk-app] could not recover imported mods: %s\n", strerror(errno));
+                return start_refused();
+            }
+            found = is_dir(p);
+        }
+        if (found) { setenv("TOTK_ROMFS_MODS", p, 1); fprintf(stderr, "[totk-app] mods folder %s\n", p); }
+        else fprintf(stderr, "[totk-app] mods folder: none (no mods/%s in the game folder, the app's private files or its shared folder)\n", version);
+    }
     env_default("TOTK_OPERATION_MODE", "%s", "handheld");
     android_native_ui_mode_policy();
     env_default("TOTK_ROMFS_MMAP", "%s", "1");
@@ -1804,6 +1831,23 @@ static void chord_trace(unsigned button, unsigned action, unsigned r, unsigned s
     fprintf(stderr, "[chord] %s %s: %s (minus %s)\n", button == OVERLAY_CHORD_MINUS ? "minus" : "R", actions[action & 3], what,
             states[state < 5 ? state : 0]);
 }
+static void game_menu_open(void) {
+    if (!g_activity) return;
+    JNIEnv *env = g_activity->env;
+    jclass cls = (*env)->GetObjectClass(env, g_activity->clazz);
+    jmethodID menu = cls ? (*env)->GetMethodID(env, cls, "showGameMenu", "()V") : NULL;
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+    if (menu && !(*env)->ExceptionCheck(env)) (*env)->CallVoidMethod(env, g_activity->clazz, menu);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        fprintf(stderr, "[totk-app] in-game menu unavailable; game retained\n");
+    }
+}
+static int game_menu_key(int code, int action, int flags) {
+    if (code != AKEYCODE_BACK) return 0;
+    if (action == AKEY_EVENT_ACTION_UP && !(flags & AKEY_EVENT_FLAG_CANCELED)) game_menu_open();
+    return 1;
+}
 static int handle_input(AInputEvent *ev) {
     if (runtime_android_game_paused()) return 1;
     int type = AInputEvent_getType(ev), src = AInputEvent_getSource(ev);
@@ -1813,7 +1857,7 @@ static int handle_input(AInputEvent *ev) {
     int pad = (src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK || (src & AINPUT_SOURCE_DPAD) == AINPUT_SOURCE_DPAD;
     if (type == AINPUT_EVENT_TYPE_KEY) {
         int code = AKeyEvent_getKeyCode(ev), act = AKeyEvent_getAction(ev);
-        if (code == AKEYCODE_BACK) return 1;   /* not "leave the game" */
+        if (game_menu_key(code, act, AKeyEvent_getFlags(ev))) return 1;
         int bit = switch_bit(code); if (bit < 0) return 0;
         if (act != AKEY_EVENT_ACTION_DOWN && act != AKEY_EVENT_ACTION_UP) return 1;
         unsigned button = bit == SW_MINUS ? OVERLAY_CHORD_MINUS : bit == SW_R ? OVERLAY_CHORD_R : OVERLAY_CHORD_OTHER;
@@ -2104,6 +2148,27 @@ static jmethodID surface_parent_method(JNIEnv *env, jobject obj, const char *nam
     (*env)->DeleteLocalRef(env, cls);
     return method;
 }
+
+/* The activity stays live until on_destroy exits the process. Only the optional overlay sampler calls this. */
+int runtime_android_battery_temperature_mc(void) {
+    ANativeActivity *a = g_activity;
+    if (!a) return INT_MIN;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if ((*a->vm)->GetEnv(a->vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*a->vm)->AttachCurrentThread(a->vm, &env, NULL) != JNI_OK) return INT_MIN;
+        attached = 1;
+    }
+    jmethodID method = surface_parent_method(env, a->clazz, "batteryTemperatureDeciC", "()I");
+    jint raw = method ? (*env)->CallIntMethod(env, a->clazz, method) : INT_MIN;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        raw = INT_MIN;
+    }
+    if (attached) (*a->vm)->DetachCurrentThread(a->vm);
+    return raw >= -500 && raw <= 1500 ? raw * 100 : INT_MIN;
+}
+
 /* Validate before publishing a new window, and again on existing window/display lifecycle notifications.
  * A previous window's accepted override must never authorize a rate on a different display. */
 static void frame_rate_hint_update(ANativeActivity *a) {
@@ -2395,6 +2460,7 @@ static void android_game_pause_update(void) {
     if (paused == runtime_android_game_paused()) return;
     game_input_after_ns = (int64_t)mono_ns();
     android_game_pause_set(&game_pause, paused);
+    if (paused && vk_wb_alias_report) vk_wb_alias_report("pause");
     runtime_audio_output_pause(paused);
     runtime_input_clear();
     present_timeline_lifecycle(-1, paused);

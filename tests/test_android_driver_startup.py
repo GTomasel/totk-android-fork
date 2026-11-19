@@ -49,6 +49,8 @@ class AndroidDriverStartup(unittest.TestCase):
 #define __ANDROID__ 1
 #define TOTK_ANDROID_APP 1
 #define TOTK_BUILD_KIND "host-order"
+#include "android_memory.h"
+#include "romfs_scan.h"
 #include <assert.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -146,7 +148,7 @@ int main(int argc, char **argv) {
            probes, getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "<unset>");
     printf("PSO_KEYS=%s\n", getenv("TOTK_PSO_KEYS") ? getenv("TOTK_PSO_KEYS") : "<unset>");
     static const char *const shown[] = {"TOTK_FPS60", "TOTK_RENDER_RES", "TOTK_OVERLAY", "TOTK_SHADOW_RES",
-        "TOTK_ACQUIRE_SLACK", "TOTK_PRESENT_BUFFERS", "TOTK_FRAME_TIMELINE", "TOTK_VK_REC_THREADS"};
+        "TOTK_ACQUIRE_SLACK", "TOTK_PRESENT_BUFFERS", "TOTK_FRAME_TIMELINE", "TOTK_VK_REC_THREADS", "TOTK_ROMFS_MODS"};
     for (size_t i = 0; i < sizeof shown / sizeof *shown; i++)
         printf("ENV %s=%s\n", shown[i], getenv(shown[i]) ? getenv(shown[i]) : "<unset>");
     return 0;
@@ -165,13 +167,17 @@ int main(int argc, char **argv) {
 
     def startup(self, lines='', driver='default', chip='43020100', success=True,
                 expected='sysmem', inherited=None, asset=None, stale_asset=False, install='{"format":1,"playable":true}', refused=False,
-                settings=None, build_asset=None):
+                settings=None, build_asset=None, interrupted_mods=False):
         with tempfile.TemporaryDirectory(prefix='case-', dir=self.directory) as path:
             case = Path(path)
             external, private = case / 'game', case / 'private'
             (external / 'rewritten/v143').mkdir(parents=True)
             (external / 'shaders/v143').mkdir(parents=True)
             private.mkdir()
+            if interrupted_mods:
+                previous = private / 'mods/v143.old/romfs'
+                previous.mkdir(parents=True)
+                (previous / 'before.bin').write_bytes(b'earlier import')
             if settings is not None:
                 (private / 'settings.env').write_text(settings)
             if asset is not None:
@@ -214,10 +220,16 @@ int main(int argc, char **argv) {
                 return result.stdout, result.stderr
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('ORDER=affinity,driver,input,thread-diag,seed,game', result.stdout)
+            if interrupted_mods:
+                self.assertEqual((private / 'mods/v143/romfs/before.bin').read_bytes(), b'earlier import')
+                self.assertIn('ENV TOTK_ROMFS_MODS=' + str(private / 'mods/v143'), result.stdout)
             if asset is not None and len(asset) >= 64 and 'TOTK_PSO_KEYS=' not in lines and 'TOTK_PSO_PREWARM=0' not in lines:
                 self.assertEqual((private / 'state/pso_keys.bin').read_bytes(), asset)
                 self.assertIn('PSO_KEYS=' + str(private / 'state/pso_keys.bin'), result.stdout)
             return result.stdout, result.stderr
+
+    def test_cold_launch_restores_private_mods_after_interrupted_import(self):
+        self.startup(interrupted_mods=True)
 
     def test_profile_identity_accepts_packaged_short_commit_and_rejects_untrusted_text(self):
         for commit in ('abcdef012345', 'a' * 40, 'b' * 64):

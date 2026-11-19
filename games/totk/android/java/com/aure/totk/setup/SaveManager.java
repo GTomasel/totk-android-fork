@@ -40,7 +40,8 @@ final class SaveManager {
     static final String TITLE_ID = "0100F2C0115B6000";
     /** Top folder of an export zip and of the mirror folder; the manifest sits inside it next to the save files. */
     static final String TOP = "TotK Native saves", MANIFEST = "totk-native-saves.json";
-    static final int MAX_FILES = 500, KEEP_BACKUPS = 10;
+    /** A complete compendium alone can exceed 500 photos. Keep every file; byte and archive-entry limits still apply. */
+    static final int MAX_FILES = 4096, KEEP_BACKUPS = 10;
     static final long MAX_TOTAL = 128L << 20;
     /** Game save files are a few MB (progress.sav ~2.3 MB); a large file with another name is not part of a save set. */
     static final long MAX_KNOWN_FILE = 32L << 20, MAX_OTHER_FILE = 1L << 20;

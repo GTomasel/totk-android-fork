@@ -2,6 +2,7 @@
 #include "vk_int.h"
 #include "vk_pcache_store.h"
 #include "vk_pcache_identity.h"
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 static int checks, failures;
@@ -41,10 +42,19 @@ static void policies(void) {
     pcache_policy unknown = {.saved_size = 1024, .last_save = seconds(1), .dirty_since = seconds(2)};
     CHECK(pcache_decide(&unknown, seconds(122), 1, 1024, 0, 0, 0) == PCACHE_DEADLINE &&
           unknown.saved_generation == 0 && unknown.dirty_since == seconds(2), "failed/missing size query cannot acknowledge dirty generation");
+    CHECK(!pcache_should_probe(&unknown, seconds(61), 1, 0, 0), "busy gameplay defers size-only driver traversal");
+    CHECK(!pcache_should_probe(&unknown, seconds(60), 1, 1, 0), "quiet probe respects the minimum interval");
+    CHECK(pcache_should_probe(&unknown, seconds(61), 1, 1, 0), "quiet eligibility probes actual growth");
+    CHECK(pcache_should_probe(&unknown, seconds(122), 1, 0, 0), "busy deadline probes actual growth");
+    CHECK(pcache_should_probe(&unknown, seconds(3), 1, 0, 1), "lifecycle flush still probes immediately");
+    CHECK(!pcache_should_probe(&unknown, seconds(122), 0, 1, 1), "clean generation needs no probe");
 }
 static const unsigned char old_blob[] = "synthetic-old-cache", new_blob[] = "synthetic-new-cache-larger";
 static int synthetic_query(void *unused, size_t *size, void *data) {
-    (void)unused; if (data) memcpy(data, new_blob, sizeof new_blob); *size = sizeof new_blob; return 0;
+    if (data) memcpy(data, new_blob, sizeof new_blob);
+    else if (unused) (*(unsigned *)unused)++;
+    *size = sizeof new_blob;
+    return 0;
 }
 static int matches(const char *path, const void *data, size_t size) {
     unsigned char bytes[128]; int fd = open(path, O_RDONLY); if (fd < 0) return 0;
@@ -66,32 +76,71 @@ static int incomplete_query(void *unused, size_t *size, void *data) {
     if (data) return VK_INCOMPLETE;
     return synthetic_query(unused, size, data);
 }
+#if defined(__linux__)
+typedef struct { size_t size; int incomplete; } large_cache;
+static int large_query(void *context, size_t *size, void *data) {
+    large_cache *cache = context;
+    if (data) memset(data, 0x5a, cache->size);
+    *size = cache->size;
+    return data && cache->incomplete ? VK_INCOMPLETE : VK_SUCCESS;
+}
+static void snapshot_residency(void) {
+    const char *path = "pcache-residency-fixture.bin";
+    pcache_store s = {0};
+    large_cache cache = {.size = 32u << 20};
+    size_t size;
+    CHECK(pcache_snapshot(&s, path, large_query, &cache, 0, &size), "large cache saves");
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)s.data;
+    uintptr_t page_start = start - start % page;
+    size_t bytes = start - page_start + cache.size;
+    size_t pages = (bytes + page - 1) / page;
+    unsigned char *residency = calloc(pages, 1);
+    if (!residency) abort();
+    for (int incomplete = 0; incomplete < 2; incomplete++) {
+        if (incomplete) {
+            cache.incomplete = 1;
+            CHECK(!pcache_snapshot(&s, path, large_query, &cache, 0, &size), "partially written snapshot is rejected");
+        }
+        int queried = mincore((void *)page_start, bytes, residency) == 0;
+        size_t resident = 0;
+        for (size_t i = 0; i < pages; i++) resident += residency[i] & 1;
+        printf("pcache scratch after %s: %zu resident bytes\n", incomplete ? "incomplete snapshot" : "successful snapshot", resident * page);
+        CHECK(queried && resident == 0, "snapshot keeps no resident scratch pages");
+    }
+    free(residency);
+    pcache_release(&s);
+    unlink(path);
+}
+#endif
 static void stores(void) {
     const char *path = "pcache-atomic-fixture.bin"; size_t size;
     for (int failure = PCACHE_FAIL_ALLOC; failure <= PCACHE_FAIL_DIRSYNC; failure++) {
         pcache_store s = {0}; CHECK(pcache_reserve(&s, sizeof old_blob), "fixture allocation");
         memcpy(s.data, old_blob, sizeof old_blob); CHECK(pcache_replace(&s, path, sizeof old_blob), "old file installed durably");
-        if (failure == PCACHE_FAIL_ALLOC) { free(s.data); s.data = NULL; s.capacity = 0; }
+        if (failure == PCACHE_FAIL_ALLOC) pcache_release(&s);
         s.fail = failure;
         pcache_policy p = {.saved_size = sizeof old_blob, .dirty_since = seconds(2), .last_save = seconds(1)};
         pcache_policy before = p;
-        int ok = pcache_snapshot(&s, path, synthetic_query, NULL, &size);
+        int ok = pcache_snapshot(&s, path, synthetic_query, NULL, 0, &size);
         if (ok) pcache_saved(&p, seconds(5), 1, size);
         CHECK(!ok, "injected snapshot stage fails");
         CHECK(!memcmp(&p, &before, sizeof p), "failure retains dirty age, generation, size and last-save time");
         CHECK(matches(path, failure == PCACHE_FAIL_DIRSYNC ? new_blob : old_blob,
                       failure == PCACHE_FAIL_DIRSYNC ? sizeof new_blob : sizeof old_blob), "failure leaves complete old blob (post-rename directory-sync failure leaves complete new blob)");
         CHECK(access("pcache-atomic-fixture.bin.tmp", F_OK) != 0, "failed transaction removes temporary file");
-        s.fail = 0; CHECK(pcache_snapshot(&s, path, synthetic_query, NULL, &size), "retry succeeds after every failure stage");
+        s.fail = 0; CHECK(pcache_snapshot(&s, path, synthetic_query, NULL, 0, &size), "retry succeeds after every failure stage");
         CHECK(matches(path, new_blob, sizeof new_blob), "atomic retry installs complete replacement");
         void *pointer = s.data; size_t capacity = s.capacity; uint64_t allocations = s.allocations;
-        CHECK(pcache_snapshot(&s, path, synthetic_query, NULL, &size), "subsequent snapshot succeeds");
+        unsigned probes = 0;
+        CHECK(pcache_snapshot(&s, path, synthetic_query, &probes, size, &size), "snapshot can reuse this iteration's size");
+        CHECK(probes == 0, "pre-probed snapshot skips duplicate size-only query");
         CHECK(s.data == pointer && s.capacity == capacity && s.allocations == allocations, "scratch is retained and reused without reallocation");
-        free(s.data);
+        pcache_release(&s);
     }
     pcache_store s = {0};
-    CHECK(pcache_snapshot(&s, path, synthetic_query, NULL, &size), "atomic reader fixture installed");
-    CHECK(!pcache_snapshot(&s, path, incomplete_query, NULL, &size) && matches(path, new_blob, sizeof new_blob),
+    CHECK(pcache_snapshot(&s, path, synthetic_query, NULL, 0, &size), "atomic reader fixture installed");
+    CHECK(!pcache_snapshot(&s, path, incomplete_query, NULL, 0, &size) && matches(path, new_blob, sizeof new_blob),
           "VK_INCOMPLETE never replaces the old file");
     pthread_t reader; pthread_create(&reader, NULL, atomic_reader, (void *)path);
     for (unsigned i = 0; i < 64; i++) {
@@ -101,8 +150,11 @@ static void stores(void) {
     }
     atomic_store(&reader_stop, 1); pthread_join(reader, NULL);
     CHECK(!atomic_load(&reader_bad), "concurrent reader sees only complete old/new files");
-    free(s.data);
+    pcache_release(&s);
     unlink(path);
+#if defined(__linux__)
+    snapshot_residency();
+#endif
 }
 static void context_fixture(const char *path, pcache_identity *id, const void *blob, size_t size) {
     pcache_store s = {.data = (void *)blob, .prefix = id, .prefix_size = id ? pcache_identity_size(id) : 0};

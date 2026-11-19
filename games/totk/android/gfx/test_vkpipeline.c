@@ -780,18 +780,19 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--pso-keylist")) return vk_pipeline_test_keys();
     if (argc == 2 && !strcmp(argv[1], "--pso-warm-only")) {
         extern int vk_pipeline_test_key_order(void);
+        extern int vk_pipeline_test_warm_pending(void);
         mtl_init();
         uint64_t stats[6] = {0};
         for (unsigned i = 0; i < 30000; i++) {
-            vk_pipeline_keys_stats(stats);
-            if (stats[0]+stats[3]+stats[4] >= stats[1]) break;
+            if (!vk_pipeline_test_warm_pending()) break;
             usleep(1000);
         }
+        vk_pipeline_keys_stats(stats);
         printf("pso-warm-only: done=%llu total=%llu ns=%llu missing=%llu failed=%llu order=%d\n",
             (unsigned long long)stats[0], (unsigned long long)stats[1], (unsigned long long)stats[2],
             (unsigned long long)stats[3], (unsigned long long)stats[4], vk_pipeline_test_key_order());
         vk_pcache_flush();
-        return stats[4] || stats[0]+stats[3] != stats[1] || !vk_pipeline_test_key_order();
+        return stats[4] || stats[0]+stats[3] != stats[1] || !vk_pipeline_test_key_order() || vk_pipeline_test_warm_pending();
     }
     int prediction_test = argc == 2 && !strcmp(argv[1], "--predict");
     int library_test = argc == 2 && !strcmp(argv[1], "--gpl");

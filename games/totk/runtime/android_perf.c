@@ -100,8 +100,12 @@ static void configure(void) {
     double ms = target && *target ? atof(target) : 33.3;
     legacy_target = ms > 0 && ms < 1000 ? (int64_t)(ms * 1e6) : 0;
     if (mode == 1 && !legacy_target) mode = 0;
-    rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");
+    /* Controller-only play must retain a refresh vote after the vendor touch boost expires.
+     * Keep explicit opt-out and content-rate profiles available for diagnostics. */
+    rate_on = !getenv("TOTK_FRAME_RATE_HINT") || is_one("TOTK_FRAME_RATE_HINT");
+    fps60 = is_one("TOTK_FPS60");
     const char *hint = getenv("TOTK_FRAME_RATE_HINT_HZ");
+    if (!hint) hint = "max";
     if (!totk_frame_rate_hint_parse(hint, &rate_request)) {
         fprintf(stderr, "[totk-perf] TOTK_FRAME_RATE_HINT_HZ=%s refused: expected integer decimal Hz or max; retaining existing policy\n", hint);
         rate_request = 0;

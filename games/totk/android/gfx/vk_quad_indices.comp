@@ -1,0 +1,30 @@
+#version 450
+// One ordered scan handles restart markers without reading guest indices on the CPU.
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) readonly buffer InputIndices { uint words[]; } src;
+layout(set=0,binding=1,std430) writeonly buffer OutputIndices {
+    uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance;
+    uint padding[3]; uint indices[];
+} dst;
+layout(push_constant) uniform Parameters {
+    uint byteOffset; uint count; uint shift; uint strip;
+    uint instances; int baseVertex; uint baseInstance;
+} p;
+void main() {
+    uint stride=1u<<p.shift;
+    uint sentinel=p.shift==2u ? 0xffffffffu : (1u<<(stride*8u))-1u;
+    uint window[4]; uint used=0u; uint written=0u;
+    for (uint i=0u;i<p.count;i++) {
+        uint at=p.byteOffset+i*stride;
+        uint index=(src.words[at>>2u]>>((at&3u)*8u))&sentinel;
+        if (index==sentinel) { used=0u; continue; }
+        window[used++]=index;
+        if (used!=4u) continue;
+        uint c=window[p.strip!=0u?3u:2u], d=window[p.strip!=0u?2u:3u];
+        dst.indices[written++]=window[0]; dst.indices[written++]=window[1]; dst.indices[written++]=c;
+        dst.indices[written++]=window[0]; dst.indices[written++]=c; dst.indices[written++]=d;
+        if (p.strip!=0u) { window[0]=window[2]; window[1]=window[3]; used=2u; } else used=0u;
+    }
+    dst.indexCount=written; dst.instanceCount=p.instances; dst.firstIndex=0u;
+    dst.vertexOffset=p.baseVertex; dst.firstInstance=p.baseInstance;
+}

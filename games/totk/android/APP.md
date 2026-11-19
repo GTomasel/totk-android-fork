@@ -138,6 +138,149 @@ ones (`assets/expected-v1.4.3.json`). Vulkan driver: `<game>/driver.so` (copied 
 driver. A `shaders/v143/seed.vkpack` selects the indexed seed IO (`TOTK_VK_SEED_IO=1`). Developer builds fill the same
 folder over USB with `install_app.sh data` (install.json goes last). The rest of this file is the development history.
 
+Local independently signed API36 test builds and data-preserving ADB updates are documented in
+[`docs/android-test-builds.md`](../../../docs/android-test-builds.md). Keep the developer signing state outside build caches.
+
+**Graphics → Performance → Low memory mode** reduces how much rendering data stays in memory. Close and reopen
+the game to apply it. It is off by default and independent of graphics presets. Developers can set
+`TOTK_LOW_MEMORY=1` in `<game>/totk.env`. An explicit value in that file overrides the menu. The staging retention
+target is 8 MiB per retired slot, and recorder packet/descriptor slabs use the existing 32 MiB retention budget.
+The profile sets a 12 MiB staging budget for deferrable GPU-to-guest copies. Immediate guest reads
+retain their existing path. An explicit `TOTK_VK_WB_AUTO_STAGING_MB=0` disables the budget.
+Image suballocation uses 32 MiB blocks and releases blocks that become empty after fence retirement. Use
+`TOTK_VK_IMAGE_BLOCK_MB=16` to try smaller blocks or `64` for the standard block size.
+Images above 16 MiB continue to use dedicated allocations. `TOTK_VK_IMAGE_PACK=1` selects the experimental
+densest-block placement. It is off by default after a worse transition on the S23+ accounted for in the
+[device report](../../../docs/s23-device-validation.md#optimization-trials-after-the-source-comparison).
+Descriptor pools use quarter capacities
+(`TOTK_VK_DESC_COMPACT=1`), falling back
+to full-size pools for layouts that need them. Pipeline prewarming is disabled (`TOTK_PSO_PREWARM=0`) and shader
+warm payloads are bounded to16MiB (`TOTK_SEED_WARM_MB=16`); shaders still load on demand, with possible first-use
+stutter. Explicit values for the underlying variables take precedence. Active allocations can exceed retention targets.
+This profile does not shrink the guest heap or lower image quality and is not a guarantee against Android low-memory termination.
+Use `tools/android_memory_capture.py` to retain package exit reasons and separate system/app counters; overlapping
+RSS/PSS/GPU/shared-memory values must not be added as if they were disjoint.
+Use `TOTK_VK_WB_TILE_TRACE=1` when a reproduction needs per-tile Vulkan write-back events.
+The periodic write-back memory and lifetime counters are available with per-tile logging off.
+For write-back experiments, set `TOTK_VK_WB_AUTO_COPY_LIMIT` to 1–128 background copy attempts
+per submission and `TOTK_VK_WB_AUTO_STAGING_MB` to 1–512 MiB of live staging at admission.
+Zero selects unlimited scheduling for that setting. It is the default outside Low memory mode. The staging limit uses
+Vulkan's actual memory requirement and allows an oversized copy when staging is empty.
+Explicit invalidations keep their immediate read-back path. The `[wb-auto]` report shows
+admissions, budget yields, peak staging at admission and the age of the oldest unstaged record.
+The `[wb-invalidate-batches]` report counts requests that selected at least one record and
+how many of those requests needed a heap allocation. Compare `[wb-copy-regions]` commands
+and regions to see how much batching reduced command recording.
+The `[wb-queue]` line counts staged background records, sweeps skipped while every
+pending record is unstaged, rebuilds of the quick-reject address bounds and
+`quiet_seals_skipped` before the next copy deadline. Set
+`TOTK_VK_OFF=settledquietscan` to compare with a full scan at each seal.
+Use `TOTK_VK_IMAGE_OWNERSHIP_TRACE=1` to report live private image bytes and auxiliary
+image trees at the existing memory-report cadence. Shared roots remain in the shared counters.
+The ownership line excludes orphaned write-backs, retired images, and standalone allocations
+for other renderer resources. Compare it with the block and dedicated allocation totals.
+The accompanying `[mirror-age]` line groups private CPU mirrors by submissions since their
+last ordinary lookup. It also counts committed blocks whose occupied spans all belong to
+mirrors last looked up at least 600 submissions ago. This reports allocation coverage.
+Destruction still requires proof that current recording and submitted GPU work no longer
+use the image and that any later lookup can recover its contents.
+Set `TOTK_ANDROID_SHORT_MALLOC_DECAY=1` in `totk.env` to test Bionic's shorter release
+interval for freed host heap pages. The option is startup-only and defaults off.
+The startup-only `TOTK_VK_GUEST_SHMEM=measure`, `copy` and `discard` developer modes use an
+explicit Linux shmem backing for the guest reservations. The `copy` mode reads
+eligible original ranges through that backing when moving them into DMA buffers.
+Overlapping replacements and unavailable backing use the ordinary mapped copy.
+`discard` releases original backing only after successful replacement by a DMA buffer.
+Fallback aliases of the original file preserve their source groups for the lifetime of the
+reservation. The experiment checks the source file and offsets, including when a clone
+supplies another clone's source. An ambiguous source stops the experiment before remapping.
+`[guest-shmem]` reports allocated backing bytes, cumulative sparse-copy traffic, the
+ranges passed to successful hole-punch requests, preserved range bytes and errors.
+In these modes, `TOTK_VK_GUEST_SHMEM_SCAN_FRAME=2699` requests one extent
+scan at the first memory report at or after that frame. `[guest-shmem-displaced]`
+reports active DMA-backed addresses covered by the reservation and occupied bytes
+at the corresponding original file offsets. Scan runs are separate from FPS comparisons.
+Use `TOTK_VK_IMAGE_PEAK_LOG=1` to log allocator commitments when the interval high rises at
+least 16 MiB since the previous event. The periodic `[image-peaks]` report shows the largest
+combined block and dedicated commitment and the largest occupied byte count since the last
+sample. The two highs can occur at different times. The periodic write-back report also tracks
+peak staging allocated for background and explicit copies. These counters cover the named
+allocator paths. Use the device memory capture to measure Android process and system memory.
+Set `TOTK_VK_IMAGE_RECLAIM_BEFORE_GROW=1` to test reusing spans from already completed image
+retirements when a texture would need a new block. Before creating a dedicated allocation,
+the same switch tries returning completed dedicated allocations to the driver. The
+experiment is off by default. The `[image-reclaim-before-grow]` report includes freed span
+bytes, requests that fit after reclamation, separate dedicated attempts and bytes freed,
+and peak reclaim time in microseconds. For a suballocation, `single_span_fits` counts
+when one completed image and its adjacent free spans cover the new request's size,
+alignment and memory type. `fits_after_reclaim` counts actual reuse.
+If allocating Vulkan memory for a texture reports a host or device memory shortage, the allocator checks
+the retire queue for completed images. When it frees any, it tries the request once
+more. The `[image-allocation-pressure]` report counts those errors and the requests
+that recovered. This fallback also runs with proactive reclamation disabled.
+If a base texture still fails to realize because of a memory error, a later lookup
+can try it once more after eight submissions. The renderer allows up to four delayed
+attempts per submission and cancels them when their guest pool is finalized.
+The `[image-realization-retry]` line counts attempts and recovered textures.
+`TOTK_VK_REC_DISCARD_FREE=1` enables an Android/Linux experiment for recorder slabs
+that exceed the existing retention budget. On the retired slot's normal trim,
+Linux can reclaim whole free payload pages unused for at least eight slot generations.
+The page-discard counter reports bytes passed successfully to the kernel.
+Staging and uniform-snapshot arenas reuse aligned space in earlier buffers when the most
+recent buffer is full. The periodic `[arena-tail-reuse]` line counts requests and payload
+bytes placed in that space for each arena type. Set `TOTK_VK_OFF=arenatails` before launch
+to compare with the previous policy, adding it to the comma-separated list if needed.
+The `[upload-prep]` report counts heap allocations for texture copy-region arrays,
+adjacent layer regions joined, and redundant barriers skipped before first uploads
+from host-written staging.
+`TOTK_VK_OFF=uploadinline` forces heap allocation for region arrays.
+`TOTK_VK_OFF=uploadfreshbarrier` restores the extra barrier before new uploads.
+`TOTK_VK_OFF=uploadlayers` restores one region per array layer.
+Set `TOTK_VK_PARTIAL_TEX_UPLOAD=1` in `totk.env` and restart to compare
+partial reuploads of CPU-mirrored block-linear textures. An eligible update copies
+only the mip levels and array layers touched by dirty guest pages. First uploads,
+untracked sources and overlapping GPU producers use the whole image. The periodic
+`[upload-partial]` line counts filtered uploads and staging bytes avoided since launch.
+When a temporary buffer is released, the renderer checks cached texel-buffer views and
+their retirement records. The `[texel-buffer-release]` line tracks cumulative views
+examined and destroyed during this work.
+The `[arena-peaks]` line records bytes allocated for slot staging and uniform snapshots,
+with separate peaks and a combined peak since the last sample. Set
+`TOTK_VK_ARENA_PEAK_LOG=1` to log a new interval high after each increase of at least
+16 MiB since the last high-water event. Low memory's 8 MiB slot cap preserves an
+available 8 MiB buffer through retirement and releases larger staging buffers.
+Try `TOTK_VK_STAGING_RETAIN_MB=4` to keep a smaller warm buffer per slot, with
+normal overflow allocation available during bursts. With a finite cap,
+`TOTK_VK_STAGING_EARLY_TRIM=1` allows a new texture upload to return excess
+upload-only buffers from a completed slot before it allocates.
+`TOTK_VK_STAGING_BURST_TRIM=1` separately lets an upload burst release
+upload-only buffers that a completed slot would otherwise keep warm. The
+active slot must be growing beyond its retention cap. Each growth can trim
+up to four buffers from one completed slot after GPU and submit work retire
+and replay leases clear. General staging stays in its owning slot.
+The `[arena-early-trim]` line reports actual Vulkan bytes released and
+whether the burst policy is enabled. Both switches default to off.
+With descriptor stock off, `TOTK_VK_DESC_TRIM_IDLE=1` in `totk.env` lets
+each recorder context and primary slot release spare descriptor pools after
+32 recycled generations of lower demand. It also skips resetting unused pools.
+The `[descriptor-idle-trim]` line counts pools destroyed since launch for both owners.
+`TOTK_VK_DESC_BATCH=1` is a separate startup experiment for recorder
+contexts with descriptor stock off. Repeated descriptor layouts can
+reserve eight sets in a single Vulkan call. Use the `descriptors`
+report to compare allocation calls, allocated sets and retained pools.
+When an owning guest pool is finalized, its overlapping shared images leave the storage
+reuse map. Existing texture serials and read-back copies retain ownership until their
+usual release. The `[pool-images]` report shows detached images, images still owned,
+and base bytes queued for retirement after the last owner releases them.
+Finalizing an owning guest pool clears cached and deferred texel views before its
+Vulkan buffer is destroyed. A change to pool mappings makes subsequent texel-view
+lookups resolve the current buffer and offset. Existing views can be reused when
+that resolution yields the same buffer, offset and range.
+
+**Graphics → Screen → Aspect ratio** separates camera ratios (4:3, 16:9, 21:9, and 32:9) from **Stretch to fill**.
+Stretch scales the final picture to the window, including the HUD, while using the standard camera. It applies on
+the next launch. The developer equivalent is `TOTK_PRESENT_STRETCH=1`.
+
 *Game data → Graphics driver* accepts a bare ELF64 AArch64 `.so` or an AdrenoTools Turnip `.zip`, detected by content.
 `DriverImport.java` stages a bounded archive privately, reads `meta.json` (up to 64 KiB) and selects its exact
 `libraryName` entry (including nested paths); without metadata exactly one `.so` is required. Other entries are
@@ -1269,7 +1412,7 @@ Host-only does not certify gralloc, SurfaceFlinger, game-image quality or perfor
 | `TOTK_FRAMEGEN=locked`, `TOTK_FRAMEGEN_LEAD_REFRESHES=1` / `2`, `TOTK_FRAME_LAG=0` / `1` | Locked camera device-qualified on Thor/Odin; Thor's qualified profile lag0, Odin measured lag1. Lead and optional FSR phase bounds compose as above; no Duo qualification. |
 | `TOTK_PRESENT_TIMELINE`, `TOTK_PRESENT_FLOOR_NS`, `TOTK_PRESENT_DEDUPE`, `TOTK_PRESENT_GUARD_NS` | Independently default-off locked-AHB qualification controls; exact behavior and limits are documented in [Experimental API timeline and timestamp corrections](#experimental-api-timeline-and-timestamp-corrections-default-off). |
 | `TOTK_DRS_FRAMEGEN=1` | Experimental, default off; applies only to locked real30 frame generation with explicit `TOTK_FPS60=0`. See [Native DRS headroom for locked frame generation](#native-drs-headroom-for-locked-frame-generation-experimental-default-off). |
-| `TOTK_ADPF=full`, `TOTK_FRAME_RATE_HINT=1` | Opt-in full ADPF and display content-rate hint; the existing render-only ADPF session remains default. See [Android performance hints](#android-performance-hints-experimental-full-mode). |
+| `TOTK_ADPF=full`, `TOTK_FRAME_RATE_HINT` | Full ADPF is opt-in; display refresh requests are enabled by default (`0` disables them). The existing render-only ADPF session remains default. See [Android performance hints](#android-performance-hints-experimental-full-mode). |
 | Aligned scene-size classifier | Always on for colour-target pipeline keys; no setting. See [Shader compiles and the pipeline cache](#shader-compiles-and-the-pipeline-cache). |
 | Packaged PSO keylist / prewarm | APK binary is generated from `games/totk/assets/pso_keys.tsv`; startup prewarm is on when packaged keys exist. `TOTK_PSO_PREWARM=0` opts out. See [Shader compiles and the pipeline cache](#shader-compiles-and-the-pipeline-cache). |
 | `TOTK_FRAMEGEN=hybrid` | Existing opt-in Odin policy. `TOTK_HYBRID_DROP_FPS`, `TOTK_HYBRID_DROP_SECONDS`, `TOTK_HYBRID_RECOVER_SECONDS`, `TOTK_HYBRID_RECOVER_SCORE`, `TOTK_HYBRID_DWELL_SECONDS` are host-tested policy tuners, not individually device-qualified values. |
@@ -2040,7 +2183,7 @@ replacement is read from the beginning, so it must not copy old commands (which 
 | `TOTK_VK_FEEDBACK_NARROW` | 0–1 | the next render pass opened | default off; retain read-only attachment feedback across texture-only invalidates; `[feedback-narrow]` counts avoided ends per 300 presents |
 | `TOTK_VK_ALPHA_TEST` | 0–1 | the next draw | default off; alpha comparison fragment variant plus immutable reference UBO; `[alpha-test]` counts enabled/ignored draws even while off |
 | `TOTK_VK_CLEAR_ON_READ` | 0–1 | the next sampled/storage image read | default off; materialize overlapping pending attachment clears before returning a cached/new view; `[clear-on-read]` counts first-read resolutions |
-| `TOTK_VK_STAGING_RETAIN_MB` | 8…4096 | each slot arena at its next open, after its fence | unset returns to the launch value (no cap when unset at launch) |
+| `TOTK_VK_STAGING_RETAIN_MB` | 1…4096 | each slot arena at its next open, after its fence | unset returns to the launch value (no cap when unset at launch) |
 | `TOTK_VK_FEEDBACK_CUT` | 0–1 | the next descriptor build | the freeze memo key carries the pass serial while it is on |
 | `TOTK_VK_PREPARE_MASK` | 0–1 | the next draw's uniform preparation | a change marks every register dirty, so that draw prepares in full; `TOTK_VK_OFF=prepare` keeps it off |
 | `TOTK_THREAD_SAMPLER` | 0–1 | the next presented frame | the first switch-on starts the sampler thread; switched off it sleeps until switched on again |
@@ -2306,7 +2449,8 @@ workers or pipeline-cache joins. Its fixed row stays reserved when empty.
 Power/temperature are **off by default**, including `full`. Add `TOTK_OVERLAY_POWER=1` to opt in:
 readable battery discharge current × voltage shows `PWR`, meaningful USB/input counters show `IN`,
 and standard `battery/temp` shows `BAT …C`. Unavailable sensors are silently omitted; temperature is the
-battery sensor, not an inferred GPU/SoC temperature. A dedicated background sampler reads sysfs at most 1 Hz.
+battery sensor. A dedicated background sampler reads sysfs at most 1 Hz. If battery sysfs is unreadable,
+the Android app queries the sticky battery snapshot at most every five seconds while the overlay is visible.
 The option reserves its row even when sensors are unavailable, preventing layout jitter.
 
 System telemetry is separately **off by default**: `TOTK_OVERLAY_SYS=1` reserves two extra rows in `full`
@@ -4017,8 +4161,8 @@ HUD/sky through load, static, pan and reload; unchanged save behavior is not yet
 | `TOTK_VK_REC_ASYNC_SUBMIT` | On when recorder workers are enabled | Explicit `0` keeps walking-thread assembly/submit. Existing diagnostic and software-protection exclusions are unchanged. |
 | `TOTK_ADPF` | Existing render-only session (unset/`legacy`) | `0` disables all CPU hints; `full` opts into the bounded critical-thread group, profile-derived targets and wait-stripped work reporting. |
 | `TOTK_ADPF_TARGET_MS` | `33.3` | Existing render-only target override; nonpositive disables the legacy session. Retained for existing profiles; ignored by `TOTK_ADPF=full`. |
-| `TOTK_FRAME_RATE_HINT` | `0` | `1` requests FIXED_SOURCE content cadence through the window and zero-copy SurfaceControl. It is only a request, never evidence of a panel-mode change. |
-| `TOTK_FRAME_RATE_HINT_HZ` | unset (`0`, off) | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate; needs `TOTK_FRAME_RATE_HINT=1`. Invalid/unavailable rates retain the existing policy. See below. |
+| `TOTK_FRAME_RATE_HINT` | `1` | Persistent refresh request through the activity window, native window and zero-copy SurfaceControl; explicit `0` disables it. It is only a request, never evidence of a panel-mode change. |
+| `TOTK_FRAME_RATE_HINT_HZ` | `max` | Startup-only integer decimal Hz or `max` for the highest advertised window-display rate. Explicit empty/`0` restores content-rate hints. Invalid/unavailable rates fall back to content-rate hints. See below. |
 | `TOTK_RATE_HINT_HOLD` | unset (`0`) | With `TOTK_FRAME_RATE_HINT=1`: `N` ms requests the window's output rate (game interval, frame generation) held at the highest of the last N ms; 0 keeps the configured rate. Live through `totk.ctl`. See below. |
 | `TOTK_ADPF_GPU` | `0` (off) | `1` reports each frame's span (the game's frame origin, else its first submit, to its present, less acquire pacing) against 90 % of the configured period (15 ms native60, else 30 ms), plus on API 35+ the GPU time of the newest completed frame once. Live through `totk.ctl`. See below. |
 
@@ -4117,7 +4261,16 @@ time minus the existing acquire pacing duration; GPU/dependency waits are retain
 Zero/invalid work and >=250ms discontinuities are not reported. Stable frames allocate
 nothing in our hint code; session creation happens only at configuration changes.
 
-`TOTK_FRAME_RATE_HINT=1` requests 60fps for locked/native60. Plain30 requests 30fps only
+By default, gameplay requests the highest advertised refresh rate of its current window display through both
+native hint targets and `WindowManager.LayoutParams.preferredRefreshRate`. This keeps a persistent app-side
+vote after a vendor's touch boost expires, including controller-only gameplay. It requests 120 Hz on a display
+advertising 120 Hz and 60 Hz on a 60-Hz display; Android still decides the actual rate under the user's display
+settings, power saving and thermal constraints. No global settings, display-mode IDs or synthetic input are used.
+The activity-window preference is cleared on pause and restored on resume. The validated rate remains independent
+of measured idle refresh and guest FPS, and repeated lifecycle revalidation avoids redundant window updates.
+See [Samsung refresh investigation](../../../docs/samsung-refresh-rate.md) for qualification limits.
+
+Explicit `TOTK_FRAME_RATE_HINT_HZ=0` (or empty) restores the content policy: locked/native60 requests 60fps. Plain30 requests 30fps only
 without a physical-clock lattice; fixed present slots, display pacing or acquire clocks
 retain a 60fps request so a 30Hz panel mode cannot turn two physical slots into 15fps.
 The SurfaceControl request is also applied to the actual zero-copy child, not only its
@@ -4134,9 +4287,10 @@ rate of the last `<ms>`: up at once, down only after the lower rate held that lo
 which follows a panel that took a lower request. Logs `[totk-perf] TOTK_RATE_HINT_HOLD=N ms (launch|live)`; each
 change still logs `window frame-rate hint=`. Measure the number of those lines and fps dips after 60→30→60 per arm.
 
-`TOTK_FRAME_RATE_HINT_HZ=120` plus `TOTK_FRAME_RATE_HINT=1` is an experimental app-side FIXED_SOURCE
-request on both the native window and actual AHB child. Unset/empty/`0` keeps the exact existing hint
-policy. Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
+`TOTK_FRAME_RATE_HINT_HZ=120` explicitly selects a 120 Hz app-side FIXED_SOURCE
+request on both the native window and actual AHB child, with a matching activity-window preference.
+Unset selects `max`; empty/`0` keeps content-rate hints without an activity-window preference.
+Integer decimal Hz is accepted (no signs, fractions or suffixes); the current window's
 `decorView.getDisplay().getSupportedModes()` must advertise that rate within 0.01 Hz, allowing float
 rounding such as 120.00001 but not substituting a distinct fractional mode. `max` instead selects the highest finite
 positive rate advertised by that same display, retaining its fractional Hz through both native hint targets.
@@ -4149,8 +4303,8 @@ This is not a preferred-mode/system-setting write and cannot override an OS/user
 Treat an accepted hint only as a request; measure game intervals, framework fences and real physical
 panel cadence separately before claiming even 40 fps at 120 Hz.
 
-Device comparison arms are unchanged default / `TOTK_ADPF=0` /
-`TOTK_ADPF=full` / `TOTK_ADPF=full TOTK_FRAME_RATE_HINT=1`, interleaved on the same
+For a refresh-policy comparison, use default / `TOTK_FRAME_RATE_HINT=0` /
+`TOTK_FRAME_RATE_HINT_HZ=0` / `TOTK_FRAME_RATE_HINT_HZ=60`, interleaved on the same
 profile, save, shader seed and cache state. Do not flip the full-mode default without
 per-layer SurfaceFlinger cadence plus performance, power and temperature evidence.
 
@@ -5086,10 +5240,12 @@ A force-kill can lose the last five seconds of new history; existing history rem
 On the first run no history exists: play the target route, allow at least five seconds for learning,
 then restart in the same seed namespace. Later starts asynchronously pre-read the MRU demand set.
 `vk_shaders_ready` waits for the metadata index **only**, not payload warming; boot/load frames can
-continue. A queued learned key requested by replay is **removed from the warm queue and read
-immediately on the caller**. An already-running learned read is joined, never duplicated.
-Cold, skipped and already-consumed packed entries also use immediate indexed `pread` on the
-pinned descriptor; they never wait for unrelated worker reads or history/request fsync.
+continue. A queued learned key requested by replay is **read immediately on the caller**.
+The demand path marks it as bypassed without traversing the queue. The worker skips it when
+draining the queue. An already-running learned read is joined, never duplicated.
+After indexing, the startup mapping is released. Cold, skipped and already-consumed packed
+entries use immediate indexed `pread` on the pinned descriptor. They never wait for unrelated
+worker reads or history/request fsync.
 Only the short metadata publication lock is shared. Mutable warmed ownership transfers directly
 to parsers; simultaneous consumers copy only when separate mutable ownership is necessary.
 
@@ -5112,14 +5268,17 @@ with sufficient capacity and the independent compute worker, not low-value specu
 Expected log lines:
 
 ```
-[seed-io] indexed N files (P packed), learned K keys learned_bytes=B cap=C mode=adaptive, index=Xms directory ...
+[seed-io] indexed N files (P packed), learned K keys learned_bytes=B cap=C mode=adaptive, index=Xms index_heap=H directory ...
 [seed-io] warm complete keys=K ready=R bytes=B cap=C skipped=S bypassed=D failed=F async=Yms
 [seed-stats] 300-present lookups=L pack_hits=P warmed_hits=H demand_storage_reads=D demand_bytes=B warmed_storage_reads=0 block_total=Xms block_max=Yms worker_reads=W worker_bytes=B cached=C warm_bytes=B cap=C skipped=S warm_joins=J learned_bytes=B warm_bypassed=D
 ```
 
 `TOTK_SEED_STATS` defaults **off**. Lookup/hit/read/byte/blocking fields are deltas per the existing
 300-present stutter window; worker reads/bytes, warm bytes, skipped and cached payload bytes are
-cumulative/current gauges. `demand_storage_reads` counts payload read attempts (individual `pread`
+cumulative/current gauges. `index_heap` counts the seed record structures and lookup table capacity at
+startup. It excludes allocator overhead, the mapped pack and warmed payloads. The table stores compact
+fingerprints and resolves equal fingerprints by comparing the complete names.
+`demand_storage_reads` counts payload read attempts (individual `pread`
 calls for packs, a loose-file read attempt for fallback) initiated for demand. Learned warm reads
 are in `worker_reads`, even if subsequently joined. `warmed_hits` means already-ready RAM;
 `warm_joins` only counts an already-running learned read, not a queued key. `warm_bypassed` is
@@ -5589,6 +5748,21 @@ the shutdown test covers that process-exit model, not Java lifecycle/device
 integration. This change establishes no measured on-device FPS improvement.
 
 ## Shader compiles and the pipeline cache
+
+For an opt-in selective warm-up trial, collect a route with `TOTK_PSO_COLLECT=1` and `TOTK_PSO_TRACE=1`.
+Use `scripts/select_hot_pso_keys.py` from the TotK directory with the resulting `.pso-keys` and `totk.log`.
+It ranks exact capture keys by measured successful synchronous build time, verifies they match the shader
+manifest and emits a small binary key list. Test it with `TOTK_PSO_PREWARM=1` and `TOTK_PSO_KEYS` pointed
+at that list, keeping the same initial driver cache and save for the comparison. The default is eight keys.
+The worker's `first-demand` trace records whether a selected key was ready, queued, building or failed
+when encountered. On Vulkan 1.3, `pso-feedback` rows also report valid driver duration and app-cache-hit
+feedback for graphics pipelines. Compare measured first usage and gameplay latency before sharing a list.
+
+For a separate restart experiment, `TOTK_PSO_RECREATE_CAPTURES=1` rebuilds the process-local
+handles for previously completed capture keys when the enabled list contains at most 32 total
+keys. Keep the same cache and list across launches. `replay_queued` counts the restored keys queued
+for recreation. Check `first-demand` for readiness. The option defaults off and uses the existing
+background worker and pressure controls.
 
 Turnip needs 70–150 ms to compile each pipeline with a shader it hasn't seen, which used to freeze the game for up to
 3 s on the first visit to an area. Pipelines the driver has to compile are now built on two worker threads

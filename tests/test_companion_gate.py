@@ -41,13 +41,26 @@ public final class HandlerThread {
 public final class SystemClock {
     public static long elapsedRealtime() { return 0; }
 }''',
+    'android/os/BatteryManager.java': '''package android.os;
+public final class BatteryManager {
+    public static final String EXTRA_PRESENT = "present";
+    public static final String EXTRA_TEMPERATURE = "temperature";
+}''',
     'android/content/Context.java': '''package android.content;
 public class Context {
+    public Context getApplicationContext() { return this; }
+    public Intent registerReceiver(BroadcastReceiver receiver, IntentFilter filter) { return null; }
     public void startActivity(Intent intent) { throw new AssertionError("the probe reports no game error"); }
+}''',
+    'android/content/BroadcastReceiver.java': 'package android.content; public abstract class BroadcastReceiver {}',
+    'android/content/IntentFilter.java': '''package android.content;
+public final class IntentFilter {
+    public IntentFilter(String action) {}
 }''',
     'android/content/Intent.java': '''package android.content;
 public class Intent {
     public static final String ACTION_VIEW = "view";
+    public static final String ACTION_BATTERY_CHANGED = "android.intent.action.BATTERY_CHANGED";
     public Intent() {}
     public Intent(Context context, Class<?> target) {}
     public Intent setAction(String value) { return this; }
@@ -55,6 +68,7 @@ public class Intent {
     public Intent setClassName(Context context, String name) { return this; }
     public Intent putExtra(String name, String value) { return this; }
     public boolean getBooleanExtra(String name, boolean fallback) { return fallback; }
+    public int getIntExtra(String name, int fallback) { return fallback; }
 }''',
     'android/content/res/Configuration.java': 'package android.content.res; public final class Configuration {}',
     'com/aure/totk/GameLaunch.java': '''package com.aure.totk;
@@ -109,7 +123,19 @@ public class View {
 }''',
     'android/view/Window.java': '''package android.view;
 public class Window {
+    private WindowManager.LayoutParams attributes = new WindowManager.LayoutParams();
     public View getDecorView() { return new View(); }
+    public WindowManager.LayoutParams getAttributes() { return attributes; }
+    public void setAttributes(WindowManager.LayoutParams value) { attributes = value; }
+}''',
+    'android/view/WindowManager.java': '''package android.view;
+public interface WindowManager {
+    class LayoutParams { public float preferredRefreshRate; }
+}''',
+    'android/window/OnBackInvokedDispatcher.java': '''package android.window;
+public final class OnBackInvokedDispatcher {
+    public static final int PRIORITY_DEFAULT = 0;
+    public void registerOnBackInvokedCallback(int priority, Runnable callback) {}
 }''',
     'android/app/Activity.java': 'package android.app; public class Activity extends android.content.Context {}',
     'android/app/NativeActivity.java': '''package android.app;
@@ -130,6 +156,10 @@ public class NativeActivity extends Activity {
     public boolean isFinishing() { return false; }
     public boolean hasWindowFocus() { return true; }
     public Window getWindow() { return new Window(); }
+    public android.window.OnBackInvokedDispatcher getOnBackInvokedDispatcher() {
+        return new android.window.OnBackInvokedDispatcher();
+    }
+    public void onBackPressed() {}
     public android.view.Display getDisplay() { return new android.view.Display(); }
     public void onWindowFocusChanged(boolean focused) {}
     public void onTopResumedActivityChanged(boolean top) {}

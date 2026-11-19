@@ -63,7 +63,7 @@ final class Strings {
 
     // Graphics
     static final String TAB_PERFORMANCE = "Performance", TAB_PICTURE = "Picture", TAB_SCREEN = "Screen";
-    static final String IN_USE = "IN USE";
+    static final String PRESET_SELECTED = "SELECTED";
     static final String RECOMMENDED = "Recommended for this device";
     static final String UNTESTED_DEFAULT = "Default for untested devices: the lightest preset";
     static final String SECOND_DETECTED = "Second screen detected";
@@ -79,7 +79,12 @@ final class Strings {
     static final String DETECTED = "Detected";
     static final String CHOOSE_GRAPHICS = "Choose graphics";
     static final String SETUP_COMPLETE = "Setup complete · step 6 of 6";
-    static final String TAKES_EFFECT = "Takes effect when you start the game. Change it any time from this menu.";
+    static final String TAKES_EFFECT = "Applies when you start the game.";
+    static final String GRAPHICS_NEXT_START = "Graphics changes apply the next time you start the game.";
+    static final String P_RESUME_GAME = "Resume game";
+    static final String RESTART_GAME = "Restart game";
+    static final String RESTART_CONFIRM = "Restart the game?";
+    static final String RESTART_PROGRESS_WARNING = "The game will close and reopen. You'll lose any progress since your last save.";
     static final String GPU_COST = "GPU cost", ADDED_LATENCY = "Added latency", WORKS_WITH = "Works with", APPLIES = "Applies";
     static final String WHILE_PLAYING = "Change while playing", SOUND_BUFFER = "Sound buffer", GAME_RESOLUTION = "Game targets";
     static final String STRENGTH = "Strength";
@@ -132,11 +137,13 @@ final class Strings {
             case "render_res": return "Render resolution";
             case "latency": return "Latency";
             case "gpu_feed": return "Keep the GPU busy";
+            case "low_memory": return "Low memory mode";
             case "upscaler": return "Upscaler";
             case "sharpness_fsr": case "sharpness_sgsr": return "Sharpness";
             case "aa": return "Anti-aliasing";
             case "shadows": return "Shadows";
             case "console_mode": return "Console mode";
+            case "aspect_ratio": return "Aspect ratio";
             case "native_hud": return "Native HUD";
             case "overlay": return "Performance overlay";
             case "overlay_pos": return "Overlay position";
@@ -156,6 +163,7 @@ final class Strings {
             case "render_res": return "Size of the 3D scene before upscaling";
             case "latency": return "Responsive · Balanced · Smoothest";
             case "gpu_feed": return "Feeds work earlier · more power and heat";
+            case "low_memory": return "Uses less RAM · applies on next launch";
             case "upscaler": return "Off · FSR 1 · Snapdragon GSR";
             case "sharpness_fsr": case "sharpness_sgsr": return "Applies to the upscaler";
             case "aa": return "Smooths jagged edges";
@@ -184,12 +192,17 @@ final class Strings {
             case "frame_gen": return "Draws an in-between picture from two real frames, so the screen updates 60 times a second while "
                     + "the game itself runs at 30. Motion looks smoother; input feels about one frame later.";
             case "render_res": return "The size the game draws its 3D scene at before it is enlarged to fill the screen. Smaller is faster "
-                    + "and softer. Game default lets the game choose, as on the console.";
+                    + "and softer. 1920 × 1080 needs more graphics memory and GPU power. Game default lets the game choose, as on the console.";
+            case "aspect_ratio": return "Aspect ratios change the camera view and keep its proportions. Stretch to fill uses the whole "
+                    + "screen with the standard 16:9 camera. It can make characters look wider or taller. Applies on next launch.";
             case "latency": return "How many finished pictures may wait for the screen. Responsive shows each one as soon as possible; "
                     + "Smoothest keeps one more in reserve to hide uneven frames, at up to one more frame of input delay.";
             case "gpu_feed": return "Sends smaller batches of work to the GPU earlier and asks Android for clocks that keep up. "
                     + "A little more GPU and CPU clock means more power and heat. On by default on devices where it was "
                     + "measured to help (Snapdragon 8 Elite class); has no effect with frame generation.";
+            case "low_memory": return "Enable this if Android closes the game while loading or exploring. The game keeps less "
+                    + "rendering data in memory and may briefly stutter when new effects appear. This keeps your picture settings. "
+                    + "Close and relaunch the game to apply it.";
             case "upscaler": return "How the picture is enlarged to the screen. FSR 1 is AMD's edge-aware upscaler; Snapdragon GSR is "
                     + "Qualcomm's, made for Adreno GPUs. Off uses plain filtering.";
             case "sharpness_fsr": case "sharpness_sgsr": return "How much detail the upscaler restores after enlarging the picture. Too high "
@@ -214,7 +227,7 @@ final class Strings {
             case "game_language": return "The language of the game's text and voices. Device language follows this device's first "
                     + "language when the game has it, and falls back to English otherwise.";
             case "rumble": return "The game's rumble on the controller's motors when it has its own, otherwise on this device's "
-                    + "vibration motor. Off gives the game no rumble at all.";
+                    + "vibration motor. Above 100 % boosts weak motors and can clip strong effects. Off gives the game no rumble at all.";
             case "motion": return "The game's motion controls (aiming the bow, some puzzles) from the controller's gyroscope when it "
                     + "has one, otherwise from this device's. The game's own options can still turn motion aiming off.";
             default: return "";
@@ -224,7 +237,8 @@ final class Strings {
         switch (key) {
             case "frame_rate": return value.equals("unlimited") ? "Unlimited" : value + " fps";
             case "frame_gen": return value.equals("on") ? "Interpolation" : "Off";
-            case "gpu_feed": return value.equals("on") ? "On" : "Off";
+            case "gpu_feed": case "low_memory": return value.equals("on") ? "On" : "Off";
+            case "aspect_ratio": return value.equals("stretch") ? "Stretch to fill" : value;
             case "render_res": return value.equals("game") ? "Game default" : value.replace("x", " × ");
             case "upscaler": return upscalerName(value);
             case "aa": return value.equals("fxaa") ? "Game (FXAA)" : value.equals("smaa") ? "SMAA" : "Off";
@@ -305,6 +319,47 @@ final class Strings {
     static final String DRIVER_RESET_ROW = "Use the bundled driver";
     static final String DRIVER_RESET_HINT = "Removes the custom driver file";
     static final String DRIVER_BUNDLED = "Bundled";
+    static final String MODS_ROW = "Mods";
+    static final String MODS_HINT = "A TKMM merge, or a mod's folder with romfs inside";
+    static final String MODS_NONE = "None";
+    static final String MODS_FROM = "Import mods from";
+    static final String MODS_BODY = "Pick the folder or zip that has a romfs folder inside: TKMM's Merged folder, or one mod as it was "
+            + "downloaded. It replaces the mods imported before. To use several mods together, merge them with TKMM first.";
+    static final String MODS_TREE = "A folder";
+    static final String MODS_TREE_HINT = "The folder that holds romfs, for example TKMM's Merged";
+    static final String MODS_ZIP = "A zip file";
+    static final String MODS_ZIP_HINT = "A zip with a romfs folder inside";
+    static final String MODS_REMOVE = "Remove the imported mods";
+    static final String MODS_REMOVE_HINT = "A mods folder placed by hand is not touched";
+    static final String MODS_IMPORTING = "Importing mods…";
+    static final String MODS_REMOVED = "Imported mods removed";
+    static final String MODS_REMOVING = "Removing mods…";
+    static final String MODS_NOT_REMOVED = "Some mod files could not be removed";
+    static final String MODS_BY_HAND = "Game folder";
+    static final String MODS_BY_HAND_NOTE = "has its own mods folder, which is used instead";
+    static final String MODS_FILES = "Game files";
+    static final String MODS_PATCHES = "Code patches";
+    static final String MODS_PATCHES_NOTE = "checked and applied at start";
+    static final String MODS_MODULES = "Code modules";
+    static final String MODS_MODULES_NOTE = "not loaded by this port";
+    static final String MODS_SOURCE = "Imported from";
+    /** The mods row and the note after an import: files, size and how many code modules the port will not load. */
+    static String modsState(int files, long size, int modules) {
+        return files + " files · " + bytes(size) + (modules == 0 ? "" : " · " + modules + " code module" + (modules == 1 ? "" : "s") + " not loaded");
+    }
+    /** ModImport.Invalid codes in the player's words; anything else with its own text. */
+    static String modsError(String code, String detail) {
+        switch (code) {
+            case "no_romfs": return "No romfs folder was found in it: pick the folder, or a zip of the folder, that holds romfs.";
+            case "several": return "It holds more than one mod (several romfs folders). Merge them with TKMM and import the merge.";
+            case "only_modules": return "It holds only code modules, which this port does not load.";
+            case "bad_zip": return "That file is not a zip archive that can be read.";
+            case "bad_path": case "duplicate": return "That archive cannot be used: " + detail;
+            case "too_many": case "too_big": return "That is more than the import takes: " + detail;
+            case "no_space": return "Not enough free storage for these mods.";
+            default: return "The mods were not imported: " + detail;
+        }
+    }
     static final String DRIVER_BAD = "That file is not a Vulkan driver: pick a Turnip .zip (AdrenoTools) or its .so (64-bit ARM).";
     static final String DRIVER_ZIP_BAD = "That zip has no usable driver. Its meta.json must name an existing libraryName, or it must "
             + "contain exactly one .so (64-bit ARM, up to 128 MiB; at most 256 entries).";
@@ -327,6 +382,11 @@ final class Strings {
             + "it nothing is drawn. Building takes a few minutes.";
     static final String DRIVER_TEXT = "The Vulkan driver the game uses. The bundled Mesa Turnip build is tested with this app. Pick a "
             + "Turnip .zip (AdrenoTools format) or a 64-bit ARM .so; only the driver library is copied into the game folder and used instead.";
+    static final String MODS_TEXT = "Game files that replace or add to your game data. They are copied into the app's private storage "
+            + "and used from the next start. IPS patches of the game's main program are checked and applied; code modules (subsdk "
+            + "files, as UltraCam and other exlaunch mods ship them) are not loaded, so a mod that needs one may misbehave. If the game "
+            + "stops at start after an import, totk.log names the file; remove the imported mods here. A mods folder placed by hand "
+            + "in the game folder is used instead of the import.";
     static final String RERUN_TEXT = "Opens setup again to pick different files. Steps that are already finished and still match "
             + "are kept.";
     static final String DELETE_TEXT = "Removes the imported game data from this device. Saves, menu settings and a custom driver stay. "

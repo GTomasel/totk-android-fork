@@ -17,6 +17,9 @@ extern int runtime_handheld_mode(void);
 #ifdef __ANDROID__
 #include <dlfcn.h>
 #endif
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+extern int runtime_android_battery_temperature_mc(void);
+#endif
 #define MINV(a, b) ((a) < (b) ? (a) : (b))
 #define SECOND_NS UINT64_C(1000000000)
 
@@ -624,6 +627,10 @@ static void *power_sampler(void *unused) {
 #ifdef __ANDROID__
     pthread_setname_np(pthread_self(), "totk-power");
 #endif
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    uint64_t battery_next_ns = 0;
+    int battery_mc = INT_MIN;
+#endif
     for (;;) {
         /* Only while the panel is shown: the live toggle may hide it for most of a session. */
         int mode = atomic_load_explicit(&live_mode, memory_order_relaxed);
@@ -631,7 +638,18 @@ static void *power_sampler(void *unused) {
             vk_overlay_power p = vk_overlay_read_power("/sys/class/power_supply");
             unsigned sample = p.mw > 0 ? (unsigned)p.mw << 1 | (unsigned)p.input : 0;
             atomic_store_explicit(&power_sample, sample, memory_order_relaxed);
-            atomic_store_explicit(&temperature_sample, vk_overlay_read_temperature("/sys/class/power_supply"), memory_order_relaxed);
+            int temperature_mc = vk_overlay_read_temperature("/sys/class/power_supply");
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+            if (temperature_mc == INT_MIN) {
+                uint64_t now = clock_ns();
+                if (now >= battery_next_ns) {
+                    battery_mc = runtime_android_battery_temperature_mc();
+                    battery_next_ns = clock_ns() + 5 * SECOND_NS;
+                }
+                temperature_mc = battery_mc;
+            }
+#endif
+            atomic_store_explicit(&temperature_sample, temperature_mc, memory_order_relaxed);
         }
         if (mode == 2 && system_enabled) {
             vk_overlay_system s = vk_overlay_read_system("/sys/devices/system/cpu", "/proc", main_cpu());

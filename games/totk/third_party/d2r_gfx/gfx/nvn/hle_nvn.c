@@ -3420,6 +3420,23 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
         return g_fps_auto_ticks; /* Exact adaptive alone may shorten host pacing. */
     if ((runtime_android_fps_auto_active() || runtime_fps_hybrid_selected()) && g_fps_auto_ticks>ticks)
         ticks=g_fps_auto_ticks;
+#if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
+    /* NVN intervals count the guest's60Hz ticks, not panel refreshes. Using
+     * interval2 directly at120Hz doubled the selected30fps mode. Convert once
+     * here so acquire waits, credits and queued presents share the same units.
+     * Adaptive returns physical slots above; interpolation/uncapped own theirs.
+     * Round up on panels without an exact divisor. Round measured Hz first:
+     * fractional rates and callback calibration noise near60/120Hz must not
+     * add a whole refresh. Durations still use the precise observed period. */
+    if (!uncapped_now() && !dm_detclock_enabled() && mfx_enabled() == MFX_OFF && !g_display_mode) {
+        uint64_t refresh = runtime_android_display_period(1);
+        if (refresh) {
+            uint64_t hz = (1000000000ull + refresh / 2) / refresh;
+            uint64_t physical = ((uint64_t)ticks * hz + 59) / 60;
+            ticks = !physical ? 1 : physical > UINT32_MAX ? UINT32_MAX : (unsigned)physical;
+        }
+    }
+#endif
     if (acquire_clock_on()) return cutscene_present_ticks(ticks);
     /* TOTK_MFX / key 2: MetalFX makes the frame between two game frames. Half the refresh rate: the game presents every
        second display tick (50 + 50 on a 100 Hz display); 30+30: hz / 30 ticks (2 at 60 Hz; at 100 Hz the own clock paces,

@@ -85,6 +85,12 @@ static void pso_collect_success(pipe_ent *e) {
 }
 static void pso_demand(pipe_ent *e, int capture) {
     if (!atomic_load_explicit(&g_pso_ready, memory_order_relaxed)) return;
+    if (e->list_index && !e->prewarm_demand_seen) {
+        e->prewarm_demand_seen = 1; /* recording owner, never mutated by a compile worker */
+        int state = atomic_load_explicit(&e->state, memory_order_acquire);
+        static const char *const reason[] = {"prewarm-queued", "prewarm-building", "prewarm-ready", "prewarm-failed"};
+        pso_trace_log(&e->k, "first-demand", reason[state], totk_ft_work_frame(), VK_SUCCESS, 0, 0, -1);
+    }
     if ((!capture || e->capture) && (!e->list_index || atomic_load_explicit(&e->state, memory_order_acquire) != PE_QUEUED)) return;
     pthread_mutex_lock(&g_pq_mu);
     e->capture |= capture;
@@ -153,6 +159,16 @@ static void pso_restore_from(const char *cache) {
     memcpy(g_pw_saved_done, g_pw_done, PSO_BITMAP_BYTES);
 }
 static void pso_restore(void) { pso_restore_from(vk_pcache_loaded_path()); }
+/* Resume bits track disk-cache progress. Each process creates its own VkPipeline handles. */
+static int pso_key_is_done(uint32_t index) {
+    return (g_pw_done[index / 8] >> (index % 8)) & 1;
+}
+static int pso_recreate_captures(const char *option, uint32_t total) {
+    return option && !strcmp(option, "1") && total && total <= 32;
+}
+static int pso_prewarms_key(uint32_t index, int capture, int recreate_captures) {
+    return !pso_key_is_done(index) || (capture && recreate_captures);
+}
 void vk_pipeline_keys_stats(uint64_t out[6]) {
     if (!atomic_load_explicit(&g_pso_ready, memory_order_acquire)) { memset(out, 0, 6*sizeof *out); return; }
     pthread_mutex_lock(&g_pq_mu);
@@ -178,7 +194,7 @@ static void pso_complete(pipe_ent *e, VkResult result, uint64_t dt) {
     if (!e->list_index) return;
     unsigned i = e->list_index-1;
     g_pw_ns += dt;
-    if (!result && !(g_pw_done[i/8] >> (i%8) & 1)) { g_pw_done[i/8] |= 1u << (i%8); g_pw_completed++; }
+    if (!result && !pso_key_is_done(i)) { g_pw_done[i/8] |= 1u << (i%8); g_pw_completed++; }
     if (result) g_pw_failed++;
     if (!(g_pw_completed % 64) || !g_pw_head)
         LOGV("[pso-prewarm] progress %u/%u missing=%u failed=%u build_ms=%.1f wall_ms=%.1f", g_pw_completed, g_pw_total, g_pw_missing, g_pw_failed, g_pw_ns/1e6, (host_now_ns()-g_pw_started)/1e6);
@@ -248,6 +264,16 @@ int vk_pipeline_test_keys(void) {
     pso_restore_from("pso-cache.bin");
     KTEST(g_pw_completed==3 && g_pw_done[0]==5 && g_pw_done[1]==1);
     KTEST(!vk_pipeline_keys_dirty());
+    KTEST(!pso_recreate_captures(NULL, 9) && !pso_recreate_captures("0", 9));
+    KTEST(!pso_recreate_captures("yes", 9) && !pso_recreate_captures("1", 0));
+    KTEST(pso_recreate_captures("1", 32) && !pso_recreate_captures("1", 33));
+    KTEST(!pso_prewarms_key(8, 1, 0) && pso_prewarms_key(8, 1, 1));
+    KTEST(!pso_prewarms_key(8, 0, 1) && pso_prewarms_key(7, 0, 0) && pso_prewarms_key(7, 1, 1));
+    a.list_index = 9;
+    pso_complete(&a, VK_SUCCESS, 1); /* recreating a process-local handle keeps the persisted bit unchanged */
+    KTEST(g_pw_completed==3 && !vk_pipeline_keys_dirty());
+    pso_complete(&a, VK_ERROR_OUT_OF_HOST_MEMORY, 1);
+    KTEST(g_pw_failed==1 && g_pw_completed==3 && !vk_pipeline_keys_dirty());
     memset(g_pw_done,0,sizeof g_pw_done); g_pw_completed=0; g_pw_digest[0]^=1;
     pso_restore_from("pso-cache.bin"); KTEST(g_pw_completed==0); /* changed list */
     g_pw_digest[0]^=1;
@@ -262,6 +288,9 @@ int vk_pipeline_test_keys(void) {
 #endif
 #ifdef TOTK_VK_TESTS
 static int g_pso_test_screen_started, g_pso_test_order_bad;
+int vk_pipeline_test_warm_pending(void) {
+    return atomic_load_explicit(&g_pso_warming, memory_order_relaxed);
+}
 int vk_pipeline_test_key_order(void) {
     pthread_mutex_lock(&g_pq_mu); int ok = !g_pso_test_order_bad; pthread_mutex_unlock(&g_pq_mu); return ok;
 }

@@ -3561,7 +3561,7 @@ typedef struct pipe_ent {
     int fast_attempted, replaced;      /* walking thread only */
     uint64_t wait_sub, retry_at; unsigned skipped, seen_failure;   /* walking thread only */
     uint64_t frame;                    /* originating request; immutable while queued/building */
-    int predicted, capture; uint32_t list_index, collected; struct pipe_ent *next;
+    int predicted, capture, prewarm_demand_seen; uint32_t list_index, collected; struct pipe_ent *next;
     vk_lend lend;                      /* g_pq_mu: the worker building it and any nice a waiter lent it */
 } pipe_ent;
 #define PIPE_FAILED ((VkPipeline)(uintptr_t)1)
@@ -3788,7 +3788,7 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
 static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
     vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vk_vs_module_for(vs, fs), .pName = "main"},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
@@ -3900,6 +3900,11 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
     int probe = (flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) != 0;
     int trace = synchronous && !probe && pso_trace_on();
     int measure = !probe && (diag || credit || trace);
+    VkPipelineCreationFeedback feedback = {0};
+    VkPipelineCreationFeedbackCreateInfo feedback_info = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+        .pNext = ci.pNext, .pPipelineCreationFeedback = &feedback};
+    int trace_feedback = part < 0 && V.props.apiVersion >= VK_API_VERSION_1_3 && pso_trace_on();
+    if (trace_feedback) ci.pNext = &feedback_info;
     uint64_t build_start = measure ? host_now_ns() : 0;
     VkResult r = vk_pcache_graphics(&ci, &p);
     if (measure) {
@@ -3908,6 +3913,16 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
         if (credit && !probe) nvn_scan_budget_build(&g_pp_budget, g_pp_frame, elapsed);
     }
     if (trace) pso_trace_target_log(k, "sync-build", frame, r, host_now_ns() - build_start);
+    if (trace_feedback && r != VK_PIPELINE_COMPILE_REQUIRED) {
+        TotkPsoTraceKey key = pso_trace_key(k);
+        int valid = (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0;
+        int hit = valid ? !!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) : -1;
+        pthread_mutex_lock(&g_pso_trace_mu);
+        LOGV("[pso-feedback] key=%016llx frame=%llu sync=%d probe=%d result=%d app_cache_hit=%d driver_ms=%.3f",
+             (unsigned long long)totk_pso_trace_key_hash(&key), (unsigned long long)frame,
+             synchronous, probe, r, hit, valid ? feedback.duration / 1e6 : -1.0);
+        pthread_mutex_unlock(&g_pso_trace_mu);
+    }
     if (!r && (runtime_android_fps_auto_active() || runtime_fps_adaptive_selected()))
         runtime_android_fps_auto_pipeline(host_now_ns());
     if (!r && frame) {
@@ -4246,7 +4261,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
                 int prim, count;
                 if (h.op == OP_DRAW) { PP_NEED(p_draw); prim = ((const p_draw *)a)->prim; count = ((const p_draw *)a)->count; }
                 else { PP_NEED(p_draw_idx); prim = ((const p_draw_idx *)a)->prim; count = ((const p_draw_idx *)a)->count; }
-                if (!count || prim < 0 || prim == 2 || prim >= 8 || (h.op == OP_DRAW_IDX && prim == 7) ||
+                if (!count || prim < 0 || prim == 2 || prim > 8 ||
                     predicted.render_disabled || predicted.raster_discard || predicted.poly.cull == NVN_FACE_FRONT_AND_BACK) break;
                 /* Prediction never loads modules. Alpha variants are demand-created;
                  * do not speculate the base module's (wrong) pipeline for this draw. */
@@ -4307,10 +4322,12 @@ void vk_pipeline_prewarm(void) {
     g_pw_started = host_now_ns();
     pso_restore();
     pipe_ent *head = NULL, *tail = NULL;
-    if (records && g_pw_total > g_pw_completed && compile_threads()) {
+    int recreate_captures = pso_recreate_captures(getenv("TOTK_PSO_RECREATE_CAPTURES"), g_pw_total);
+    unsigned recreated = 0;
+    if (records && (g_pw_total > g_pw_completed || recreate_captures) && compile_threads()) {
         for (int priority = 1; priority >= 0; priority--) for (uint32_t i = 0; i < g_pw_total; i++) {
             if (records[i].capture != (uint32_t)priority) continue;
-            if (g_pw_done[i/8] >> (i%8) & 1) continue;
+            if (!pso_prewarms_key(i, priority, recreate_captures)) continue;
             pso_record *r = records+i; pipe_key k; pso_decode(r, &k);
             k.vs = vk_shader_seed((const char *)r->key, 0, 0);
             k.fs = r->key[80] ? vk_shader_seed((const char *)r->key+80, 1, pso_u32(r->key+160)) : NULL;
@@ -4322,10 +4339,12 @@ void vk_pipeline_prewarm(void) {
             e->capture = r->capture; e->predicted = 1; /* first demand must build/join, never skip a formerly cached draw */
             nvn_hm_put(&g_pipes, &k, e);
             if (tail) tail->next = e; else head = e; tail = e;
+            recreated += pso_key_is_done(i);
         }
     }
     free(records);
-    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first", path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6);
+    if (path) LOGV("[pso-prewarm] list=%s resumed=%u/%u missing=%u startup_ms=%.1f; background_worker_limit=1, demand first, replay_queued=%u",
+                   path, g_pw_completed, g_pw_total, g_pw_missing, (host_now_ns()-g_pw_started)/1e6, recreated);
     pthread_mutex_lock(&g_pq_mu);
     g_pw_head = head; g_pw_tail = tail;
     atomic_store_explicit(&g_pso_warming, head != NULL, memory_order_relaxed);
@@ -4494,7 +4513,89 @@ static void support_fill(uint8_t *d, uint32_t w, uint32_t h) {   /* Ryujinx Supp
     memcpy(d + 144, vi, 16); memcpy(d + 160, vs, 16);
     for (int i = 0; i < 73; i++) { float one = 1; memcpy(d + 192 + 16 * i, &one, 4); }
 }
-typedef struct { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; VkBufferView t; } dinfo;
+typedef union { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; VkBufferView t; } dinfo;
+
+/* Descriptor writes have no stride field. Single bindings can point directly into
+   selection scratch, but each array needs contiguous entries of its Vulkan type. */
+static VkWriteDescriptorSet *direct_descriptor_writes(const vk_shader *sh, const dinfo *info,
+                                                       size_t array_elements, VkDescriptorSet set) {
+    static VkWriteDescriptorSet *writes;
+    static uint8_t *packed;
+    static size_t write_capacity, packed_capacity;
+    if ((size_t)sh->nb > write_capacity) {
+        write_capacity = (size_t)sh->nb + 16;
+        writes = VK_REALLOC(writes, write_capacity * sizeof *writes);
+    }
+    if (array_elements > packed_capacity) {
+        packed_capacity = array_elements + 16;
+        packed = VK_REALLOC(packed, packed_capacity * sizeof(dinfo));
+    }
+    size_t first = 0, used = 0;
+    for (int i = 0; i < sh->nb; i++) {
+        const vk_bind *binding = &sh->b[i];
+        const dinfo *in = &info[first];
+        first += binding->count;
+        VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = binding->binding, .descriptorCount = binding->count,
+            .descriptorType = (VkDescriptorType)binding->dtype};
+        void *array = NULL;
+        if (binding->count > 1) {
+            array = packed + used * sizeof(dinfo);
+            used += binding->count;
+        }
+        switch (write.descriptorType) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            if (array) {
+                VkDescriptorBufferInfo *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].b;
+            }
+            write.pBufferInfo = array ? array : &in->b;
+            break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            if (array) {
+                VkBufferView *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].t;
+            }
+            write.pTexelBufferView = array ? array : &in->t;
+            break;
+        default:
+            if (array) {
+                VkDescriptorImageInfo *out = array;
+                for (unsigned e = 0; e < binding->count; e++) out[e] = in[e].i;
+            }
+            write.pImageInfo = array ? array : &in->i;
+            break;
+        }
+        writes[i] = write;
+    }
+    return writes;
+}
+#ifdef TOTK_VK_TESTS
+int vk_draw_test_descriptor_arrays(VkDescriptorSet set, const vk_record_descriptor input[6]) {
+    vk_bind bindings[] = {
+        {.binding = 0, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER},
+        {.binding = 2, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+        {.binding = 4, .count = 2, .dtype = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER},
+    };
+    vk_shader shader = {.nb = 3, .b = bindings};
+    const dinfo info[] = {{.b = input[0].b}, {.b = input[1].b}, {.i = input[2].i},
+                          {.i = input[3].i}, {.t = input[4].t}, {.t = input[5].t}};
+    const VkWriteDescriptorSet *writes = direct_descriptor_writes(&shader, info, 6, set);
+    for (unsigned i = 0; i < 2; i++) {
+        const VkDescriptorBufferInfo *buffer = &writes[0].pBufferInfo[i];
+        const VkDescriptorImageInfo *image = &writes[1].pImageInfo[i];
+        if (buffer->buffer != input[i].b.buffer || buffer->offset != input[i].b.offset ||
+            buffer->range != input[i].b.range || image->imageView != input[2 + i].i.imageView ||
+            image->sampler != input[2 + i].i.sampler || image->imageLayout != input[2 + i].i.imageLayout ||
+            writes[2].pTexelBufferView[i] != input[4 + i].t) return 0;
+    }
+    vkUpdateDescriptorSets(V.dev, 3, writes, 0, NULL);
+    return 1;
+}
+#endif
+
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out, int storage, int rw, uint64_t extent, vk_record_descriptor *record) {
     VkBuffer b; uint64_t off, avail; uint32_t reason = 0;
     if (!addr || !vk_resolve_for(addr, 1, &b, &off, &avail, VK_LOOKUP_UBO)) return 0;
@@ -4949,7 +5050,12 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
     (void)feedback_cut_refresh();   /* a live TOTK_VK_FEEDBACK_CUT takes effect at this descriptor build */
     if (__builtin_expect(PL.enabled, 0)) pso_life_reads(sh, (unsigned)stage);
     if (g_record_draw) return R.open ? record_stage_impl(sh, stage, set_index, stats) : 0;
-    size_t total = 0; for (int i = 0; i < sh->nb; i++) total += sh->b[i].count;
+    size_t total = 0, array_elements = 0;
+    for (int i = 0; i < sh->nb; i++) {
+        unsigned count = sh->b[i].count;
+        total += count;
+        if (count > 1) array_elements += count;
+    }
     VkImageView replay_source = VK_NULL_HANDLE;
     static dinfo *info; static size_t capi;
     if (total > capi) { capi = total + 64; info = realloc(info, capi * sizeof *info); }
@@ -5046,20 +5152,14 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
     hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h);
     unsigned slot = (unsigned)(h[0] % DS_CACHE);
     VkDescriptorSet set;
+    VkWriteDescriptorSet *writes = NULL;
     static int dsoff = -1; if (dsoff < 0) dsoff = vk_off("ds");
     if (!dsoff && g_dsc[slot].sub == sub && g_dsc[slot].hash[0] == h[0] && g_dsc[slot].hash[1] == h[1] && g_dsc[slot].dsl == sh->dsl && g_dsc[slot].n == total) {
         set = g_dsc[slot].set; g_stat_sets_reused++;
     } else {
         set = vk_alloc_set(sh->dsl);
-        /* Writes are only consumed on a cache miss; hits need only the resolved infos (also used by pass dumps). */
-        static VkWriteDescriptorSet *w; static size_t capw;
-        if ((size_t)sh->nb > capw) { capw = (size_t)sh->nb + 16; w = realloc(w, capw * sizeof *w); }
-        for (int i = 0, kk = 0; i < sh->nb; i++) {
-            const vk_bind *b = &sh->b[i]; dinfo *in = &info[kk]; kk += b->count;
-            w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = b->count, .descriptorType = (VkDescriptorType)b->dtype,
-                .pBufferInfo = &in->b, .pImageInfo = &in->i, .pTexelBufferView = &in->t};
-        }
-        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, w, 0, NULL);
+        writes = direct_descriptor_writes(sh, info, array_elements, set);
+        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, writes, 0, NULL);
         g_dsc[slot].sub = sub; g_dsc[slot].hash[0] = h[0]; g_dsc[slot].hash[1] = h[1]; g_dsc[slot].dsl = sh->dsl; g_dsc[slot].n = total; g_dsc[slot].set = set;
         g_stat_sets_new++;
     }
@@ -5072,23 +5172,16 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
                 if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->dtype == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
                     for (int e = 0; e < b->count; e++)
                         if (in[e].i.imageView == replay_source) in[e].i.imageView = vk_fg_canvas_view();
-                VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet=replay_set, .dstBinding=b->binding, .descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype, .pBufferInfo=&in->b,
-                    .pImageInfo=&in->i, .pTexelBufferView=&in->t};
-                vkUpdateDescriptorSets(V.dev,1,&write,0,NULL);
             }
+            writes = direct_descriptor_writes(sh, info, array_elements, replay_set);
+            vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, writes, 0, NULL);
             FGX.record->final = 2; /* exact canvas input was replaced, not a shader-name-only guess */
         }
         if (FGX.record->final &&
                 atomic_load_explicit(&vk_fg_terminal_owned_active,memory_order_relaxed)) {
-            for (int i=0,first=0;i<sh->nb;i++) {
-                const vk_bind *b=&sh->b[i]; dinfo *in=&info[first]; first+=b->count;
-                VkWriteDescriptorSet write={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstBinding=b->binding,.descriptorCount=b->count,
-                    .descriptorType=(VkDescriptorType)b->dtype,.pBufferInfo=&in->b,
-                    .pImageInfo=&in->i,.pTexelBufferView=&in->t};
-                if (!vk_fg_terminal_owned_binding(set_index,sh->dsl,&write,b->rw))
+            if (!writes) writes = direct_descriptor_writes(sh, info, array_elements, replay_set);
+            for (int i = 0; i < sh->nb; i++) {
+                if (!vk_fg_terminal_owned_binding(set_index, sh->dsl, &writes[i], sh->b[i].rw))
                     vk_fg_terminal_owned_fail();
             }
         }
@@ -5114,9 +5207,20 @@ static int bind_stage(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayo
 }
 
 /* ---------- draws ---------- */
-static VkBuffer g_quad_ib; static uint32_t g_quad_max;
-static void quad_indices(uint32_t quads) {
-    if (g_quad_ib && quads <= g_quad_max) return;
+#include "vk_quad_indices_spv.h"
+static VkBuffer g_quad_ib[2]; static uint32_t g_quad_max[2];
+static uint32_t quad_count(int prim, uint32_t count) {
+    return prim == 8 ? (count < 4 ? 0 : count / 2 - 1) : count / 4;
+}
+static void quad_fill(uint32_t *ix, uint32_t n, int strip) {
+    for (uint32_t q = 0; q < n; q++) {
+        uint32_t v = q * (strip ? 2 : 4), t[6] = {v, v + 1, v + 2, v, v + 2, v + 3};
+        if (strip) { t[2] = t[4] = v + 3; t[5] = v + 2; }
+        memcpy(ix + q * 6, t, 24);
+    }
+}
+static VkBuffer quad_indices(uint32_t quads, int strip) {
+    if (g_quad_ib[strip] && quads <= g_quad_max[strip]) return g_quad_ib[strip];
     uint32_t n = quads < 65536 ? 65536 : quads;
     VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)n * 24, .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT};
     VkBuffer b; VKCHECK(vkCreateBuffer(V.dev, &bci, NULL, &b));
@@ -5124,9 +5228,76 @@ static void quad_indices(uint32_t quads) {
     vk_alloc a; if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &a)) DIE("quad index buffer");
     VKCHECK(vkBindBufferMemory(V.dev, b, a.mem, a.off));
     uint32_t *ix; VKCHECK(vkMapMemory(V.dev, a.mem, a.off, (VkDeviceSize)n * 24, 0, (void **)&ix));
-    for (uint32_t q = 0; q < n; q++) { uint32_t v = q * 4, t[6] = {v, v + 1, v + 2, v, v + 2, v + 3}; memcpy(ix + q * 6, t, 24); }
+    /* QUAD_STRIP's perimeter is (2q,2q+1,2q+3,2q+2), not a triangle strip:
+       keep its diagonal and the same first/provoking vertex in both triangles. */
+    quad_fill(ix, n, strip);
     vkUnmapMemory(V.dev, a.mem);
-    g_quad_ib = b; g_quad_max = n;   /* the old buffer (if any) is left alive: it may be in flight */
+    g_quad_ib[strip] = b; g_quad_max[strip] = n;   /* old buffers may still be in flight */
+    return b;
+}
+static struct { VkBuffer buffer; VkDeviceSize index_offset, indirect_offset; uint32_t bound; } g_quad_draw;
+static int indexed_quads_prepare(const p_draw_idx *di, uint32_t count) {
+    if (di->itype < 0 || di->itype > 2 || count > (1u << 20)) return 0;
+    if (di->base_instance && !V.has_indirect_first_instance) return 0;
+    if (count < 4) return 1;
+    /* A generated count is safe in its producer slot. Later generated-frame UI
+       replay needs an extended ownership proof, even if this pass uses workers. */
+    if (vk_fg_extract_active) fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"indexed quad replay not qualified");
+    uint32_t stride = 1u << di->itype, maximum = quad_count(di->prim, count) * 6;
+    uint64_t bytes = (uint64_t)count * stride, offset, available;
+    VkBuffer source;
+    /* Materialize ordered CPU updates before selecting the same live/frozen input as an ordinary index draw. */
+    vk_ub_touch(di->ibuf, bytes);
+    if (!vk_resolve_for(di->ibuf, bytes, &source, &offset, &available, VK_LOOKUP_VERTEX) || offset % stride) return 0;
+    uint64_t align = MAXV(4, V.props.limits.minStorageBufferOffsetAlignment);
+    VkDescriptorBufferInfo frozen;
+    uint64_t padded = (bytes + 3) & ~UINT64_C(3);
+    int captured = padded <= available && vk_lag_read(di->ibuf, padded, align, &frozen, VK_LAG_INDEX);
+    if (captured) { source = frozen.buffer; offset = frozen.offset; available = frozen.range; }
+    uint64_t base = offset - offset % align, prefix = offset - base;
+    uint64_t range = (prefix + bytes + 3) & ~UINT64_C(3);
+    if (range > available + prefix || range > V.props.limits.maxStorageBufferRange) return 0;
+    static VkDescriptorSetLayout set_layout;
+    static VkPipelineLayout layout;
+    static VkPipeline pipeline;
+    if (!pipeline) {
+        VkDescriptorSetLayoutBinding bindings[2] = {
+            {.binding=0,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT},
+            {.binding=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.descriptorCount=1,.stageFlags=VK_SHADER_STAGE_COMPUTE_BIT}};
+        VkDescriptorSetLayoutCreateInfo si = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=2,.pBindings=bindings};
+        VKCHECK(vkCreateDescriptorSetLayout(V.dev,&si,NULL,&set_layout));
+        VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT,0,28};
+        VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&set_layout,.pushConstantRangeCount=1,.pPushConstantRanges=&push};
+        VKCHECK(vkCreatePipelineLayout(V.dev,&li,NULL,&layout));
+        VkShaderModule module;
+        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=sizeof vk_quad_indices_spv,.pCode=vk_quad_indices_spv};
+        VKCHECK(vkCreateShaderModule(V.dev,&mi,NULL,&module));
+        VkComputePipelineCreateInfo pi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.layout=layout,
+            .stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=module,.pName="main"}};
+        VKCHECK(vkCreateComputePipelines(V.dev,VK_NULL_HANDLE,1,&pi,NULL,&pipeline));
+        vkDestroyShaderModule(V.dev,module,NULL);
+    }
+    vk_end_rendering_at(VK_PASS_END_COMPUTE,0);
+    VkDeviceSize output_offset;
+    (void)vk_transient(32 + (size_t)maximum * 4, align, &g_quad_draw.buffer, &output_offset);
+    g_quad_draw.index_offset = output_offset + 32; g_quad_draw.indirect_offset = output_offset; g_quad_draw.bound = maximum;
+    VkDescriptorBufferInfo buffers[2] = {{source,base,range},{g_quad_draw.buffer,output_offset,32+(uint64_t)maximum*4}};
+    VkDescriptorSet set = vk_alloc_set(set_layout);
+    VkWriteDescriptorSet writes[2];
+    for (unsigned i=0;i<2;i++) writes[i]=(VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=i,
+        .descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&buffers[i]};
+    vkUpdateDescriptorSets(V.dev,2,writes,0,NULL);
+    struct { uint32_t offset,count,shift,strip,instances; int32_t base_vertex; uint32_t base_instance; } push = {
+        (uint32_t)prefix,count,(uint32_t)di->itype,di->prim==8,di->instances>1?(uint32_t)di->instances:1,di->base_vertex,(uint32_t)di->base_instance};
+    VkCommandBuffer cb = vk_cb();
+    vk_barrier_all(cb);
+    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
+    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,1,&set,0,NULL);
+    vkCmdPushConstants(cb,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof push,&push);
+    vkCmdDispatch(cb,1,1,1);
+    vk_barrier_all(cb);
+    g_bound_pipe = VK_NULL_HANDLE;
+    return 1;
 }
 static void dynamic_state(VkCommandBuffer cb, int prim) {
     /* everything the draw sets dynamically, compared with what this command buffer last set (unchanged: nothing issued) */
@@ -5516,10 +5687,16 @@ static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di,
         d->vertex[ZERO_BINDING].buffer = VK_NULL_HANDLE; d->vertex[ZERO_BINDING].offset = 0; d->vertex[ZERO_BINDING].lag_reason = 0;
     }
     d->count = count; d->instances = instances; d->base_instance = base_instance;
-    if (dw && prim == 7) {
+    if (dw && (prim == 7 || prim == 8)) {
         if (count < 4) d->count = 0;
-        else { quad_indices(count / 4); d->index = g_quad_ib; d->index_type = VK_INDEX_TYPE_UINT32; d->count = count / 4 * 6; d->vertex_offset = dw->first; }
+        else { uint32_t quads = quad_count(prim, count); d->index = quad_indices(quads, prim == 8); d->index_type = VK_INDEX_TYPE_UINT32; d->count = quads * 6; d->vertex_offset = dw->first; }
     } else if (dw) d->first = (uint32_t)dw->first;
+    else if (prim == 7 || prim == 8) {
+        d->index = g_quad_draw.buffer; d->index_offset = g_quad_draw.index_offset; d->count = g_quad_draw.bound;
+        d->indirect = g_quad_draw.buffer; d->indirect_offset = g_quad_draw.indirect_offset;
+        d->index_type = VK_INDEX_TYPE_UINT32; d->vertex_offset = di->base_vertex;
+        d->first = 0; d->index_address = 0; d->index_bytes = (uint64_t)d->count * 4;
+    }
     else {
         uint32_t stride = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4; VkBuffer buffer; uint64_t offset;
         /* Eligibility affects immediate samples/conditions. Freeze the validated live handle too, so workers
@@ -5585,9 +5762,9 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
     owned_geometry=owned_geometry && g_test_terminal_geometry_freeze;
 #endif
     if (replay) {
-        replay->count = dw && prim == 7 ? (count / 4) * 6 : count;
+        replay->count = dw && (prim == 7 || prim == 8) ? quad_count(prim, count) * 6 : count;
         replay->instances = inst; replay->base_instance = base_inst;
-        replay->first = dw && prim != 7 ? (uint32_t)dw->first : 0;
+        replay->first = dw && prim != 7 && prim != 8 ? (uint32_t)dw->first : 0;
         replay->vertex_offset = dw ? dw->first : di->base_vertex;
     }
     for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
@@ -5627,28 +5804,34 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
         }
     }
     VK_REC_DO(VK_REC_S, vk_occlusion_draw(cb)); pd_pre_draw(cb);
-    if (dw && prim == 7) {
+    if (dw && (prim == 7 || prim == 8)) {
         if (count >= 4) {
-            quad_indices(count / 4);
-            VK_REC_DO(VK_REC_CMD, vkCmdBindIndexBuffer(cb, g_quad_ib, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(cb, (count / 4) * 6, inst, 0, dw->first, base_inst));
+            uint32_t quads = quad_count(prim, count);
+            VkBuffer quad_ib = quad_indices(quads, prim == 8);
+            VK_REC_DO(VK_REC_CMD, vkCmdBindIndexBuffer(cb, quad_ib, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(cb, quads * 6, inst, 0, dw->first, base_inst));
             if (replay) {
-                replay->index = g_quad_ib; replay->index_type = VK_INDEX_TYPE_UINT32;
+                replay->index = quad_ib; replay->index_type = VK_INDEX_TYPE_UINT32;
                 if (owned_geometry) {
                     /* This static buffer is not an arena. Reproduce only its
                        bounded, known CPU-generated prefix at the original bind;
                        do not grant arbitrary host-visible buffers copy authority. */
-                    VkDescriptorBufferInfo source={g_quad_ib,0,(uint64_t)(count/4)*24}, frozen;
+                    VkDescriptorBufferInfo source={quad_ib,0,(uint64_t)quads*24}, frozen;
                     if (fg_terminal_geometry_read(VK_FG_TERMINAL_INPUT_INDEX,0,0,source,&frozen)) {
                         uint32_t *ix=vk_transient((size_t)source.range,16,&replay->index,&replay->index_offset);
-                        for (uint32_t q=0;q<count/4;q++) {
-                            uint32_t v=q*4,t[6]={v,v+1,v+2,v,v+2,v+3}; memcpy(ix+q*6,t,24);
-                        }
+                        quad_fill(ix, quads, prim == 8);
                     }
                 }
             }
             totk_ft_count(FT_COUNT_DRAWS, 1);
         }
     } else if (dw) { VK_REC_DO(VK_REC_CMD, vkCmdDraw(cb, count, inst, (uint32_t)dw->first, base_inst)); totk_ft_count(FT_COUNT_DRAWS, 1); }
+    else if (prim == 7 || prim == 8) {
+        if (g_quad_draw.buffer) {
+            VK_REC_DO(VK_REC_CMD, vkCmdBindIndexBuffer(cb, g_quad_draw.buffer, g_quad_draw.index_offset, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexedIndirect(cb, g_quad_draw.buffer, g_quad_draw.indirect_offset, 1, sizeof(VkDrawIndexedIndirectCommand)));
+            totk_ft_count(FT_COUNT_DRAWS, 1);
+        }
+    }
     else {
         VkBuffer ib; uint64_t io;
         uint32_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
@@ -5752,13 +5935,16 @@ static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     g_load_override = 0;
+    memset(&g_quad_draw,0,sizeof g_quad_draw);
     int prim = dw ? dw->prim : di->prim;
     if (!S.prog) { g_stat_skips[0]++; return; }
     if (S.render_disabled || S.raster_discard) { g_stat_skips[1]++; pd_draw_note("      draw skipped: %s", S.render_disabled ? "conditional rendering off" : "rasterizer discard"); return; }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_stat_skips[2]++; pd_draw_note("      draw skipped: cull front and back"); return; }
-    if (prim == 2 || prim >= 8) { RED(4, "primitive type %d not drawn", prim); g_stat_skips[3]++; return; }
-    if (di && prim == 7) { RED(4, "indexed quads not drawn"); g_stat_skips[3]++; return; }
+    if (prim < 0 || prim == 2 || prim > 8) { RED(4, "primitive type %d not drawn", prim); g_stat_skips[3]++; return; }
     uint32_t count = dw ? (uint32_t)dw->count : (uint32_t)di->count; if (!count) return;
+    if (dw && (prim == 7 || prim == 8) && quad_count(prim, count) > UINT32_MAX / 6) {
+        RED(4, "quad triangle index count overflows"); g_stat_skips[3]++; return;
+    }
     if (S.color.alpha_func && S.color.alpha_func!=NVN_ALPHA_FUNC_ALWAYS) {
         g_alpha_enabled++;
         if (!totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) g_alpha_ignored++;
@@ -5792,6 +5978,9 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     }
     split_pass_check(sh, canvas_transfer);
     VK_REC_DO(VK_REC_S_TOUCH, draw_touch(sh, dw, di));
+    if (di && (prim == 7 || prim == 8) && !indexed_quads_prepare(di,count)) {
+        RED(4,"indexed quad conversion refused: invalid or oversized index range"); g_stat_skips[8]++; return;
+    }
     g_load_draw = dw; g_load_indexed = di; g_load_sh = sh; g_load_pipeline = VK_NULL_HANDLE;
     int opened = begin_rendering(1);
     g_load_sh = NULL; g_load_draw = NULL; g_load_indexed = NULL;
@@ -5922,7 +6111,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;
     if (!VK_REC_VALUE(VK_REC_VERTEX, draw_buffers(cb, sh[0], dw, di, prim, count, inst, base_inst))) return;
-    if (vk_gpuprof_pipeline_on && !(dw && prim == 7 && count < 4))
+    if (vk_gpuprof_pipeline_on && !(dw && (prim == 7 || prim == 8) && count < 4))
         vk_gpuprof_pipeline_count(prim, count, inst, di != NULL);
     if (g_record_draw) { vk_record_draw_commit(); g_record_draw = NULL; }
     overlay_scene_draw();
@@ -6892,6 +7081,7 @@ void front_frame_presented(void);
 enum { NPRES = VK_PRESENT_SLOT_CAPACITY };
 static int g_pres_active = VK_PRESENT_SLOT_DEFAULT_BUFFERS;
 static int g_pres_guest_output; /* immutable before presenter startup */
+static int g_pres_stretch;
 /* Explicit experiment arm: 0 retains live frame queries for matched diagnostic A/B. */
 static int g_guest_extent_cached = 1, g_guest_extent_diag;
 enum { GUEST_QUERY_PRODUCER, GUEST_QUERY_PRESENTER, GUEST_QUERY_ROLES };
@@ -9336,7 +9526,8 @@ static void *presenter(void *arg) {
                     ARect src = {0, 0, (int32_t)g_ahb[i].w, (int32_t)g_ahb[i].h};
                     ARect dst = {0, 0, (int32_t)pw, (int32_t)ph};
                     if (g_pres_guest_output) {
-                        vk_present_rect fit=g_guest_extent_cached ? b->guest_fit : vk_present_guest_fit(b->w,b->h,pw,ph);
+                        vk_present_rect fit=vk_present_guest_display(g_guest_extent_cached ? b->guest_fit :
+                            vk_present_guest_fit(b->w,b->h,pw,ph),pw,ph,g_pres_stretch);
                         dst=(ARect){fit.x,fit.y,fit.x+(int32_t)fit.w,fit.y+(int32_t)fit.h};
                     }
                     int use_timeline=g_pres_timeline && b->timeline_role && b->display_timeline.vsync_id>=0 &&
@@ -9646,10 +9837,11 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
     if (g_pres_guest_output) {
         dw=(int32_t)real->guest_fit.w; dh=(int32_t)real->guest_fit.h; dx=dy=0;
         if (ow==real->guest_window.w && oh==real->guest_window.h) {
-            dx=real->guest_fit.x; dy=real->guest_fit.y;
+            vk_present_rect shown=vk_present_guest_display(real->guest_fit,ow,oh,g_pres_stretch);
+            dx=shown.x; dy=shown.y; dw=(int32_t)shown.w; dh=(int32_t)shown.h;
         }
     } else {
-        vk_present_rect fit=vk_present_fit_shown(w,h,pres_shown_aspect(),ow,oh);
+        vk_present_rect fit=vk_present_fit_shown(w,h,pres_shown_aspect(),ow,oh,g_pres_stretch);
         dw=(int32_t)fit.w; dh=(int32_t)fit.h; dx=fit.x; dy=fit.y;
     }
     vk_post_output post = generated;
@@ -9686,15 +9878,9 @@ static void present_generated(const tex_t *t, vk_tex *x, int srgb, const pres_bu
         }
         if (!extent.w || !extent.h) { output_ok=0; goto generated_enqueue; }
         ow=extent.w; oh=extent.h;
-        if (g_guest_extent_cached) {
-            dw=(int32_t)real->guest_fit.w; dh=(int32_t)real->guest_fit.h;
-            dx=real->guest_fit.x; dy=real->guest_fit.y;
-        } else {
-            uint32_t sw=vk_present_shown_width(w,h,pres_shown_aspect());
-            double sc=fmin(1.0,fmin((double)ow/sw,(double)oh/h));
-            dw=(int32_t)(sw*sc+0.5); dh=(int32_t)(h*sc+0.5);
-            dx=((int32_t)ow-dw)/2; dy=((int32_t)oh-dh)/2;
-        }
+        vk_present_rect shown=vk_present_guest_display(g_guest_extent_cached ? real->guest_fit :
+            vk_present_guest_fit(vk_present_shown_width(w,h,pres_shown_aspect()),h,ow,oh),ow,oh,g_pres_stretch);
+        dw=(int32_t)shown.w; dh=(int32_t)shown.h; dx=shown.x; dy=shown.y;
     }
     if (!pres_image(ow,oh,srgb?VK_FORMAT_R8G8B8A8_SRGB:VK_FORMAT_R8G8B8A8_UNORM) ||
         !pres_alloc(b,(VkDeviceSize)ow*oh*4)) {
@@ -9956,6 +10142,7 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
         g_pres_distinct_refreshes=vk_fg_locked() && e && !strcmp(e,"1");
         LOGV("[present-floor] ns=%u guard_ns=%u dedupe=%d; locked AHB eligibility only; API metadata unchanged",
             g_pres_floor_ns,g_pres_guard_ns,g_pres_distinct_refreshes);
+        e=getenv("TOTK_PRESENT_STRETCH"); g_pres_stretch=e && !strcmp(e,"1");
         e=getenv("TOTK_APP_WIDTH");
         pthread_mutex_lock(&g_win_mu); /* one-time selection, shared with lifecycle callbacks */
         g_pres_guest_output=!vk_native_ui_enabled() && e && !strcmp(e,"guest");
@@ -10059,9 +10246,12 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
     int32_t dw, dh, dx, dy;
     if (g_pres_guest_output) {
         dw=(int32_t)guest_fit.w; dh=(int32_t)guest_fit.h; dx=dy=0;
-        if (ow==pw && oh==ph) { dx=guest_fit.x; dy=guest_fit.y; }
+        if (ow==pw && oh==ph) {
+            vk_present_rect shown=vk_present_guest_display(guest_fit,pw,ph,g_pres_stretch);
+            dx=shown.x; dy=shown.y; dw=(int32_t)shown.w; dh=(int32_t)shown.h;
+        }
     } else {
-        vk_present_rect fit = vk_present_fit_shown(w, h, pres_shown_aspect(), ow, oh);
+        vk_present_rect fit = vk_present_fit_shown(w, h, pres_shown_aspect(), ow, oh, g_pres_stretch);
         dw = (int32_t)fit.w; dh = (int32_t)fit.h; dx = fit.x; dy = fit.y;
     }
     pres_buf *b = &g_pres[i]; b->zero = 0;
@@ -10105,8 +10295,8 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
 #endif
     if (g_pres_guest_output && (ow!=pw || oh!=ph)) {
         ow=pw; oh=ph;
-        dw=(int32_t)guest_fit.w; dh=(int32_t)guest_fit.h;
-        dx=guest_fit.x; dy=guest_fit.y;
+        vk_present_rect shown=vk_present_guest_display(guest_fit,pw,ph,g_pres_stretch);
+        dw=(int32_t)shown.w; dh=(int32_t)shown.h; dx=shown.x; dy=shown.y;
     }
     VkFormat of = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (!pres_image(ow, oh, of)) goto cancel;

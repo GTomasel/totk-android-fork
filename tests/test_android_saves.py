@@ -124,7 +124,7 @@ class SavesTests(unittest.TestCase):
         (big / 'slot_00/movie.mp4').write_bytes(b'\0' * (2 << 20))   # an unknown file far beyond any save file
         many = save_set(self.dir / 'many', slots=(0,), extra=False)
         (many / 'album').mkdir()
-        for i in range(501):
+        for i in range(4097):
             (many / f'album/{i:03d}_Thumb.jpg').write_bytes(b'x')
         huge = save_set(self.dir / 'huge', slots=(0,), extra=False)
         with open(huge / 'slot_00/progress.sav', 'r+b') as f:
@@ -160,6 +160,27 @@ class SavesTests(unittest.TestCase):
             self.assertFalse((self.dir / f'staged-{z.stem}').exists(), 'nothing is staged from a refused dump')
 
     # ---------- export and import ----------
+    def test_late_game_compendium_survives_folder_and_zip_import(self):
+        live = save_set(self.dir / 'late-game', slots=range(6), option=True)
+        pictures = live / 'picturebook'
+        pictures.mkdir()
+        for i in range(526):
+            (pictures / f'{i:04d}.jpg').write_bytes(b'\xff\xd8' + bytes([i % 256]) * 32768 + b'\xff\xd9')
+        expected = tree(live)
+        self.assertEqual(len(expected), 553)
+        self.assertIn('files=553 ', self.one('select', live))
+        archive = self.dir / 'eden-save.zip'
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zipped:
+            for name, data in expected.items():
+                zipped.writestr('0100F2C0115B6000/' + name, data)
+        staged = self.dir / 'staged-late-game'
+        self.assertEqual(self.one('zip', archive, staged), 'root=0100F2C0115B6000/ files=553')
+        self.assertEqual(tree(staged), expected, 'compendium photographs must never be discarded to satisfy a file cap')
+        exported = self.dir / 'late-export.zip'
+        self.assertEqual(self.one('export', staged, exported), '553')
+        self.assertEqual(self.one('zip', exported, self.dir / 'reimported'), 'root=TotK Native saves/ files=553')
+        self.assertEqual(tree(self.dir / 'reimported'), expected)
+
     def test_export_zip_round_trip_and_manifest_check(self):
         live = save_set(self.dir / 'live', slots=range(6), option=True)
         exported = self.dir / 'export.zip'

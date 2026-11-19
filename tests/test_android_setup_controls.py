@@ -70,6 +70,8 @@ class SetupService {
 }
 class Strings {
     static final String SAVE_WAIT_TIMEOUT = "save timeout", CLOSE_GAME_TIMEOUT = "close timeout";
+    static final String GRAPHICS = "Graphics", RESTART_CONFIRM = "Restart the game?", CANCEL = "Cancel";
+    static final String RESTART_GAME = "Restart game", RESTART_PROGRESS_WARNING = "Progress since the last save will be lost";
     static String gameLockError(String reason) { return reason; }
 }
 class BaseActivity { protected void onStart() {} protected void onStop() {} }
@@ -88,7 +90,7 @@ class InstallState {
 JAVA_ACTIVITY = r'''
 }
 public final class SetupActivity extends BaseActivity {
-    enum Screen { HOME, SAVES, WELCOME, DATA, STORAGE, SETUP_STORAGE, INSTALL, UPDATE_DOWNLOAD }
+    enum Screen { HOME, SAVES, WELCOME, DATA, STORAGE, SETUP_STORAGE, INSTALL, UPDATE_DOWNLOAD, GRAPHICS, CHOICE }
     boolean ui, started = true, uiStarted, closingGame, closeSent, noteOk;
     GameLock.Result gameState = InstallState.next;
     final List<View> gameControls = new ArrayList<>();
@@ -114,11 +116,20 @@ public final class SetupActivity extends BaseActivity {
     void updateInstallResult() {}
     void updateDownloadProgress() {}
     int renders, statuses, syncs, checks, notices;
+    int launches;
+    Object[][] restartOptions;
     SetupActivity(File files) throws IOException { this.files = files; Files.createDirectories(new File(files, "state").toPath()); }
     File getFilesDir() { return files; }
     boolean isDestroyed() { return false; }
     void render() { renders++; }
     void updateGameNotice() { notices++; }
+    void openChoice(String icon, String header, String title, String body, Object[]... options) {
+        require(body.equals(Strings.RESTART_PROGRESS_WARNING), "restart confirmation omitted the progress warning");
+        restartOptions = options;
+        screen = Screen.CHOICE;
+    }
+    void back() { screen = Screen.GRAPHICS; }
+    void startGame() { launches++; }
     boolean bindService(Intent intent, ServiceConnection connection, int flags) {
         binds++; bindFlags = flags;
         if (duringBind != null) duringBind.run();
@@ -228,6 +239,34 @@ JAVA_TESTS = r'''
                 activity.closePoll.run();
                 require(activity.closeSent && Files.exists(new File(activity.files, "state/close-request").toPath()), "finished save did not proceed to native close");
                 require(activity.unbinds == 0, "binding released before native close finished");
+                break;
+            }
+            case "restart": {
+                activity.screen = Screen.GRAPHICS;
+                activity.confirmGameRestart();
+                require(activity.restartOptions == null, "restart offered without a running game");
+                InstallState.next = activity.gameState = new GameLock.Result(GameLock.State.GAME, "lock=contended");
+                activity.confirmGameRestart();
+                require(activity.screen == Screen.CHOICE && activity.binds == 0, "opening the warning started a close");
+                ((Runnable) activity.restartOptions[0][4]).run();
+                require(activity.screen == Screen.GRAPHICS && activity.binds == 0 && activity.launches == 0,
+                        "cancelling affected the current game");
+                activity.confirmGameRestart();
+                Path saving = new File(activity.files, "state/save-busy").toPath();
+                Files.writeString(saving, "saving");
+                ((Runnable) activity.restartOptions[1][4]).run();
+                activity.closePoll.run();
+                require(activity.closingGame && !activity.closeSent && activity.launches == 0, "restart interrupted an active save");
+                View unrelated = new View();
+                activity.gameControl(unrelated, "Changing game data", () -> mutations[0]++);
+                unrelated.requestFocus();
+                Files.delete(saving);
+                activity.closePoll.run();
+                require(activity.closeSent && activity.launches == 0, "restart launched before the old game closed");
+                InstallState.next = new GameLock.Result(GameLock.State.FREE, "lock=free");
+                activity.closePoll.run(); activity.closePoll.run();
+                require(!activity.closingGame && activity.launches == 1 && activity.unbinds == 1 && mutations[0] == 0,
+                        "restart did not launch exactly once after the game lock cleared");
                 break;
             }
             case "disconnect": {
@@ -365,15 +404,17 @@ class SetupControlTests(unittest.TestCase):
         source = (JAVA / 'SetupActivity.java').read_text()
         state = (JAVA / 'InstallState.java').read_text()
         methods = section(source, '    private void gameControl(', '    private void gameBanner(')
+        restart = section(source, '    private void confirmGameRestart()', '    private void refreshGameState()')
         close = section(source, '    private void closeGame()', '    // ---------- lifecycle')
         start = section(source, '    @Override protected void onStart()', '    @Override protected void onResume()')
-        stop = section(source, '    @Override protected void onStop()', '    /** A card mounted,')
+        # Visible-game service binding has its own production-method fixture in test_android_game_menu.py.
+        stop = section(source, '    @Override protected void onStop()', '    /** The visible menu still depends')
         refresh = section(source, '    private final Runnable refresh', '    @Override protected void onDestroy()')
         show = section(source, '    private void showUi()', '    /** A move killed')
         show_tail = show.rsplit('        render();', 1)[1]
         logger = section(state, '    static void logGameDecision(', '    /** Only an acquired game lock')
         probe = cls.work / 'SetupActivity.java'
-        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + methods + close + start + stop + refresh
+        probe.write_text(JAVA_PRELUDE + logger + JAVA_ACTIVITY + 'void bindVisibleGame() {} void unbindVisibleGame() {}\n' + methods + restart + close + start + stop + refresh
                          + '    private void showUi() { ui = true; render();' + show_tail + JAVA_TESTS)
         log = cls.work / 'android/util/Log.java'; log.parent.mkdir(parents=True); log.write_text(LOG)
         process = cls.work / 'android/os/Process.java'; process.parent.mkdir(parents=True)
@@ -423,6 +464,9 @@ int main(int argc, char **argv) {
         for mode in ('bind-save', 'disconnect', 'bind-race', 'bind-failure', 'close-timeout', 'stop-close', 'already-free'):
             with self.subTest(mode=mode):
                 self.probe(mode)
+
+    def test_graphics_restart_requires_confirmation_and_waits_for_save_and_exit(self):
+        self.probe('restart')
 
     def test_ui_created_after_onstart_registers_one_refresh_and_removes_it(self):
         self.probe('late-ui')

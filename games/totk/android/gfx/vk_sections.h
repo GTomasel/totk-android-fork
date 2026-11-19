@@ -107,6 +107,7 @@ void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocation
 #define vkCmdBindIndexBuffer(cb, ...) vkCmdBindIndexBuffer(vk_sections_command_kind(cb, VK_SECTION_BindIndexBuffer), __VA_ARGS__)
 #define vkCmdDraw(cb, ...) vkCmdDraw(vk_sections_command_kind(cb, VK_SECTION_Draw), __VA_ARGS__)
 #define vkCmdDrawIndexed(cb, ...) vkCmdDrawIndexed(vk_sections_command_kind(cb, VK_SECTION_DrawIndexed), __VA_ARGS__)
+#define vkCmdDrawIndexedIndirect(cb, ...) vkCmdDrawIndexedIndirect(vk_sections_command_kind(cb, VK_SECTION_DrawIndexed), __VA_ARGS__)
 #define vkCmdDispatch(cb, ...) vkCmdDispatch(vk_sections_command_kind(cb, VK_SECTION_Dispatch), __VA_ARGS__)
 #define vkCmdSetViewport(cb, ...) vkCmdSetViewport(vk_sections_command_kind(cb, VK_SECTION_SetViewport), __VA_ARGS__)
 #define vkCmdSetScissor(cb, ...) vkCmdSetScissor(vk_sections_command_kind(cb, VK_SECTION_SetScissor), __VA_ARGS__)

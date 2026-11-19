@@ -25,6 +25,7 @@
 #include "vk_load_proof.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
+#include "vk_varyings.h"
 #include "vk_int_fold.h"
 #include <errno.h>
 #include <inttypes.h>
@@ -37,8 +38,13 @@ int totk_depth_near_minus_w(void) __attribute__((weak));
 
 static pthread_once_t g_position_once = PTHREAD_ONCE_INIT;
 static unsigned g_position_policy;
+static int g_nan_minmax, g_varying_fix;
 static void position_init(void) {
     g_position_policy = vk_position_policy(getenv("TOTK_VK_POS_INVARIANT"), getenv("TOTK_VK_POS_NOCONTRACT"));
+    const char *nm = getenv("TOTK_VK_NAN_MINMAX"), *vf = getenv("TOTK_VK_VARYING_FIX");
+    g_nan_minmax = !nm || strcmp(nm, "0");
+    g_varying_fix = !vf || strcmp(vf, "0");
+    LOGV("shader compatibility: Maxwell NaN min/max=%d, missing varyings=%d", g_nan_minmax, g_varying_fix);
     LOGV("[nvn-vk] TOTK_VK_POS_INVARIANT=%u (startup-only): vertex Position Invariant", g_position_policy & 1);
     LOGV("[nvn-vk] TOTK_VK_POS_NOCONTRACT=%u (startup-only): position-feeding float arithmetic NoContraction", g_position_policy >> 1);
 }
@@ -468,6 +474,8 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
         }
         spv = (char *)words; spv_len = nw * 4;
     }
+    if (g_nan_minmax && vk_spirv_nan_minmax((uint32_t *)spv, spv_len / 4) < 0)
+        RED(16, "shader %s: malformed NaN min/max module; unchanged", variant);
     if (sh->stage == 1) {
         size_t nw = spv_len / 4; uint32_t *words = (uint32_t *)spv;
         if (vk_spirv_early_tests(&words, &nw, sh->early_tests && earlyz_on() && !sh->alpha_func) < 0) {
@@ -517,6 +525,8 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
             RED(16, "shader %s: integer proof unavailable; retaining original module", variant);
         }
     }
+    if (sh->stage == 0) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 3, &sh->vout_mask, NULL);
+    else if (sh->stage == 1) sh->io_known = !vk_spirv_io((const uint32_t *)spv, spv_len / 4, 1, &sh->fin_mask, sh->fin_kind);
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
     VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &sh->mod);
     free(spv);
@@ -719,6 +729,53 @@ void vk_prog_prepare(const prog_t *p) {
     }
 }
 void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g_progs_mu); nvn_hm_del(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu); }   /* the vk_prog leaks a little; programs are few */
+/* Adapted from upstream PR #43. Keep reconstructed vertex modules in step with the
+ * current position/subgroup/integer-proof pipeline, rather than the older PR's load path. */
+struct vk_vfix { uint32_t missing; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
+static pthread_mutex_t g_vfix_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *vs_words_again(const vk_shader *vs, size_t *nw) {
+    char path[1024]; size_t len = 0;
+    snprintf(path, sizeof path, "%s/%s.spv", seed_dir(), vs->key);
+    uint32_t *words = (uint32_t *)read_file(path, &len);
+    if (!words || len % 4 || len < 20) { free(words); return NULL; }
+    *nw = len / 4;
+    if (g_position_policy && vk_spirv_position(&words, nw, g_position_policy) < 0) { free(words); return NULL; }
+    if (g_nan_minmax && vk_spirv_nan_minmax(words, *nw) < 0) { free(words); return NULL; }
+    if (V.subgroup_fix && vk_spirv_subgroup32(&words, nw) < 0) { free(words); return NULL; }
+    if (g_int_fold) (void)vk_spirv_int_fold(words, *nw); // failed proof leaves the original, as shader_load does
+    return words;
+}
+VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
+    if (!g_varying_fix || !vs || !fs || !vs->io_known || !fs->io_known) return vs ? vs->mod : VK_NULL_HANDLE;
+    uint32_t missing = fs->fin_mask & ~vs->vout_mask;
+    if (!missing) return vs->mod;
+    uint8_t kind[32] = {0};
+    for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l];
+    pthread_mutex_lock(&g_vfix_mu);
+    for (struct vk_vfix *f = vs->vfix; f; f = f->next)
+        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) {
+            VkShaderModule module = f->mod; pthread_mutex_unlock(&g_vfix_mu); return module;
+        }
+    struct vk_vfix *cached = calloc(1, sizeof *cached);
+    if (!cached) { pthread_mutex_unlock(&g_vfix_mu); return vs->mod; }
+    size_t nw = 0, count = 0;
+    uint32_t *original = vs_words_again(vs, &nw);
+    uint32_t *patched = original ? vk_spirv_add_outputs(original, nw, missing, kind, &count) : NULL;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (patched) {
+        VkShaderModuleCreateInfo info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = count * 4, .pCode = patched};
+        if (vkCreateShaderModule(V.dev, &info, NULL, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
+    }
+    free(original); free(patched);
+    cached->missing = missing; memcpy(cached->kind, kind, sizeof kind);
+    cached->mod = module ? module : vs->mod; cached->next = vs->vfix; vs->vfix = cached;
+    pthread_mutex_unlock(&g_vfix_mu);
+    static _Atomic unsigned logged;
+    if (atomic_fetch_add(&logged, 1) < 40)
+        LOGV("[varyings] vs %.16s + fs %.16s missing=%#x: %s", vs->key, fs->key, missing,
+             module ? "added Maxwell (0,0,0,1) outputs" : "unavailable; original module retained");
+    return module ? module : vs->mod;
+}
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);
     if (!vk_shaders_ready()) return -1;

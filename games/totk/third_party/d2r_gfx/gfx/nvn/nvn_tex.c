@@ -148,23 +148,34 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     o->align = 512;
 }
 
-uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
+void nvn_tex_level_layout(const nvn_texdesc *d, unsigned level, const nvn_texlayout *layout,
+                          uint64_t *offset, unsigned tiles[2]) {
     fmt_t t = fmt_of(d->format);
     unsigned dpl; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);
-    if (!t.bpb || nvn_tex_is_linear(d) || d->target == 10) return 0;
+    if (offset) *offset = !t.bpb || nvn_tex_is_linear(d) || d->target == 10 ? 0 :
+        level_offset(d, level, dpl, w, h, z, layout->tileH, layout->tileD, t);
+    if (tiles) {
+        uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
+        uint32_t lh = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
+        uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
+        tiles[0] = adj_tile(layout->tileH, 8, lh);
+        tiles[1] = adj_tile(layout->tileD, 1, ld);
+    }
+}
+
+uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
+    if (!level || nvn_tex_is_linear(d) || d->target == 10) return 0;
     nvn_texlayout L; nvn_tex_layout(d, &L);
-    return level_offset(d, level, dpl, w, h, z, L.tileH, L.tileD, t);
+    uint64_t offset;
+    nvn_tex_level_layout(d, level, &L, &offset, NULL);
+    return offset;
 }
 
 void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {
-    fmt_t t = fmt_of(d->format);
-    unsigned dpl; int layered; uint32_t w, h, z;
-    shape(d, &dpl, &layered, &w, &h, &z);
-    uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     nvn_texlayout L; nvn_tex_layout(d, &L);
-    uint32_t lh = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
-    uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
-    *tileH = adj_tile(L.tileH, 8, lh);
-    *tileD = adj_tile(L.tileD, 1, ld);
+    unsigned tiles[2];
+    nvn_tex_level_layout(d, level, &L, NULL, tiles);
+    *tileH = tiles[0];
+    *tileD = tiles[1];
 }

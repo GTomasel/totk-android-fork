@@ -26,7 +26,7 @@
 enum { IO_EMPTY, IO_QUEUED, IO_READING, IO_READY };
 typedef struct seed_file {
     char name[SEED_NAME];
-    struct seed_file *next, *queue, *recent_prev, *recent_next;
+    struct seed_file *next, *hash_next, *queue, *recent_prev, *recent_next;
     char *data;
     size_t size, length;
     uint64_t offset, generation;
@@ -42,7 +42,7 @@ typedef struct seed_request {
 } seed_request;
 static pthread_mutex_t io_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t io_cv = PTHREAD_COND_INITIALIZER;
-static nvn_hmap inventory = {.klen = SEED_NAME};
+static nvn_hmap inventory = {.klen = sizeof(uint32_t)};
 static seed_file *files, *files_tail, *warm_head, *warm_tail, *recent_head, *recent_tail;
 static seed_request *request_head, *request_tail;
 static char *seed_directory, *learn_path;
@@ -53,8 +53,13 @@ static unsigned recent_count, readers;
 static int learn_dirty;
 static uint64_t save_after;
 static pthread_t io_thread;
-static vk_seed_pack packed;
+static int packed_fd = -1;
 static vk_seed_io_stats stats, window;
+
+static uint64_t index_heap_bytes(void) { /* io_mu; excludes allocator overhead and the file mapping */
+    return stats.entries * sizeof(seed_file) +
+        (uint64_t)inventory.cap * (inventory.klen + sizeof *inventory.vals);
+}
 
 int vk_seed_io_enabled(void) {
     const char *e = getenv("TOTK_VK_SEED_IO");
@@ -69,16 +74,20 @@ static int shader_name(const char *name) {
     return vk_seed_pack_valid_name(key, &length);
 }
 static seed_file *entry(const char *name, int create) { /* io_mu, except private initial inventory */
-    char key[SEED_NAME] = {0};
     if (!shader_name(name)) return NULL;
-    memcpy(key, name, strlen(name));
-    seed_file *f = nvn_hm_get(&inventory, key);
-    if (!f && create) {
-        f = calloc(1, sizeof *f);
-        if (!f) { fprintf(stderr, "[seed-io] out of memory building seed inventory\n"); abort(); }
-        memcpy(f->name, key, sizeof key); nvn_hm_put(&inventory, key, f); stats.entries++;
-        if (files_tail) files_tail->next = f; else files = f; files_tail = f;
-    }
+    size_t length = strlen(name);
+    uint32_t hash = (uint32_t)nvn_hm_hash(name, (uint32_t)length);
+    /* Keep the full name once. Equal fingerprints still need exact identity. */
+    seed_file *head = nvn_hm_get(&inventory, &hash);
+    for (seed_file *f = head; f; f = f->hash_next)
+        if (!strcmp(f->name, name)) return f;
+    if (!create) return NULL;
+    seed_file *f = calloc(1, sizeof *f);
+    if (!f) { fprintf(stderr, "[seed-io] out of memory building seed inventory\n"); abort(); }
+    memcpy(f->name, name, length + 1);
+    f->hash_next = head;
+    nvn_hm_put(&inventory, &hash, f); stats.entries++;
+    if (files_tail) files_tail->next = f; else files = f; files_tail = f;
     return f;
 }
 #ifdef TOTK_VK_TESTS
@@ -105,15 +114,23 @@ static void inventory_build(void) {
     const char *use_pack = getenv("TOTK_VK_SEED_PACK");
     char path[SEED_PATH_SIZE];
     if ((!use_pack || atoi(use_pack)) && seed_path(path, "seed.vkpack")) {
+        vk_seed_pack packed;
         int result = vk_seed_pack_open(&packed, path);
         if (result) fprintf(stderr, "[seed-io] pack %s: %s; falling back to indexed loose seed\n", path,
             result == -2 ? "invalid/truncated/incompatible" : "missing or unreadable");
-        else for (uint64_t i = 0; i < packed.count; i++) {
-            const char *name; const void *data; size_t size;
-            if (!vk_seed_pack_entry(&packed, i, &name, &data, &size)) continue;
-            seed_file *f = entry(name, 1); if (!f) continue;
-            f->packed = 1; f->offset = (const unsigned char *)data - (const unsigned char *)packed.mapping;
-            f->size = size; stats.pack_entries++;
+        else {
+            for (uint64_t i = 0; i < packed.count; i++) {
+                const char *name; const void *data; size_t size;
+                if (!vk_seed_pack_entry(&packed, i, &name, &data, &size)) continue;
+                seed_file *f = entry(name, 1); if (!f) continue;
+                f->packed = 1; f->offset = (const unsigned char *)data - (const unsigned char *)packed.mapping;
+                f->size = size; stats.pack_entries++;
+            }
+            /* Names and offsets now belong to the inventory. Pin just the inode
+               for payload preads and release the startup mapping. */
+            packed_fd = packed.fd;
+            packed.fd = -1;
+            vk_seed_pack_close(&packed);
         }
     }
     /* Existing loose overlays win, in particular expanded .vv lists from live translation.
@@ -135,15 +152,20 @@ static void inventory_build(void) {
         if (n > 4 && !strcmp(f->name + n - 4, ".spv")) has_modules = 1;
     }
 }
-static void queue(seed_file **head, seed_file **tail, seed_file *f) {
+static void queue_warm(seed_file *f) {
     f->queue = NULL; f->state = IO_QUEUED;
-    if (*tail) (*tail)->queue = f; else *head = f;
-    *tail = f;
+    if (warm_tail) warm_tail->queue = f; else warm_head = f;
+    warm_tail = f;
 }
-static seed_file *pop(seed_file **head, seed_file **tail) {
-    seed_file *f = *head;
-    if (f) { *head = f->queue; if (!*head) *tail = NULL; f->queue = NULL; }
-    return f;
+static seed_file *pop_warm(void) {
+    while (warm_head) {
+        seed_file *f = warm_head;
+        warm_head = f->queue;
+        if (!warm_head) warm_tail = NULL;
+        f->queue = NULL;
+        if (f->state == IO_QUEUED) return f;
+    }
+    return NULL;
 }
 static void release_reservation(seed_file *f) {
     warm_planned -= f->reserved; f->reserved = 0;
@@ -179,16 +201,14 @@ static void warm_plan(void) { /* index sizes, not payload reads; io_mu */
     for (seed_file *f = recent_head; f; f = f->recent_next) {
         if (f->size < warm_limit && f->size + 1 <= warm_limit - warm_planned) {
             f->reserved = f->size + 1; warm_planned += f->reserved;
-            queue(&warm_head, &warm_tail, f);
+            queue_warm(f);
         } else stats.warm_skipped++;
     }
 }
 static void cancel_warm(seed_file *f) { /* io_mu; demand never waits for queued warming */
-    seed_file **link = &warm_head, *previous = NULL;
-    while (*link && *link != f) { previous = *link; link = &(*link)->queue; }
-    if (!*link) return;
-    *link = f->queue; if (warm_tail == f) warm_tail = previous;
-    f->queue = NULL; f->state = IO_EMPTY;
+    /* Only the worker drains the queue. Change state in place so a demand
+       read can take over without traversing the remaining entries. */
+    f->state = IO_EMPTY;
     release_reservation(f); stats.warm_bypassed++;
 }
 static char *payload_read(seed_file *f, size_t *length, uint64_t *reads) {
@@ -205,7 +225,7 @@ static char *payload_read(seed_file *f, size_t *length, uint64_t *reads) {
         size_t chunk = f->size - at;
         if (chunk > (1u << 20)) chunk = 1u << 20;
         (*reads)++;
-        ssize_t n = pread(packed.fd, data + at, chunk, (off_t)(f->offset + at));
+        ssize_t n = pread(packed_fd, data + at, chunk, (off_t)(f->offset + at));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) { free(data); return NULL; }
         at += (size_t)n;
@@ -281,14 +301,15 @@ static void *seed_worker(void *unused) {
     pthread_mutex_lock(&io_mu);
     inventory_build(); learned_load(); warm_plan(); index_ready = 1;
     stats.index_ns = host_now_ns() - began;
-    fprintf(stderr, "[seed-io] indexed %llu files (%llu packed), learned %llu keys learned_bytes=%llu cap=%zu mode=%s, index=%.3fms directory %s\n",
+    fprintf(stderr, "[seed-io] indexed %llu files (%llu packed), learned %llu keys learned_bytes=%llu cap=%zu mode=%s, index=%.3fms index_heap=%llu directory %s\n",
         (unsigned long long)stats.entries, (unsigned long long)stats.pack_entries,
         (unsigned long long)stats.warm_keys, (unsigned long long)stats.learned_bytes, warm_limit,
-        getenv("TOTK_SEED_WARM_MB") && *getenv("TOTK_SEED_WARM_MB") ? "override" : "adaptive", stats.index_ns / 1e6, seed_directory);
+        getenv("TOTK_SEED_WARM_MB") && *getenv("TOTK_SEED_WARM_MB") ? "override" : "adaptive", stats.index_ns / 1e6,
+        (unsigned long long)index_heap_bytes(), seed_directory);
     pthread_cond_broadcast(&io_cv);
     save_after = host_now_ns() + UINT64_C(5000000000);
     for (;;) {
-        seed_file *f = pop(&warm_head, &warm_tail);
+        seed_file *f = pop_warm();
         if (!f && !warm_done) {
             warm_done = 1;
             stats.warm_ns = host_now_ns() - began - stats.index_ns;
@@ -311,7 +332,7 @@ static void *seed_worker(void *unused) {
             pthread_mutex_lock(&io_mu);
             if (stats_on) { stats.worker_reads++; stats.worker_bytes += data ? length : 0; }
             if (generation != f->generation) {
-                free(data); queue(&warm_head, &warm_tail, f);
+                free(data); queue_warm(f);
             } else {
                 f->data = data; f->length = data ? length : 0; f->state = IO_READY;
                 f->warmed = data != NULL; stats.cached_bytes += f->length;
@@ -468,7 +489,7 @@ void vk_seed_io_published(const char *variant) {
 void vk_seed_io_stats_get(vk_seed_io_stats *out) {
     pthread_mutex_lock(&io_mu);
     while (started && !stopping && !index_ready) pthread_cond_wait(&io_cv, &io_mu);
-    *out = stats; pthread_mutex_unlock(&io_mu);
+    *out = stats; out->index_heap_bytes = index_heap_bytes(); pthread_mutex_unlock(&io_mu);
 }
 void vk_seed_io_report(void) {
     pthread_mutex_lock(&io_mu);
@@ -494,8 +515,10 @@ void vk_seed_io_stop(void) {
     while (readers) pthread_cond_wait(&io_cv, &io_mu);
     /* Readers either own detached copies or observe stopping under the same mutex. */
     while (files) { seed_file *next = files->next; free(files->data); free(files); files = next; }
-    free(inventory.keys); free(inventory.vals); inventory = (nvn_hmap){.klen = SEED_NAME};
-    vk_seed_pack_close(&packed); free(seed_directory); free(learn_path); seed_directory = learn_path = NULL;
+    free(inventory.keys); free(inventory.vals); nvn_hm_init(&inventory, sizeof(uint32_t));
+    if (packed_fd >= 0) close(packed_fd);
+    packed_fd = -1;
+    free(seed_directory); free(learn_path); seed_directory = learn_path = NULL;
     files_tail = warm_head = warm_tail = recent_head = recent_tail = NULL;
     recent_count = learn_dirty = 0; warm_planned = request_bytes = 0;
     started = stopping = index_ready = warm_done = has_modules = 0;

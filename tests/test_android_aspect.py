@@ -23,7 +23,7 @@ DRIVER = r'''
 int main(void) {
     char kind[16]; unsigned w, h, ow, oh; float a;
     while (scanf("%15s %u %u %f %u %u", kind, &w, &h, &a, &ow, &oh) == 6) {
-        vk_present_rect r = kind[0] == 'f' ? vk_present_fit_shown(w, h, a, ow, oh)
+        vk_present_rect r = kind[0] == 'f' ? vk_present_fit_shown(w, h, a, ow, oh, 0)
                                            : vk_present_guest_fit(vk_present_shown_width(w, h, a), h, ow, oh);
         printf("%d %d %u %u\n", r.x, r.y, r.w, r.h);
     }

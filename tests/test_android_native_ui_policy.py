@@ -385,6 +385,7 @@ static int record(unsigned rotation,int srgb,int ubwc) {
     int ok=pres_ahb_draw(0,&texture,&source,srgb,128,64,4,2,32,16,12,4,96,48,
         NULL,rotation,ubwc,(VkCommandBuffer)(uintptr_t)7);
     ASSERT(ok && !trace_bad && !live_calls && !g_ahb[0].foreign);
+    ASSERT(!g_bound_pipe && g_dyn_dirty);
     ASSERT(push_bytes==(rotation?32:16) && push_layout==bound_layout &&
         bound_layout==(rotation?g_pres_rotated_layout:g_pres_layout) &&
         bound_pipeline==(rotation?g_pres_rotated_pipe[srgb]:g_pres_pipe[srgb]));
@@ -496,6 +497,8 @@ int main(void) {
     const char *trace=getenv("TOTK_FRAMEGEN_JOB_TRACE");
     job_trace=trace && !strcmp(trace,"1");
     for (unsigned i=0;i<1000;i++) { begin_hook();commit_hook(); }
+    (void)g_in_sub;
+    (void)g_gpu_guest_ns;
     printf("%u %u %u\n",boundaries,selectors,fg_config_calls);
     if (trace_getters || trace_clocks || trace_logs) return 1;
     if (!production_pres_slots_requested()) return 0;

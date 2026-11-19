@@ -39,6 +39,8 @@
 // BUSY lasts at most one mprotect (plus the atomic page-state updates). The wait has an upper limit BUSY_WAIT_MS:
 // in the page-fault handler, exceeding it returns "not our page" and lets the crash handler report the crash truthfully instead of spinning silently. The wait only reads atomics and takes no lock.
 enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2 };
+/* A private-alias GPU store also owns PG_BUSY, but leaves the guest mapping read-only throughout:
+   PG_PROT -> PG_BUSY -> PG_PROT without permission changes or CPU-generation publication. */
 enum { WATCH_EXACT = 1, WATCH_TEXTURE = 2 }; /* retained in the existing per-page exact byte */
 enum { BUSY_WAIT_MS = 2000 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
@@ -80,6 +82,7 @@ enum { WB_WATCH_MAX = 4096 };
 static wb_watch g_wb_watch[WB_WATCH_MAX];
 static _Atomic unsigned g_wb_watch_used;
 static _Atomic uint64_t g_wb_faults, g_wb_preps;
+static _Atomic uint64_t g_wb_write_revision;
 static _Atomic int g_nr;
 /* Slot publication is serialized by g_slot_mu. Advance after live publication or removal: an acquire snapshot
    must never authorize a range incarnation that has not yet become live. Unrelated changes do not stale older refs. */
@@ -733,7 +736,9 @@ static void lag_gate_wait(lag_unit_t *u, const range_t *r, uintptr_t index, int 
 #endif
     lag_wait_watchdog(start, &reported, r, index, ticket, host, 1);
 }
-static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t watch_first, uintptr_t watch_end, unsigned watch_flags) {
+/* Claim only ownership, without changing permissions or reserving VMA split credit. Alias writers use
+   this directly: even a pressure-triggered lag-only drain would violate their read-only guest contract. */
+static uint64_t lag_lock_gate(range_t *r, uintptr_t index, int host) {
     lag_unit_t *u = &r->lag[index];
     uint64_t old = atomic_load_explicit(&u->gate, memory_order_acquire);
     for (;;) {
@@ -741,24 +746,27 @@ static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t 
             lag_gate_wait(u, r, index, host); old = atomic_load_explicit(&u->gate, memory_order_acquire); continue;
         }
         uint64_t busy = (old & ~(uint64_t)LAG_STATE_MASK) | LAG_BUSY;
-        if (atomic_compare_exchange_weak_explicit(&u->gate, &old, busy, memory_order_acquire, memory_order_acquire)) {
-            /* Watch stamps precede this call. Preserve baseline authority before a pressure drain can
-               dirty additional lag-only neighbours; only a real CPU store may revoke these stamps. */
-            for (uintptr_t p = watch_first; p < watch_end; p++) {
-                unsigned old_flags = atomic_load_explicit(&r->exact[p], memory_order_relaxed);
-                atomic_store_explicit(&r->exact[p], old_flags | watch_flags, memory_order_relaxed);
-            }
-            if (!vma_charge(u)) {
-                /* Baseline texture/exact watches must remain valid. Temporary writer/split credit is
-                   not a new lag guard, and is returned when the gate is released. */
-                atomic_fetch_add_explicit(&g_vma_regions, g_unit, memory_order_acq_rel); u->regions += g_unit;
-                lag_wait(old >> 2, host, u, r, index);
-                vma_unprotect_unit(r, index);
-                old &= ~(uint64_t)LAG_STATE_MASK;
-            }
-            return old;
-        }
+        if (atomic_compare_exchange_weak_explicit(&u->gate, &old, busy, memory_order_acquire, memory_order_acquire)) return old;
     }
+}
+static uint64_t lag_lock_pages(range_t *r, uintptr_t index, int host, uintptr_t watch_first, uintptr_t watch_end, unsigned watch_flags) {
+    lag_unit_t *u = &r->lag[index];
+    uint64_t old = lag_lock_gate(r, index, host);
+    /* Watch stamps precede this call. Preserve baseline authority before a pressure drain can
+       dirty additional lag-only neighbours; only a real CPU store may revoke these stamps. */
+    for (uintptr_t p = watch_first; p < watch_end; p++) {
+        unsigned old_flags = atomic_load_explicit(&r->exact[p], memory_order_relaxed);
+        atomic_store_explicit(&r->exact[p], old_flags | watch_flags, memory_order_relaxed);
+    }
+    if (!vma_charge(u)) {
+        /* Baseline texture/exact watches must remain valid. Temporary writer/split credit is
+           not a new lag guard, and is returned when the gate is released. */
+        atomic_fetch_add_explicit(&g_vma_regions, g_unit, memory_order_acq_rel); u->regions += g_unit;
+        lag_wait(old >> 2, host, u, r, index);
+        vma_unprotect_unit(r, index);
+        old &= ~(uint64_t)LAG_STATE_MASK;
+    }
+    return old;
 }
 static uint64_t lag_lock(range_t *r, uintptr_t index, int host) { return lag_lock_pages(r, index, host, 0, 0, 0); }
 static void lag_unlock(range_t *r, uintptr_t index, uint64_t value) {
@@ -985,6 +993,8 @@ static int wb_unprotect_write(range_t *r, uintptr_t p, int host, uintptr_t addre
             if (!atomic_compare_exchange_strong(&w->state, &state, WB_ARMED)) atomic_store(&w->state, WB_FREE);
             continue;
         }
+        /* Publish the revocation before waiting for arming or changing permissions. */
+        atomic_fetch_add_explicit(&g_wb_write_revision, 1, memory_order_release);
         atomic_store(&w->cpu_address, address);
         /* Finish the finite permission update before disarming; otherwise its tail could re-protect pages
            after this CPU write won. This waits only for mprotect/page publication, never a WB GPU ticket. */
@@ -1046,10 +1056,11 @@ static void prep_write(void *addr, size_t len) {
 
 /* Writes on behalf of the GPU (a rendering written back into CPU-visible memory): the bytes change without counting as
    a CPU write. Protected pages are taken to BUSY (a guest write meanwhile waits in the fault handler, then faults again
-   and is recorded as usual), made writable, and protected again by nvn_dirty_gpu_write_end with their generation kept.
-   Pages already unprotected are left as they are. Returns a token for nvn_dirty_gpu_write_end (NULL: nothing tracked). */
-typedef struct { range_t *r; uintptr_t p0, p1, u0, nu; uint8_t *was; uint64_t *gates; } gpu_write_tok;
-static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
+   and is recorded as usual). Ordinary stores temporarily unprotect; private-alias stores leave the guest read-only.
+   End restores each taken page to PROT with its generation kept. Pages already unprotected are left as they are.
+   Returns a token for nvn_dirty_gpu_write_end (NULL: nothing tracked). */
+typedef struct { range_t *r; uintptr_t p0, p1, u0, nu; uint8_t *was; uint64_t *gates; int alias; } gpu_write_tok;
+static void *gpu_write_begin(void *addr, size_t len, int wait, int alias, int *ready) {
     *ready = 1;
     if (!len) return NULL;
     range_t *r = find((uintptr_t)addr); if (!r || len > r->end - (uintptr_t)addr) return NULL;
@@ -1058,11 +1069,14 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
     gpu_write_tok *t = malloc(sizeof *t); uint8_t *was = calloc(p1 - p0 + 1, 1);
     uint64_t *gates = r->lag ? malloc(nu * sizeof *gates) : NULL;
     if (!t || !was || (r->lag && !gates)) { free(t); free(was); free(gates); *ready = 0; return NULL; }
-    *t = (gpu_write_tok){ r, p0, p1, u0, nu, was, gates };
+    *t = (gpu_write_tok){ r, p0, p1, u0, nu, was, gates, alias };
     /* Retain gates through end. Asynchronous texture landing never waits for GPU readers or a BUSY owner:
        unwind and retry at a later sweep instead. The blocking API retains its existing semantics. */
     if (gates) for (uintptr_t i = 0; i < nu; i++) {
-        if (wait) { gates[i] = lag_lock(r, u0 + i, 1); lag_wait(gates[i] >> 2, 1, NULL, r, u0 + i); }
+        if (wait) {
+            gates[i] = alias ? lag_lock_gate(r, u0 + i, 1) : lag_lock(r, u0 + i, 1);
+            lag_wait(gates[i] >> 2, 1, NULL, r, u0 + i);
+        }
         else {
             lag_unit_t *u = &r->lag[u0 + i];
             uint64_t old = atomic_load_explicit(&u->gate, memory_order_acquire);
@@ -1089,7 +1103,7 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
 #ifdef TOTK_VK_TESTS
     nvn_dirty_test_wb_phase(addr, NVN_DIRTY_TEST_WB_PROTECTED);
 #endif
-    for (uintptr_t p = p0, run = 0, open = 0; p <= p1 + 1; p++) {   /* runs of taken pages: one mprotect each */
+    if (!alias) for (uintptr_t p = p0, run = 0, open = 0; p <= p1 + 1; p++) {   /* runs of taken pages: one mprotect each */
         int w = p <= p1 && was[p - p0];
         if (w && !open) { run = p; open = 1; }
         if (!w && open) { mp(r->base + (run << g_shift), (p - run) << g_shift, PROT_READ | PROT_WRITE, NVN_DIRTY_MP_GPU_WRITE); open = 0; }
@@ -1097,15 +1111,24 @@ static void *gpu_write_begin(void *addr, size_t len, int wait, int *ready) {
     return t;
 }
 void *nvn_dirty_gpu_write_begin(void *addr, size_t len) {
-    int ready; return gpu_write_begin(addr, len, 1, &ready);
+    int ready; return gpu_write_begin(addr, len, 1, 0, &ready);
 }
 int nvn_dirty_gpu_write_try_begin(void *addr, size_t len, void **token) {
-    int ready; *token = gpu_write_begin(addr, len, 0, &ready); return ready;
+    int ready; *token = gpu_write_begin(addr, len, 0, 0, &ready); return ready;
+}
+void *nvn_dirty_gpu_write_alias_begin(void *addr, size_t len) {
+    int ready; return gpu_write_begin(addr, len, 1, 1, &ready);
+}
+int nvn_dirty_gpu_write_alias_try_begin(void *addr, size_t len, void **token) {
+    int ready; *token = gpu_write_begin(addr, len, 0, 1, &ready); return ready;
 }
 void nvn_dirty_gpu_write_end(void *tok) {
     gpu_write_tok *t = tok; if (!t) return;
     int restored = 1;
-    for (uintptr_t p = t->p0, run = 0, open = 0; p <= t->p1 + 1; p++) {
+    if (t->alias) {
+        for (uintptr_t p = t->p0; p <= t->p1; p++)
+            if (t->was[p - t->p0]) atomic_store(&t->r->state[p], PG_PROT);
+    } else for (uintptr_t p = t->p0, run = 0, open = 0; p <= t->p1 + 1; p++) {
         int w = p <= t->p1 && t->was[p - t->p0];
         if (w && !open) { run = p; open = 1; }
         if (!w && open) {
@@ -1121,19 +1144,35 @@ void nvn_dirty_gpu_write_end(void *tok) {
 /* GPU reports/events are implemented with host C stores. A prepare-before-write alone is insufficient: a replay can
    re-arm between the prepare and the actual store (and libc/TSan describes memcpy before its first fault). Keep the
    unit gate through the store itself, restoring only pages that were protected. No token allocation is needed. */
-static int lag_store(void *address, const void *data, size_t len, int add32) {
+static int lag_store(void *address, void *write_address, const void *data, size_t len, int add32, int alias) {
     uintptr_t a = (uintptr_t)address;
+    uint8_t *dst = write_address;
     const uint8_t *src = data;
     while (len) {
         range_t *r = find(a);
         if (!r || !r->lag) {
             size_t n = g_pg ? g_pg - (a & (g_pg - 1)) : len; if (n > len) n = len;
-            if (add32) { uint32_t v; memcpy(&v, (void *)a, 4); v += *(const uint32_t *)src; memcpy((void *)a, &v, 4); return 1; }
-            memcpy((void *)a, src, n); a += n; src += n; len -= n; continue;
+            /* Lag-off still has baseline/exact dirty watches. Claim this guest page while the alias
+               store runs so a CPU fault cannot revoke ownership concurrently; one page needs no token allocation. */
+            uintptr_t p = 0; int taken = 0;
+            if (alias && r) {
+                p = (a - r->base) >> g_shift;
+                for (;;) {
+                    uint8_t st = PG_PROT;
+                    if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { taken = 1; break; }
+                    if (st < PG_BUSY) break;
+                    if (!busy_wait(r, p)) return 0;
+                }
+            }
+            if (add32) { uint32_t v; memcpy(&v, dst, 4); v += *(const uint32_t *)src; memcpy(dst, &v, 4); }
+            else memcpy(dst, src, n);
+            if (taken) atomic_store(&r->state[p], PG_PROT);
+            if (add32) return 1;
+            a += n; dst += n; src += n; len -= n; continue;
         }
         uintptr_t p0 = (a - r->base) >> g_shift, index = p0 / g_unit;
         lag_unit_t *u = &r->lag[index];
-        uint64_t gate = lag_lock(r, index, 1);
+        uint64_t gate = alias ? lag_lock_gate(r, index, 1) : lag_lock(r, index, 1);
         lag_wait(gate >> 2, 1, u, r, index);
         uintptr_t end = unit_addr(r, (index + 1) * g_unit); if (end > r->end) end = r->end;
         size_t n = end - a; if (n > len) n = len;
@@ -1141,25 +1180,31 @@ static int lag_store(void *address, const void *data, size_t len, int add32) {
         for (uintptr_t p = p0; p <= p1; p++) {
             uint8_t st = PG_PROT;
             while (!atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY) && st >= PG_BUSY) {
-                if (!busy_wait(r, p)) { lag_unlock(r, index, gate); return 0; }
+                if (!busy_wait(r, p)) {
+                    /* Permission changes have not started. Earlier BUSY pages are ours; leave the
+                       timed-out page with its original owner and unwind only our successful claims. */
+                    for (uintptr_t q = p0; q < p; q++)
+                        if (atomic_load(&r->state[q]) == PG_BUSY) atomic_store(&r->state[q], PG_PROT);
+                    lag_unlock(r, index, gate); return 0;
+                }
                 st = PG_PROT;
             }
         }
         int ok = 1, restored = 1;
-        for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
+        if (!alias) for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
             int protected = p <= p1 && atomic_load(&r->state[p]) == PG_BUSY;
             if (protected && !open) { run = p; open = 1; }
             if (!protected && open) { ok &= mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ | PROT_WRITE, NVN_DIRTY_MP_GPU_WRITE); open = 0; }
         }
         if (ok) {
-            if (add32) { uint32_t v; memcpy(&v, (void *)a, 4); v += *(const uint32_t *)src; memcpy((void *)a, &v, 4); }
-            else memcpy((void *)a, src, n);
+            if (add32) { uint32_t v; memcpy(&v, dst, 4); v += *(const uint32_t *)src; memcpy(dst, &v, 4); }
+            else memcpy(dst, src, n);
         }
         for (uintptr_t p = p0, run = p0, open = 0; p <= p1 + 1; p++) {
             int protected = p <= p1 && atomic_load(&r->state[p]) == PG_BUSY;
             if (protected && !open) { run = p; open = 1; }
             if (!protected && open) {
-                int read_only = mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ, NVN_DIRTY_MP_RESTORE);
+                int read_only = alias || mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ, NVN_DIRTY_MP_RESTORE);
                 for (uintptr_t k = run; k < p; k++) atomic_store(&r->state[k], read_only ? PG_PROT : PG_NONE);
                 restored &= read_only; open = 0;
             }
@@ -1167,12 +1212,15 @@ static int lag_store(void *address, const void *data, size_t len, int add32) {
         lag_unlock(r, index, restored ? gate : gate & ~(uint64_t)LAG_STATE_MASK);
         if (!ok || !restored) return 0;
         if (add32) return 1;   /* NVN events are aligned 32-bit words and cannot cross a protection unit. */
-        a += n; src += n; len -= n;
+        a += n; dst += n; src += n; len -= n;
     }
     return 1;
 }
-int nvn_dirty_lag_store(void *addr, const void *data, size_t len) { return lag_store(addr, data, len, 0); }
-int nvn_dirty_lag_store32(volatile uint32_t *addr, uint32_t value, int add) { return lag_store((void *)addr, &value, 4, add); }
+int nvn_dirty_lag_store(void *addr, const void *data, size_t len) { return lag_store(addr, addr, data, len, 0, 0); }
+int nvn_dirty_lag_store32(volatile uint32_t *addr, uint32_t value, int add) { return lag_store((void *)addr, (void *)addr, &value, 4, add, 0); }
+int nvn_dirty_lag_store_alias(void *guest, void *alias, const void *data, size_t len, int add32) {
+    return lag_store(guest, alias, data, len, add32, 1);
+}
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
@@ -1580,8 +1628,8 @@ size_t nvn_dirty_lag_batch_count(const nvn_dirty_lag_batch *batch) {
 uint64_t nvn_dirty_lag_batch_bytes(const nvn_dirty_lag_batch *batch) {
     return batch && batch->impl && batch->impl != LAG_BATCH_FAILED ? ((const lag_batch_impl *)batch->impl)->bytes : 0;
 }
-static void protect_pages(const void *addr, size_t len, int exact) {
-    if (!len || !nvn_dirty_tracked(addr, len)) return;
+static int protect_pages(const void *addr, size_t len, int exact) {
+    if (!len || !nvn_dirty_tracked(addr, len)) return 0;
     range_t *r = find((uintptr_t)addr);
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
     if (r->lag) {
@@ -1598,13 +1646,13 @@ static void protect_pages(const void *addr, size_t len, int exact) {
                 atomic_fetch_add_explicit(&g_lag_rearms, 1, memory_order_relaxed);
             if (!ok) die("dirty baseline watch mprotect failed");
         }
-        return;
+        return 1;
     }
     if (exact) for (uintptr_t i = p; i <= q; i++) atomic_store(&r->exact[i], WATCH_EXACT);
     else if (g_unit > 1) { uintptr_t np = range_pages(r); p = p / g_unit * g_unit; q = (q / g_unit + 1) * g_unit - 1; if (q >= np) q = np - 1; }
-    protect_span(r, p, q, 1, NULL, exact, exact ? NVN_DIRTY_MP_EXACT : NVN_DIRTY_MP_TEXTURE);
+    return protect_span(r, p, q, 1, NULL, exact, exact ? NVN_DIRTY_MP_EXACT : NVN_DIRTY_MP_TEXTURE);
 }
-void nvn_dirty_protect(const void *addr, size_t len) { protect_pages(addr, len, 0); }
+int nvn_dirty_protect(const void *addr, size_t len) { return protect_pages(addr, len, 0); }
 void nvn_dirty_protect_exact(const void *addr, size_t len) { protect_pages(addr, len, 1); }
 void *nvn_dirty_wb_watch(const void *addr, size_t len, uint64_t stamp) {
     if (!len || !nvn_dirty_tracked(addr, len)) return NULL;
@@ -1634,6 +1682,9 @@ void *nvn_dirty_wb_watch(const void *addr, size_t len, uint64_t stamp) {
 int nvn_dirty_wb_written(const void *watch) {
     const wb_watch *w = watch;
     return !w || atomic_load_explicit(&w->state, memory_order_acquire) != WB_ARMED;
+}
+uint64_t nvn_dirty_wb_write_revision(void) {
+    return atomic_load_explicit(&g_wb_write_revision, memory_order_acquire);
 }
 uintptr_t nvn_dirty_wb_cpu_address(const void *watch) {
     const wb_watch *w = watch;

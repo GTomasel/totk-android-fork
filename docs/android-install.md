@@ -8,9 +8,8 @@ needs on the device.
 
 ## What you need
 
-- Android 13 (API 33) or newer, arm64, Adreno GPU. Adreno only, because the game draws through the bundled Mesa
-  **Turnip** Vulkan driver, which supports Adreno GPUs only; the devices' own Qualcomm drivers lack the memory-sharing
-  extensions the game needs (`VK_EXT_external_memory_host` / dma-buf), so they cannot run it.
+- Android 13 (API 33) or newer, arm64, Adreno GPU. The bundled Mesa **Turnip** Vulkan driver supports Adreno and
+  provides the memory sharing the game needs.
 - Free storage on the device: **about 40 GB during setup** (the 17 GB RomFS image plus the inputs you copy over), about
   **20 GB afterwards** (you may delete your copied inputs once setup says *Ready*). Inputs can also be on an SD card.
 - Your own dump of the game, made from a cartridge or eShop purchase you own, on your own Switch. Pick **one** of the two
@@ -240,8 +239,13 @@ own Turnip build, open the app's *Game data → Graphics driver* and pick its Ad
 `libraryName` and supplies the displayed name; without metadata, a zip must contain exactly one `.so`.
 Only that library is installed, and a refused import leaves your current driver unchanged. Libraries are limited to
 128 MiB, metadata to 64 KiB and archives to 256 entries / 160 MiB. *Use the bundled driver* goes back to the bundled one.
-`TOTK_VK_DRIVER=system` in `totk.env` there selects the system driver instead; no current Qualcomm system driver
-passes the game's startup check, so that is for testing only.
+`TOTK_VK_DRIVER=system` in `totk.env` selects the system driver for testing. The stock Qualcomm driver tested
+upstream on the AYN Thor failed the game's memory-sharing check.
+
+**Samsung Galaxy S23+ (SM-S916B, Adreno 740).** Use the bundled Turnip driver. It was validated through an
+Akkala–Depths round trip on Android 16 and had fewer long frames in the warm-cache Akkala comparison.
+See the [S23+ driver results](s23-gpu-driver-research.md#s23-adb-results) for both Banners-Turnip alternatives
+and the scope of the device tests.
 
 ## Versions
 

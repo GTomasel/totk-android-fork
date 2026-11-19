@@ -32,6 +32,28 @@ def key(vs='a', fs='b', mask=15):
 
 
 class PsoKeysTests(unittest.TestCase):
+    def test_select_expensive_capture_keys_from_native_trace(self):
+        # Hashes from TotkPsoTraceKey with these exact shader IDs, color count, samples and masks.
+        hashes = ['1553907e3fd4c3ac', '1cf4e783020371cf', '1a69ca816bf3e26e', '0db239797da61589']
+        records = [(key(mask=mask), 1, 1) for mask in range(1, 5)]
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            root = Path(directory)
+            keys, trace, manifest, output = [root / name for name in ('keys', 'trace', 'shaders', 'output')]
+            keys.write_bytes(pso.encode(records))
+            manifest.write_text(f'V\t{"a" * 64}\t{{}}\nV\t{"b" * 64}\t{{}}\n')
+            rows = []
+            for identity, ms, reason, result in zip(hashes, (90, 175, 250, 500),
+                                                      ('capture-sync', 'capture-sync', 'async-worker', 'capture-sync'),
+                                                      (0, 0, 0, -1), strict=True):
+                rows.append(f'[pso-trace] key={identity} phase=build reason={reason} frame=100 result={result} '
+                            f'ms={ms}.0 flags=0 part=-1 vs={"a" * 64} fs={"b" * 64} early=0\n')
+            trace.write_text(''.join(rows))
+            selection = subprocess.run([sys.executable, str(ROOT / 'games/totk/scripts/select_hot_pso_keys.py'),
+                                        str(keys), str(trace), '--shader-list', str(manifest), '--limit', '1',
+                                        '--output', str(output)], capture_output=True, text=True)
+            self.assertEqual(selection.returncode, 0, selection.stdout + selection.stderr)
+            self.assertEqual(pso.decode(output.read_bytes()), [records[1]])
+
     def test_roundtrip(self):
         records = [(key(), 5, 1), (key(fs='', mask=7), 1, 0)]
         data = pso.encode(records)
