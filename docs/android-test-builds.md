@@ -48,7 +48,7 @@ flow backs up the destination save set before replacement.
 The signed release build uses application ID `com.gtomasel.totk` and launcher label
 **TotK Fork**. It installs alongside both upstream and the development app. To move
 saves between identities, use the export and import screens. Download updates
-from the [fork's GitHub releases](https://github.com/GTomasel/totk-android-fork/releases).
+from the [fork's GitHub releases](https://github.com/GTomasel/totk-android-low-ram/releases).
 
 Build from the tagged source with the fork's persistent release signing key. The first
 beta used version code 10022. Version 1.1.2 uses 10102 and can update the fork's

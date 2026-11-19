@@ -4,7 +4,7 @@
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Clone GTomasel/totk-android-fork using the personal account and gabitomasel@gmail.com | Complete | SSH authenticated as GTomasel; repository-local user.email and personal SSH key configured. |
+| Clone the fork with its owner's GitHub account | Complete | Repository-local Git identity and SSH authentication verified. |
 | Read upstream reports about needing to touch the screen | Complete | Issues [40](https://github.com/AurelioB/totk-android/issues/40), [30](https://github.com/AurelioB/totk-android/issues/30), and [22](https://github.com/AurelioB/totk-android/issues/22). |
 | Keep a persistent gameplay refresh request without touch input | Sky and surface verified on S23+ | Window/AHB hints default enabled/max. All 120 samples over 601s on the sky ledge/descent/respawn and all 144 samples over 721s on the surface retained 120 Hz. Some demanding views still render at 14–18 FPS. |
 | Support 120 Hz and 60 Hz/user-selected refresh limits | Samsung Standard/Adaptive checked | Native/JVM fixtures cover explicit/fractional/invalid/migrating rates. With the app requesting max, Samsung Standard selected60Hz (mode3); restoring original Adaptive selected120Hz (mode1). Explicit60 override on hardware remains. |

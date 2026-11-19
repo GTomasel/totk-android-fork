@@ -76,5 +76,5 @@ tests with one optional skip on tmpfs. Android startup recovery passed through
 the production launch code. The mod import regression confirms the decompressed ZIP quota
 includes ignored directory payloads. The saved 1080p setting migrates to Game default.
 
-The public beta remains available at [v1.1.0-beta.1](https://github.com/GTomasel/totk-android-fork/releases/tag/v1.1.0-beta.1).
+The public beta remains available at [v1.1.0-beta.1](https://github.com/GTomasel/totk-android-low-ram/releases/tag/v1.1.0-beta.1).
 The 10024 fixes await device and gameplay confirmation.

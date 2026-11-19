@@ -4,7 +4,7 @@ Reviewed on 2026-11-18 against the published fork beta at `c686e4c`
 and upstream main at `5f2c643`. The original and the fork differ in
 their default display requests. The developer APK used for the
 ongoing memory experiment is a separate build.
-[Published beta](https://github.com/GTomasel/totk-android-fork/releases/tag/v1.1.0-beta.1),
+[Published beta](https://github.com/GTomasel/totk-android-low-ram/releases/tag/v1.1.0-beta.1),
 [Upstream main](https://github.com/AurelioB/totk-android/commits/main/)
 
 ## New issue activity
