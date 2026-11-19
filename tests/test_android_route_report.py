@@ -1,14 +1,16 @@
 """Replay renderer and rootless device evidence without accessing Android."""
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools/bench'))
 from route_report import device_samples, matching_exits, read_phase, report  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from android_memory_capture import process_faults, vm_activity  # noqa: E402
+from android_memory_capture import main as capture_memory, process_faults, vm_activity  # noqa: E402
 
 
 def result(text, code=0):
@@ -16,6 +18,34 @@ def result(text, code=0):
 
 
 class RouteReportTest(unittest.TestCase):
+    def test_capture_tracks_game_pid_across_disconnect_and_ignores_replacement(self):
+        pid_results = iter([(0, '101 202\n', ''), (1, '', 'adb: device offline'), (0, '202\n', '')])
+        meminfo_targets = []
+
+        def adb(command, **options):
+            args = command[3:]
+            if args == ['get-state']:
+                return subprocess.CompletedProcess(command, 0, 'device\n', '')
+            if args[:2] == ['shell', 'pidof']:
+                return subprocess.CompletedProcess(command, *next(pid_results))
+            if args[:3] == ['shell', 'dumpsys', 'meminfo']:
+                meminfo_targets.append(args[-1])
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / 'capture'
+            args = ['capture', '--serial', 'test', '--pid', '101', '--out', str(capture)]
+            with patch.object(sys, 'argv', args), patch('android_memory_capture.subprocess.run', side_effect=adb), \
+                    patch('android_memory_capture.shutil.which', return_value='adb'), \
+                    patch('android_memory_capture.time.sleep'), patch('builtins.print'):
+                capture_memory()
+            rows = [json.loads(line) for line in (capture / 'samples.jsonl').read_text().splitlines()]
+            summary = json.loads((capture / 'report.json').read_text())
+        self.assertEqual([row['pids'] for row in rows], [['101'], [], []])
+        self.assertEqual(meminfo_targets, ['101'])
+        self.assertTrue(summary['game_disappeared'])
+        self.assertEqual(summary['target_pid'], 101)
+
     def test_optional_timeline_retains_coverage_and_uses_its_own_frame_numbers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'game.log'

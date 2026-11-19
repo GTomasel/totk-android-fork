@@ -50,6 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--serial', required=True)
     parser.add_argument('--package', default='com.aure.totk')
+    parser.add_argument('--pid', type=int, help='track this gameplay PID and stop when it exits')
     parser.add_argument('--duration', type=float, default=180)
     parser.add_argument('--interval', type=float, default=5)
     parser.add_argument('--display', action='store_true', help='also sample the internal display framework mode/rate')
@@ -60,6 +61,8 @@ def main():
         parser.error('invalid Android package name')
     if args.duration <= 0 or args.interval < 1:
         parser.error('duration must be positive and interval at least one second')
+    if args.pid is not None and args.pid <= 0:
+        parser.error('PID must be positive')
     adb = shutil.which('adb')
     if not adb:
         parser.error('adb not found')
@@ -90,6 +93,8 @@ def main():
                 tick = time.monotonic()
                 pid_result = run('shell', 'pidof', args.package)
                 pids = [word for word in pid_result['stdout'].split() if word.isdecimal()]
+                if args.pid is not None:
+                    pids = [pid for pid in pids if pid == str(args.pid)]
                 sample = {'elapsed_s': round(tick - started, 3), 'pids': pids}
                 meminfo = run('shell', 'cat', '/proc/meminfo')
                 sample['system_bytes'] = memory_values(meminfo['stdout'])
@@ -104,7 +109,8 @@ def main():
                         or 'mActiveSfDisplayMode=' in line]
                 if pids:
                     observed = True
-                    sample['app_memory'] = run('shell', 'dumpsys', 'meminfo', '-a', args.package)
+                    app = pids[0] if args.pid is not None else args.package
+                    sample['app_memory'] = run('shell', 'dumpsys', 'meminfo', '-a', app)
                     sample['status'] = run('shell', 'cat', '/proc/' + pids[0] + '/status')
                     sample['smaps_rollup'] = run('shell', 'cat', '/proc/' + pids[0] + '/smaps_rollup')
                     if args.faults:
@@ -113,7 +119,7 @@ def main():
                         if data['returncode'] != 0:
                             data = run('shell', 'run-as', args.package, 'cat', path)
                         sample['process_faults'] = process_faults(data['stdout'], pids[0])
-                elif observed:
+                elif (observed or args.pid is not None) and pid_result['returncode'] in (0, 1) and not pid_result['stderr'].strip():
                     disappeared = True
                 output.write(json.dumps(sample) + '\n'); output.flush(); samples += 1
                 print(f"{sample['elapsed_s']:7.1f}s game={'running' if pids else 'not running'} "
@@ -136,6 +142,8 @@ def main():
                   'qualification': 'Device evidence captured; inspect exit reason and per-category counters.' if observed
                   else 'No gameplay captured: the game process was never observed.',
                   'limits': 'No root; inaccessible proc counters retain their errors. Shared/GPU/RSS/PSS counters overlap.'}
+        if args.pid is not None:
+            report['target_pid'] = args.pid
         (args.out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
         print(report['qualification'], flush=True)
 
