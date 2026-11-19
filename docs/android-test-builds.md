@@ -50,8 +50,9 @@ The signed release build uses application ID `com.gtomasel.totk` and launcher la
 saves between identities, use the export and import screens. Download beta updates
 from the [fork's GitHub releases](https://github.com/GTomasel/totk-android-fork/releases).
 
-Build the first beta from its tagged source with the fork's persistent release signing key.
-Use a higher version code for each subsequent build under this application ID.
+Build from the tagged source with the fork's persistent release signing key. The first
+beta used version code 10022. The 1.1.1 beta uses 10101 so Android can update the existing
+installation. The pre-release suffix does not change the derived version code.
 
 ```sh
 python3 games/totk/android/build_release.py \
@@ -60,8 +61,8 @@ python3 games/totk/android/build_release.py \
   --turnip /path/to/pinned/driver.so \
   --key /private/path/to/fork-release-signing.pem \
   --package com.gtomasel.totk --label 'TotK Fork' --target-sdk 36 \
-  --version-name 1.1.0-beta.1 --version-code 10022 \
-  --out .scratch/android-release/TotK-Fork-1.1.0-beta.1.apk
+  --version-name 1.1.1-beta.1 --version-code 10101 \
+  --out .scratch/android-release/TotK-Fork-1.1.1-beta.1.apk
 ```
 
 The release build targets API 36 and supports Android 13 and later on ARM64, subject to

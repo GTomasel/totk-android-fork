@@ -15,6 +15,28 @@ import subprocess
 import time
 
 
+VM_ACTIVITY = {'pgmajfault', 'pswpin', 'pswpout', 'pgscan_direct', 'pgsteal_direct',
+               'allocstall_dma32', 'allocstall_normal', 'allocstall_movable'}
+
+
+def process_faults(source, pid):
+    """Read process totals from proc stat, whose command can contain spaces or parentheses."""
+    identity, separator, fields = source.rpartition(')')
+    values = fields.split()
+    if not separator or not identity.startswith(f'{pid} (') or len(values) < 20:
+        return {}
+    try:
+        return {'pid': pid, 'start_ticks': int(values[19]),
+                'minor': int(values[7]), 'major': int(values[9])}
+    except ValueError:
+        return {}
+
+
+def vm_activity(source):
+    return {key: int(value) for key, value in re.findall(r'^(\w+) (\d+)$', source, re.M)
+            if key in VM_ACTIVITY}
+
+
 def memory_values(source):
     result = {}
     for line in source.splitlines():
@@ -31,6 +53,7 @@ def main():
     parser.add_argument('--duration', type=float, default=180)
     parser.add_argument('--interval', type=float, default=5)
     parser.add_argument('--display', action='store_true', help='also sample the internal display framework mode/rate')
+    parser.add_argument('--faults', action='store_true', help='sample kernel VM activity and the game process fault counters when readable')
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+', args.package):
@@ -59,6 +82,7 @@ def main():
     (args.out / 'device.json').write_text(json.dumps(properties, indent=2) + '\n')
     (args.out / 'exit-before.json').write_text(json.dumps(run('shell', 'dumpsys', 'activity', 'exit-info', args.package), indent=2) + '\n')
     started = time.monotonic()
+    started_unix = time.time()
     observed, disappeared, samples = False, False, 0
     try:
         with (args.out / 'samples.jsonl').open('w') as output:
@@ -70,6 +94,8 @@ def main():
                 meminfo = run('shell', 'cat', '/proc/meminfo')
                 sample['system_bytes'] = memory_values(meminfo['stdout'])
                 sample['memory_pressure'] = run('shell', 'cat', '/proc/pressure/memory')
+                if args.faults:
+                    sample['vm_activity'] = vm_activity(run('shell', 'cat', '/proc/vmstat')['stdout'])
                 if args.display:
                     display = run('shell', 'dumpsys', 'display')
                     # Preserve the framework evidence, not a claimed hardware scanout measurement.
@@ -81,6 +107,12 @@ def main():
                     sample['app_memory'] = run('shell', 'dumpsys', 'meminfo', '-a', args.package)
                     sample['status'] = run('shell', 'cat', '/proc/' + pids[0] + '/status')
                     sample['smaps_rollup'] = run('shell', 'cat', '/proc/' + pids[0] + '/smaps_rollup')
+                    if args.faults:
+                        path = f'/proc/{pids[0]}/stat'
+                        data = run('shell', 'cat', path)
+                        if data['returncode'] != 0:
+                            data = run('shell', 'run-as', args.package, 'cat', path)
+                        sample['process_faults'] = process_faults(data['stdout'], pids[0])
                 elif observed:
                     disappeared = True
                 output.write(json.dumps(sample) + '\n'); output.flush(); samples += 1
@@ -100,6 +132,7 @@ def main():
         (args.out / 'package-exit-log.txt').write_text('\n'.join(relevant) + '\n')
         report = {'package': args.package, 'samples': samples, 'game_observed': observed,
                   'game_disappeared': disappeared, 'elapsed_s': round(time.monotonic() - started, 3),
+                  'capture_start_host_unix_s': started_unix,
                   'qualification': 'Device evidence captured; inspect exit reason and per-category counters.' if observed
                   else 'No gameplay captured: the game process was never observed.',
                   'limits': 'No root; inaccessible proc counters retain their errors. Shared/GPU/RSS/PSS counters overlap.'}
