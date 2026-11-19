@@ -3,7 +3,20 @@
 All notable changes to TotK Native for Android (`com.aure.totk`). The app follows [semantic versioning](https://semver.org);
 the game version it runs is shown separately. versionCode = major × 10000 + minor × 100 + patch.
 
-## Unreleased
+## 1.1.2 (versionCode 10102), game 1.4.3
+
+### Changes since the 1.1.1 fork beta
+
+- Graphics changes made while the game is open show when they will apply. The
+  menu can resume the current game or restart it after confirming that unsaved
+  progress will be lost. The restart waits for an active save to finish.
+- Low memory mode caps staging for deferrable Vulkan GPU-to-guest copies at
+  12 MiB. Immediate guest reads keep their existing path.
+- Include optional Vulkan staging reclamation during upload bursts. It is
+  disabled by default while the effect on total process memory is evaluated.
+- The Android memory capture can follow the exact gameplay PID across sampling
+  errors and distinguish it from a replacement process from the same package.
+  See the [S23+ campaign results](docs/s23-campaign-results.md) for device coverage and remaining checks.
 
 ### Issue-audit candidates
 - Add **Low memory mode** to Graphics → Performance, with fenced reclamation of

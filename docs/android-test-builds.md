@@ -43,16 +43,16 @@ Shared game data can be selected in both apps, but run only one game/setup write
 a time. Each identity has its own private saves and settings. The normal save-import
 flow backs up the destination save set before replacement.
 
-## Public fork beta
+## Public fork release
 
 The signed release build uses application ID `com.gtomasel.totk` and launcher label
 **TotK Fork**. It installs alongside both upstream and the development app. To move
-saves between identities, use the export and import screens. Download beta updates
+saves between identities, use the export and import screens. Download updates
 from the [fork's GitHub releases](https://github.com/GTomasel/totk-android-fork/releases).
 
 Build from the tagged source with the fork's persistent release signing key. The first
-beta used version code 10022. The 1.1.1 beta uses 10101 so Android can update the existing
-installation. The pre-release suffix does not change the derived version code.
+beta used version code 10022. Version 1.1.2 uses 10102 and can update the fork's
+1.1.1 beta (10101) in place with the same signing certificate.
 
 ```sh
 python3 games/totk/android/build_release.py \
@@ -61,8 +61,8 @@ python3 games/totk/android/build_release.py \
   --turnip /path/to/pinned/driver.so \
   --key /private/path/to/fork-release-signing.pem \
   --package com.gtomasel.totk --label 'TotK Fork' --target-sdk 36 \
-  --version-name 1.1.1-beta.1 --version-code 10101 \
-  --out .scratch/android-release/TotK-Fork-1.1.1-beta.1.apk
+  --version-name 1.1.2 \
+  --out .scratch/android-release/TotK-Fork-1.1.2.apk
 ```
 
 The release build targets API 36 and supports Android 13 and later on ARM64, subject to
