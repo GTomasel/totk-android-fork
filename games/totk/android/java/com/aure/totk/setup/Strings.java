@@ -63,7 +63,7 @@ final class Strings {
 
     // Graphics
     static final String TAB_PERFORMANCE = "Performance", TAB_PICTURE = "Picture", TAB_SCREEN = "Screen";
-    static final String IN_USE = "IN USE";
+    static final String PRESET_SELECTED = "SELECTED";
     static final String RECOMMENDED = "Recommended for this device";
     static final String UNTESTED_DEFAULT = "Default for untested devices: the lightest preset";
     static final String SECOND_DETECTED = "Second screen detected";
@@ -79,7 +79,12 @@ final class Strings {
     static final String DETECTED = "Detected";
     static final String CHOOSE_GRAPHICS = "Choose graphics";
     static final String SETUP_COMPLETE = "Setup complete · step 6 of 6";
-    static final String TAKES_EFFECT = "Takes effect when you start the game. Change it any time from this menu.";
+    static final String TAKES_EFFECT = "Applies when you start the game.";
+    static final String GRAPHICS_NEXT_START = "Graphics changes apply the next time you start the game.";
+    static final String P_RESUME_GAME = "Resume game";
+    static final String RESTART_GAME = "Restart game";
+    static final String RESTART_CONFIRM = "Restart the game?";
+    static final String RESTART_PROGRESS_WARNING = "The game will close and reopen. You'll lose any progress since your last save.";
     static final String GPU_COST = "GPU cost", ADDED_LATENCY = "Added latency", WORKS_WITH = "Works with", APPLIES = "Applies";
     static final String WHILE_PLAYING = "Change while playing", SOUND_BUFFER = "Sound buffer", GAME_RESOLUTION = "Game targets";
     static final String STRENGTH = "Strength";

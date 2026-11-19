@@ -308,7 +308,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             View.OnFocusChangeListener previous = view.getOnFocusChangeListener();
             view.setOnFocusChangeListener((v, has) -> {
                 if (previous != null) previous.onFocusChange(v, has);
-                if (has && !gameState.free()) { blockedAction = retry; blockedNeed = need; updateGameNotice(); }
+                if (has && !closingGame && !gameState.free()) { blockedAction = retry; blockedNeed = need; updateGameNotice(); }
             });
             view.setOnClickListener(v -> {
                 if (!closingGame && needGameClosed(need, retry)) retry.run();
@@ -325,24 +325,46 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         return false;
     }
     private void gameBanner() {
-        if ((gameControls.isEmpty() && blockedAction == null) || gameState.free()) return;
-        if (blockedAction == null) blockedNeed = screen == Screen.FILES || screen == Screen.ERROR || screen == Screen.INTERRUPTED ? "Installing"
+        boolean graphics = screen == Screen.GRAPHICS;
+        if (gameState.free() || (!graphics && gameControls.isEmpty() && blockedAction == null)) return;
+        if (!graphics && blockedAction == null) blockedNeed = screen == Screen.FILES || screen == Screen.ERROR || screen == Screen.INTERRUPTED ? "Installing"
                 : screen == Screen.STORAGE ? "Moving game data" : screen == Screen.DATA ? "Changing game data" : "Changing saves";
         gameNotice = Theme.paragraph(this, "", 18, Theme.AMBER);
+        gameNotice.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         board.put(gameNotice, 80, 930, 1360, 70);
-        closeGameAction = new Widgets.Action(this, Strings.CLOSE_GAME, false, v -> closeGame());
-        closeGameAction.setTag("close-game");
-        board.put(closeGameAction, 1840, 930, Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.START);
+        closeGameAction = new Widgets.Action(this, graphics ? Strings.RESTART_GAME : Strings.CLOSE_GAME, false,
+                v -> { if (graphics) confirmGameRestart(); else closeGame(); });
+        closeGameAction.setTag(graphics ? "restart-game" : "close-game");
+        board.put(closeGameAction, 1840, graphics ? 914 : 930,
+                Widgets.Board.WRAP, Widgets.Board.WRAP, Widgets.Board.END, Widgets.Board.START);
         if (blockedAction == null && screen == Screen.FILES) { blockedAction = () -> go(Screen.UPDATES); blockedNeed = "Installing"; }
         updateGameNotice();
     }
     private void updateGameNotice() {
-        if (gameNotice != null) gameNotice.setText(closingGame ? (closeSent ? Strings.CLOSING_GAME : Strings.WAITING_SAVE)
-                : gameState.state == GameLock.State.ERROR ? Strings.gameLockError(gameState.reason) : Strings.gameRunning(blockedNeed));
+        if (gameNotice != null) {
+            String message;
+            if (closingGame) message = closeSent ? Strings.CLOSING_GAME : Strings.WAITING_SAVE;
+            else if (gameState.state == GameLock.State.ERROR) message = Strings.gameLockError(gameState.reason);
+            else message = screen == Screen.GRAPHICS ? Strings.GRAPHICS_NEXT_START : Strings.gameRunning(blockedNeed);
+            if (!message.contentEquals(gameNotice.getText())) gameNotice.setText(message);
+        }
         if (closeGameAction != null) {
             closeGameAction.setVisibility(gameState.state == GameLock.State.GAME ? View.VISIBLE : View.GONE);
             closeGameAction.setEnabled(!closingGame);
         }
+    }
+    private void confirmGameRestart() {
+        if (closingGame || gameState.state != GameLock.State.GAME) return;
+        openChoice("gfx", Strings.GRAPHICS, Strings.RESTART_CONFIRM, Strings.RESTART_PROGRESS_WARNING,
+                new Object[]{"restart:no", Strings.CANCEL, null, false, (Runnable) this::back},
+                new Object[]{"restart:yes", Strings.RESTART_GAME, null, true, (Runnable) this::restartGame});
+    }
+    private void restartGame() {
+        if (closingGame || !started) return;
+        back();
+        blockedAction = this::startGame;
+        closeGame();
+        if (closingGame) render();
     }
     private void refreshGameState() {
         GameLock.Result next = InstallState.gameState(this);
@@ -1097,8 +1119,9 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private Widgets.Prompt prompt(String key, String label, View.OnClickListener click) { return new Widgets.Prompt(this, key, label, click); }
     private Widgets.Prompt backPrompt() { return prompt("B", Strings.P_BACK, v -> back()); }
     private Widgets.Prompt startPrompt() {
-        Widgets.Prompt start = prompt("+", Strings.P_START, v -> startGame());
-        start.setEnabled(InstallState.read(this).playable() && !seedRefused);
+        String label = screen == Screen.GRAPHICS && gameState.state == GameLock.State.GAME ? Strings.P_RESUME_GAME : Strings.P_START;
+        Widgets.Prompt start = prompt("+", label, v -> startGame());
+        start.setEnabled(!closingGame && InstallState.read(this).playable() && !seedRefused);
         return start;
     }
     private Widgets.Panel panel(float x, float y, float w, float h, boolean notch, float padH, float padV) {
@@ -1281,7 +1304,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             for (int i = 0; i < all.length; i++) {
                 String id = all[i];
                 Widgets.PresetCard card = new Widgets.PresetCard(this, Strings.presetName(id), Strings.presetCaption(id),
-                        id.equals(recommended) ? Strings.RECOMMENDED : null, Strings.IN_USE, v -> choosePreset(id));
+                        id.equals(recommended) ? Strings.RECOMMENDED : null, Strings.PRESET_SELECTED, v -> choosePreset(id));
                 card.setTag("preset:" + id);
                 card.setOnFocusChangeListener((v, has) -> { if (has) showDetail("preset:" + id); });
                 presetCards.put(id, card);
@@ -1414,6 +1437,7 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         noteRow.addView(line, Widgets.margins(Widgets.size(-1, -2), 0, 20, 0, 0));
         detail.addView(noteRow);
         detailNote = noteRow;
+        if (screen == Screen.GRAPHICS && !gameState.free()) detailNote.setVisibility(View.GONE);
     }
     private void fact(String key, View value) { detailFacts.addView(Widgets.fact(this, key, value)); }
     private void fact(String key, String value) { fact(key, Theme.text(this, value, false, 20, Theme.TEXT)); }
@@ -1513,7 +1537,6 @@ public final class SetupActivity extends Activity implements SetupService.Listen
         }
         detailConstraint.setText(constraint == null ? "" : constraint);
         detailConstraint.setVisibility(constraint == null ? View.GONE : View.VISIBLE);
-        if (detailNote != null) detailNote.setVisibility(View.VISIBLE);
         if (detailDiagram.getVisibility() == View.VISIBLE) fitDiagram(id.substring(4).equals("sharpness") ? "sharpness_fsr" : id.substring(4));
     }
     /** The picture takes its preferred height, or what is left of the detail panel once the text, facts, constraint
