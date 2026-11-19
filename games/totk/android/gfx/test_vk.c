@@ -1299,6 +1299,68 @@ static int staging_early_trim_checks(int enabled) {
     return fails != 0;
 }
 
+static int staging_burst_trim_checks(int enabled) {
+    enum { MIB = 1 << 20, SAMPLE = 256 };
+    setenv("TOTK_VK_STAGING_RETAIN_MB", "8", 1);
+    setenv("TOTK_VK_STAGING_EARLY_TRIM", "0", 1);
+    setenv("TOTK_VK_STAGING_BURST_TRIM", enabled ? "1" : "0", 1);
+    uint8_t *guest = mmap(NULL, MIB, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (guest == MAP_FAILED) DIE("staging burst fixture destination");
+    mtl_init(); mtl_pool_add(guest, MIB);
+    VkBuffer destination, pinned, general, idle, first_upload, burst;
+    VkDeviceSize pinned_offset, general_offset, idle_offset, first_offset, burst_offset;
+    uint64_t resolved;
+    if (!vk_resolve((uintptr_t)guest, MIB, &destination, &resolved) || resolved) DIE("staging burst fixture buffer");
+
+    mtl_sub_begin();
+    memset(vk_texture_staging(MIB, &pinned, &pinned_offset), 0x3d, SAMPLE);
+    arena_check_copy(pinned, pinned_offset, destination, 0);
+    uint64_t lease = vk_replay_lease_begin_immutable();
+    CHECK(lease && mtl_wait(mtl_sub_commit(), 5000000000ull), "the first upload completes with a replay lease");
+
+    mtl_sub_begin();
+    memset(vk_transient(MIB, 16, &general, &general_offset), 0x5b, SAMPLE);
+    arena_check_copy(general, general_offset, destination, 1);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "general staging completes");
+
+    mtl_sub_begin();
+    memset(vk_texture_staging(MIB, &idle, &idle_offset), 0x74, SAMPLE);
+    arena_check_copy(idle, idle_offset, destination, 2);
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "the unleased upload completes");
+    CHECK(vk_test_slot_arena_bytes() == 24 * MIB, "small allocations retain all three warm chunks");
+
+    mtl_sub_begin();
+    memset(vk_texture_staging(4 * MIB, &first_upload, &first_offset), 0xa9, SAMPLE);
+    CHECK(vk_test_slot_arena_bytes() == 32 * MIB, "the first upload within the allowance keeps completed slots warm");
+    memset(vk_texture_staging(5 * MIB, &burst, &burst_offset), 0xc1, SAMPLE);
+    uint8_t data[SAMPLE];
+    CHECK(vk_replay_frozen_buffer_copy(pinned, pinned_offset, sizeof data, data) && data[0] == 0x3d,
+          "the burst leaves the replay lease intact");
+    CHECK(vk_replay_frozen_buffer_copy(general, general_offset, sizeof data, data) && data[0] == 0x5b,
+          "the burst leaves general staging intact");
+    int has_idle_bytes = vk_replay_frozen_buffer_copy(idle, idle_offset, sizeof data, data) && data[0] == 0x74;
+    CHECK(has_idle_bytes == !enabled,
+          "only the burst trim arm releases the unleased upload");
+    arena_check_copy(first_upload, first_offset, destination, 3);
+    arena_check_copy(burst, burst_offset, destination, 4);
+    uint64_t ticket = mtl_sub_commit();
+    CHECK(mtl_wait(ticket, 5000000000ull) && vk_replay_lease_end(lease, ticket), "the burst and replay lease retire");
+    uint8_t expected[5 * SAMPLE];
+    memset(expected, 0x3d, SAMPLE);
+    memset(expected + SAMPLE, 0x5b, SAMPLE);
+    memset(expected + 2 * SAMPLE, 0x74, SAMPLE);
+    memset(expected + 3 * SAMPLE, 0xa9, SAMPLE);
+    memset(expected + 4 * SAMPLE, 0xc1, SAMPLE);
+    CHECK(!memcmp(guest, expected, sizeof expected), "GPU copies match across all five allocations");
+    uint64_t slot[5], snapshot[5], combined;
+    vk_test_arena_memory(slot, snapshot, &combined);
+    CHECK(slot[2] == (enabled ? 32 : 40) * MIB, "staging peak is %.0f MiB", slot[2] / (double)MIB);
+    mtl_pool_finalize(guest); munmap(guest, MIB);
+    printf("%s: staging burst trim %s, %.0f MiB peak, %d checks, %d failed\n",
+           fails ? "FAILED" : "ok", enabled ? "on" : "off", slot[2] / (double)MIB, checks, fails);
+    return fails != 0;
+}
+
 static int arena_tail_checks(int enabled) {
     if (enabled) unsetenv("TOTK_VK_OFF");
     else setenv("TOTK_VK_OFF", "arenatails", 1);
@@ -2783,6 +2845,10 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--pool-image-lifetime")) return pool_image_lifetime_checks();
     if (argc == 2 && !strcmp(argv[1], "--staging-warm-retain")) return staging_warm_retain_checks(8);
     if (argc == 2 && !strcmp(argv[1], "--staging-warm-retain-small")) return staging_warm_retain_checks(4);
+    if (argc == 3 && !strcmp(argv[1], "--staging-burst-trim")) {
+        if (!strcmp(argv[2], "on")) return staging_burst_trim_checks(1);
+        if (!strcmp(argv[2], "off")) return staging_burst_trim_checks(0);
+    }
     if (argc == 3 && !strcmp(argv[1], "--staging-early-trim")) {
         if (!strcmp(argv[2], "on")) return staging_early_trim_checks(1);
         if (!strcmp(argv[2], "off")) return staging_early_trim_checks(0);

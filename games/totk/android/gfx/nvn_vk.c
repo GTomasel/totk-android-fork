@@ -2133,7 +2133,7 @@ static void arena_reset(arena_t *a, int max_bos) {
    after its reset (whole chunks, oldest first, and a high-water hint clipped to N); a later submission that needs more
    allocates it again. Live (totk.ctl) at each slot open, after the slot's fence. */
 static int g_staging_retain_launch = -1;   /* MiB, -1: no cap; parsed once (pthread_once) */
-static int g_staging_early_trim;
+static int g_staging_early_trim, g_staging_burst_trim;
 static _Atomic uint64_t g_staging_trims, g_staging_trimmed;
 static _Atomic uint64_t g_staging_early_trims, g_staging_early_released;
 static pthread_once_t g_staging_once = PTHREAD_ONCE_INIT;
@@ -2142,6 +2142,8 @@ static void staging_retain_parse(void) {
     if (e && *e) { long n = atol(e); g_staging_retain_launch = n < 1 ? 8 : n > 4096 ? 4096 : (int)n; }
     e = getenv("TOTK_VK_STAGING_EARLY_TRIM");
     g_staging_early_trim = e && !strcmp(e, "1");
+    e = getenv("TOTK_VK_STAGING_BURST_TRIM");
+    g_staging_burst_trim = e && !strcmp(e, "1");
     if (g_staging_retain_launch < 0) LOGV("staging retention: no cap (TOTK_VK_STAGING_RETAIN_MB unset: each slot keeps its upload high-water)");
     else LOGV("staging retention: %d MiB per slot (TOTK_VK_STAGING_RETAIN_MB; %d slots)", g_staging_retain_launch, RING);
 }
@@ -3185,13 +3187,22 @@ static int chunk_offset(const chunk_t *chunk, VkDeviceSize size, VkDeviceSize al
 
 /* Runs under the recording owner, outside g_mu during destruction. Only
    another recording owner can open or lease a completed slot. */
-static void staging_trim_completed_uploads(int cap_mb) {
-    if (!g_staging_early_trim || cap_mb < 0) return;
+static void staging_trim_completed_uploads(const slot_t *current, VkDeviceSize requested) {
+    int cap_mb = current->staging_cap_mb;
+    if (cap_mb < 0 || (!g_staging_early_trim && !g_staging_burst_trim)) return;
+    if (g_staging_burst_trim) {
+        VkDeviceSize limit = (VkDeviceSize)cap_mb << 20, used = 0;
+        for (int i = 0; i < current->ar.nchunk; i++) used += current->ar.chunks[i].size;
+        /* An upload that grows this slot beyond its warm allowance can borrow
+           the allowance of one retired slot. Ordinary warm growth keeps it. */
+        if (requested > limit || used > limit - requested) cap_mb = 0;
+    }
+    if (cap_mb && !g_staging_early_trim) return;
     VkDeviceSize cap = (VkDeviceSize)cap_mb << 20;
     unsigned candidates = 0;
     for (unsigned i = 0; i < RING; i++) {
         slot_t *slot = &g_ring[i];
-        if (slot == g_cur) continue;
+        if (slot == current) continue;
         VkDeviceSize capacity = 0;
         int upload = 0;
         for (int c = 0; c < slot->ar.nchunk; c++) {
@@ -3245,7 +3256,7 @@ static void *arena_alloc_with_usage(arena_t *a, size_t size, size_t align, VkBuf
                 atomic_fetch_add_explicit(&arena_tail_bytes[kind], size, memory_order_relaxed);
             }
         } else {
-            if (upload) staging_trim_completed_uploads(g_cur->staging_cap_mb);
+            if (upload) staging_trim_completed_uploads(g_cur, size);
             uint64_t compact_start = a->reserve ? host_now_ns() : 0;
             VkDeviceSize min = a->min;
             if (!min) {
@@ -3277,7 +3288,7 @@ static void *arena_alloc_with_usage(arena_t *a, size_t size, size_t align, VkBuf
             if (compact_start) arena_compact_ns[a->min != 0] += host_now_ns() - compact_start;
         }
     }
-    if (g_staging_early_trim && !upload) c->general_use = 1;
+    if ((g_staging_early_trim || g_staging_burst_trim) && !upload) c->general_use = 1;
     c->used = at + size;
     *buf = c->buf; *off = at;
     return c->ptr + at;
@@ -6772,11 +6783,11 @@ void vk_mem_report(void) {
     LOGV("memory staging retention: cap %d MiB per slot (-1: none), trims %llu, %.1f MiB not retained (TOTK_VK_STAGING_RETAIN_MB)",
         staging_retain_mb(), (unsigned long long)atomic_load_explicit(&g_staging_trims, memory_order_relaxed),
         atomic_load_explicit(&g_staging_trimmed, memory_order_relaxed) / 1048576.0);
-    if (g_staging_early_trim)
-        LOGV("[arena-early-trim] sub=%llu trims=%llu released_bytes=%llu",
+    if (g_staging_early_trim || g_staging_burst_trim)
+        LOGV("[arena-early-trim] sub=%llu trims=%llu released_bytes=%llu burst_policy=%d",
             (unsigned long long)vk_submit_serial(),
             (unsigned long long)atomic_load_explicit(&g_staging_early_trims, memory_order_relaxed),
-            (unsigned long long)atomic_load_explicit(&g_staging_early_released, memory_order_relaxed));
+            (unsigned long long)atomic_load_explicit(&g_staging_early_released, memory_order_relaxed), g_staging_burst_trim);
     LOGV("[arena-peaks] sub=%llu slot_allocated=%llu slot_peak=%llu snapshot_allocated=%llu snapshot_peak=%llu combined_peak=%llu slot_created=%llu snapshot_created=%llu",
         (unsigned long long)vk_submit_serial(), (unsigned long long)arenas.slot.allocated,
         (unsigned long long)arenas.slot.peak, (unsigned long long)arenas.snapshot.allocated,

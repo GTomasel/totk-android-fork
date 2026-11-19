@@ -19,14 +19,17 @@ class LowMemoryTests(unittest.TestCase):
 #include <assert.h>
 int main(void) {
     const char *names[] = {"TOTK_LOW_MEMORY", "TOTK_VK_STAGING_RETAIN_MB", "TOTK_VK_REC_MEMORY_MB", "TOTK_VK_IMAGE_FREE_EMPTY",
-        "TOTK_VK_DESC_COMPACT", "TOTK_PSO_PREWARM", "TOTK_SEED_WARM_MB", "TOTK_VK_IMAGE_BLOCK_MB", "TOTK_VK_IMAGE_PACK"};
+        "TOTK_VK_DESC_COMPACT", "TOTK_PSO_PREWARM", "TOTK_SEED_WARM_MB", "TOTK_VK_IMAGE_BLOCK_MB", "TOTK_VK_IMAGE_PACK",
+        "TOTK_VK_WB_AUTO_STAGING_MB"};
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++) unsetenv(names[i]);
     totk_android_memory_defaults();
     for (unsigned i = 1; i < sizeof names / sizeof *names; i++) assert(!getenv(names[i]));
     setenv("TOTK_LOW_MEMORY", "0", 1); totk_android_memory_defaults();
     assert(!getenv("TOTK_VK_STAGING_RETAIN_MB"));
+    assert(!getenv("TOTK_VK_WB_AUTO_STAGING_MB"));
     setenv("TOTK_LOW_MEMORY", "1", 1); totk_android_memory_defaults();
     assert(!strcmp(getenv("TOTK_VK_STAGING_RETAIN_MB"), "8"));
+    assert(!strcmp(getenv("TOTK_VK_WB_AUTO_STAGING_MB"), "12"));
     assert(!strcmp(getenv("TOTK_VK_REC_MEMORY_MB"), "32"));
     assert(!strcmp(getenv("TOTK_VK_IMAGE_FREE_EMPTY"), "1"));
     assert(getenv("TOTK_VK_DESC_COMPACT") && !strcmp(getenv("TOTK_VK_DESC_COMPACT"), "1"));
@@ -35,10 +38,12 @@ int main(void) {
     assert(!strcmp(getenv("TOTK_VK_IMAGE_BLOCK_MB"), "32"));
     assert(!strcmp(getenv("TOTK_VK_IMAGE_PACK"), "0"));
     setenv("TOTK_VK_IMAGE_BLOCK_MB", "64", 1);
+    setenv("TOTK_VK_WB_AUTO_STAGING_MB", "0", 1);
     setenv("TOTK_VK_STAGING_RETAIN_MB", "12", 1); setenv("TOTK_VK_IMAGE_FREE_EMPTY", "0", 1);
     setenv("TOTK_VK_REC_MEMORY_MB", "64", 1); setenv("TOTK_VK_IMAGE_PACK", "1", 1); totk_android_memory_defaults();
     assert(!strcmp(getenv("TOTK_VK_STAGING_RETAIN_MB"), "12"));
     assert(!strcmp(getenv("TOTK_VK_IMAGE_BLOCK_MB"), "64"));
+    assert(!strcmp(getenv("TOTK_VK_WB_AUTO_STAGING_MB"), "0"));
     assert(!strcmp(getenv("TOTK_VK_REC_MEMORY_MB"), "64"));
     assert(!strcmp(getenv("TOTK_VK_IMAGE_FREE_EMPTY"), "0"));
     assert(!strcmp(getenv("TOTK_VK_IMAGE_PACK"), "1"));

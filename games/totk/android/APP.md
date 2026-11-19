@@ -145,6 +145,8 @@ Local independently signed API36 test builds and data-preserving ADB updates are
 the game to apply it. It is off by default and independent of graphics presets. Developers can set
 `TOTK_LOW_MEMORY=1` in `<game>/totk.env`. An explicit value in that file overrides the menu. The staging retention
 target is 8 MiB per retired slot, and recorder packet/descriptor slabs use the existing 32 MiB retention budget.
+The profile sets a 12 MiB staging budget for deferrable GPU-to-guest copies. Immediate guest reads
+retain their existing path. An explicit `TOTK_VK_WB_AUTO_STAGING_MB=0` disables the budget.
 Image suballocation uses 32 MiB blocks and releases blocks that become empty after fence retirement. Use
 `TOTK_VK_IMAGE_BLOCK_MB=16` to try smaller blocks or `64` for the standard block size.
 Images above 16 MiB continue to use dedicated allocations. `TOTK_VK_IMAGE_PACK=1` selects the experimental
@@ -162,7 +164,7 @@ Use `TOTK_VK_WB_TILE_TRACE=1` when a reproduction needs per-tile Vulkan write-ba
 The periodic write-back memory and lifetime counters are available with per-tile logging off.
 For write-back experiments, set `TOTK_VK_WB_AUTO_COPY_LIMIT` to 1–128 background copy attempts
 per submission and `TOTK_VK_WB_AUTO_STAGING_MB` to 1–512 MiB of live staging at admission.
-Zero selects unlimited scheduling for that setting, which is the default. The staging limit uses
+Zero selects unlimited scheduling for that setting. It is the default outside Low memory mode. The staging limit uses
 Vulkan's actual memory requirement and allows an oversized copy when staging is empty.
 Explicit invalidations keep their immediate read-back path. The `[wb-auto]` report shows
 admissions, budget yields, peak staging at admission and the age of the oldest unstaged record.
@@ -251,7 +253,13 @@ Try `TOTK_VK_STAGING_RETAIN_MB=4` to keep a smaller warm buffer per slot, with
 normal overflow allocation available during bursts. With a finite cap,
 `TOTK_VK_STAGING_EARLY_TRIM=1` allows a new texture upload to return excess
 upload-only buffers from a completed slot before it allocates.
-The `[arena-early-trim]` line reports actual Vulkan bytes released.
+`TOTK_VK_STAGING_BURST_TRIM=1` separately lets an upload burst release
+upload-only buffers that a completed slot would otherwise keep warm. The
+active slot must be growing beyond its retention cap. Each growth can trim
+up to four buffers from one completed slot after GPU and submit work retire
+and replay leases clear. General staging stays in its owning slot.
+The `[arena-early-trim]` line reports actual Vulkan bytes released and
+whether the burst policy is enabled. Both switches default to off.
 With descriptor stock off, `TOTK_VK_DESC_TRIM_IDLE=1` in `totk.env` lets
 each recorder context and primary slot release spare descriptor pools after
 32 recycled generations of lower demand. It also skips resetting unused pools.
